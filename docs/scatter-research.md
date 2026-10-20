@@ -132,28 +132,38 @@ being created, before its index exists, which the shim has to special-case. Both
 since the shim routes per call and mimalloc v3 heaps are not thread-bound. Both home modes
 behave the same across the join; replacing glibc as the home allocator was not slower.
 
-## What this decides
+## What this decides, corrected
 
-- **Placement below Python is solved for libc users** by approach A with either backing: torch
-  passes whole, including from threads the worker starts and threads that existed at the
-  checkpoint. The shim adds nothing measurable at home.
-- **Placement is not the whole join.** Imported native objects that count references into
-  pre-fork native objects (Arrow's `shared_ptr`s; Rust `Arc`s would be the same) cannot be
-  dropped safely, because no table of pre-fork native counts exists and none can be built
-  generically. This is independent of A or B.
-- **Libraries with their own allocator** (Arrow's default pool, polars) are below libc. Approach B
-  (gVisor-level placement of new `mmap`s) is what would place them, and it would still leave the
-  previous point open for them.
-- **NumPy's outside buffers** come from its cache, not from an allocator; the fix is per type: drain
-  the cache after the switch, or copy dims and strides into the range at export, which is what the
-  per-type walker of approach C does.
+The first reading of these tables (same day, retracted the same day) was that imported native
+objects which count references into pre-fork native objects can never be dropped, and that no
+general fix exists. That conflated two things:
 
-So the gate is C, as the design already says: a define of a native type is carried only when its
-type is known to reference nothing pre-fork by count, and refused by name otherwise. Within that
-gate, A places the memory for libc users, and B would extend placement to own-allocator libraries
-without lifting the refusal for types that count into pre-fork objects. Nothing of this is in
-`motabi/` yet; the shim is under `experiments/fold/rangemalloc/`, and the one package change is a
-launcher line passing `MOTABI_LD_PRELOAD` into the sandbox as `LD_PRELOAD`.
+- **Running the destructor** of an imported native object is what corrupts the root: it
+  decrements counts the worker raised in pages the join discarded. **Reclaiming its memory** does
+  not need the destructor. If the root never runs destructors of imported native objects and
+  drops a range's pages when the Python objects in it are dead, as 2.4 already states, the
+  pre-fork counts are exactly right for the root's own references. Untested as of this writing;
+  it is step 1 of the follow-up plan.
+- **"Below libc" is not below the shim.** Arrow's and polars' bundled allocators get their memory
+  through libc's `mmap`, which the shim can intercept and place in the range; no runsc change is
+  needed for that. Untested; step 2 of the follow-up.
+
+What the tables do decide:
+
+- Placement of libc allocations is solved by approach A with either backing, from any thread,
+  including threads alive at the checkpoint, at no measurable cost at home.
+- NumPy's outside buffers come from its cache of pre-fork blocks, which no allocator sees. A
+  per-type fix (drain the cache after the switch, or copy dims and strides at export) is needed
+  regardless of A or B.
+- The open question that no placement answers is **reuse of pre-fork free space**: every worker
+  restores with identical allocator state and may hand out the same pre-fork block, which is a
+  conflict between workers, not a placement miss. Its rate is unmeasured; measuring it from
+  gVisor's own checkpoints is step 4 of the follow-up.
+
+The per-type check of approach C remains the gate for what is carried; the shim is the placement
+mechanism under it. Nothing of this is in `motabi/` yet; the shim is under
+`experiments/fold/rangemalloc/`, and the one package change is a launcher line passing
+`MOTABI_LD_PRELOAD` into the sandbox as `LD_PRELOAD`.
 
 A note on what was tried earlier: `motabi/npdivert.c` installed a NumPy data-memory handler that
 forwards to `PyMem_Raw*`. It is unnecessary on NumPy 2 (data already goes that way) and it broke
