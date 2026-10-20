@@ -95,13 +95,13 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
    rdseed, vmx and the rest; the kernel is restored at home, the cell raises with the site's
    reason and does not run, and the kernel stays usable for the next run.
 
-5. **The kernel stays out.** A `require` cell starts a leg and the kernel stays at the site;
+5. **The kernel stays out.** A `remote` cell starts a leg and the kernel stays at the site;
    cells without a requirement run where it is; it comes home at a cell beginning with
    `motabi.home()`, at a scatter header (the prototype forks only at home), or when the run
    ends (a hook on marimo's run-finished list, registered in `motabi/kernel.py`). Verified
-   against the guest: a plain cell after the require cell wrote its line to the workspace
+   against the guest: a plain cell after the remote cell wrote its line to the workspace
    file while away and no move happened between them; the `home()` cell brought the kernel
-   back; a require cell with no descendants went out and came home at run end, three times.
+   back; a remote cell with no descendants went out and came home at run end, three times.
 
 6. **The environment as designed (2.7).** The notebook carries a PEP 723 block (`nb.py`);
    `uv lock --script` and `uv export --script` at home produce `nb.py.lock` and
@@ -189,10 +189,10 @@ selection (plain logic, nothing to prove about feasibility).
 
 ## Code map
 
-- `motabi/__init__.py` — the user-facing calls: `require()` (marks a cell as needing remote
+- `motabi/__init__.py` — the user-facing calls: `remote()` (marks a cell as needing remote
   compute), `scatter()` / `gather()` (bracket the per-item cells).
 - `motabi/executor.py` — plugs into marimo's per-cell execution hook. A plain cell runs
-  normally. A `require` cell asks the launcher to move the sandbox and waits. A `scatter` header
+  normally. A `remote` cell asks the launcher to move the sandbox and waits. A `scatter` header
   triggers the fork; the cells in between are answered from the merged results.
 - `motabi/launcher.py` — runs outside the sandbox, in the slot marimo reserves for its kernel
   process. It starts the kernel inside the sandbox and, on each request left in a shared

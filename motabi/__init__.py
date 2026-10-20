@@ -1,9 +1,10 @@
 """motabi moves a running marimo kernel to the compute its cells need.
 
-A cell that needs more than the machine it is edited on calls `require()` as its first
-statement; the kernel then stays at the site until a cell calls `home()` or the run ends. A range of cells to run once per item is bracketed by `scatter()` in a header cell
+A cell that needs more than the machine it is edited on calls `remote()` as its first
+statement, saying what the site must provide; the kernel then stays at the site until a cell
+calls `home()` or the run ends. A range of cells to run once per item is bracketed by `scatter()` in a header cell
 and `gather()` in a footer cell. The executor (motabi.executor) reads these calls from the
-cells' source; at run time `require` does nothing, `scatter` records its items and `gather`
+cells' source; at run time `remote` does nothing, `scatter` records its items and `gather`
 looks up what the workers defined.
 """
 
@@ -17,7 +18,7 @@ _SCATTER: tuple[list[Any], int] | None = None
 _GATHERED: dict[int, list[Any]] = {}
 
 
-def require(
+def remote(
     *,
     cores: int | None = None,
     memory: str | None = None,
@@ -33,7 +34,7 @@ def home() -> None:
     return None
 
 
-def scatter(items: Any, *, workers: int | None = None, require: Any = None) -> Any:
+def scatter(items: Any, *, workers: int | None = None, remote: Any = None) -> Any:
     """One worker per item; returns worker 0's item in the root, the worker's own in a worker."""
     global _SCATTER
     items = list(items)

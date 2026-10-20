@@ -33,7 +33,7 @@ def _(np):
 
 @app.cell
 def _(data, log, motabi, os):
-    motabi.require(cores=4, memory="8G")
+    motabi.remote(cores=4, memory="8G")
     data[:] *= 2  # in-place mutation of a pre-leg array
     log.write(f"written away, pid {os.getpid()}\n")
     log.flush()
@@ -88,7 +88,7 @@ def _(motabi, payload, tally):
 @app.cell
 def _(motabi):
     # a leg with no descendants: the run ends while the kernel is away, and it comes home
-    motabi.require(cores=2)
+    motabi.remote(cores=2)
     alone = 42
     return (alone,)
 

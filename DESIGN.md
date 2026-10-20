@@ -183,11 +183,11 @@ item = motabi.scatter(samples, workers=16)
 ```
 ```python
 # scattered cells: ordinary cells that read `item`, each with its requirement
-motabi.require(gpus=1)
+motabi.remote(gpus=1)
 aligned = align(item)
 ```
 ```python
-motabi.require(gpus=1)
+motabi.remote(gpus=1)
 stats = summarize(aligned)
 ```
 ```python
@@ -354,7 +354,7 @@ Three pieces live in Marimo; all use what Marimo ships.
   already in hand, the way the cache lifecycle answers with a hit
   (`marimo/_runtime/executor/lifecycles/cached.py:144`). Marimo's `SequentialScheduler`
   (`marimo/_runtime/runner/scheduler.py:77`) is therefore not an obstacle.
-- **Requirement on the cell.** A call at the top of the cell (`motabi.require(...)`,
+- **Requirement on the cell.** A call at the top of the cell (`motabi.remote(...)`,
   `motabi.home()`, `item = motabi.scatter(...)`) is persistent per-cell metadata: it is in the file, it diffs, and
   the executor reads it from the cell's source before running the body. The executor renders the
   cell's state (site, resources, queued, running) by prefixing the cell's output with a status

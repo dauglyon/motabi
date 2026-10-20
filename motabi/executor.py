@@ -5,7 +5,7 @@ marimo's default executor. The executor and the launcher (motabi.launcher, outsi
 sandbox) talk through files in the share directory, so nothing crosses the sandbox boundary
 but bytes on a bind mount:
 
-    leg-<n>.req / .go / .done / .home       out at a require cell; home at a home() cell or
+    leg-<n>.req / .go / .done / .home       out at a remote cell; home at a home() cell or
                                             when the run ends (DESIGN.md 2.3)
     scatter-<n>.req / .go                   fork: W workers restored without network, then the
     scatter-<n>.claim_<i>                   root copy; each copy claims a role on waking
@@ -63,8 +63,8 @@ def _call(code: str, name: str) -> ast.Call | None:
 
 
 def requirement_of(code: str) -> dict[str, Any] | None:
-    """The keyword arguments of a `motabi.require(...)` call in the cell's source, or None."""
-    node = _call(code, "require")
+    """The keyword arguments of a `motabi.remote(...)` call in the cell's source, or None."""
+    node = _call(code, "remote")
     if node is None:
         return None
     out: dict[str, Any] = {}
@@ -143,7 +143,7 @@ class MotabiExecutor:
     # -- leg ---------------------------------------------------------------------------
 
     def _depart(self, cell: Any) -> None:
-        """A require cell starts a leg unless the kernel is already out; the prototype has one
+        """A remote cell starts a leg unless the kernel is already out; the prototype has one
         site, so "out" is the site that meets every requirement."""
         global _AWAY
         req = requirement_of(cell.code)

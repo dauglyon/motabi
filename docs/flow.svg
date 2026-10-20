@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 920" width="1000" height="920" role="img" aria-labelledby="t d">
   <title id="t">How motabi runs a notebook's cells across sites</title>
-  <desc id="d">A notebook's cells run in order from top to bottom. The first cells run at home. A cell containing motabi.require(gpus=1) sends the kernel to a site with a GPU. Three independent cells after it, each with the same requirement, run in parallel as copies of the kernel and fold back into one kernel. A cell containing motabi.home() brings the kernel back home. Later, a cell calling motabi.scatter(samples) stays at home and sends copies of the kernel to a GPU site, where the next two cells, each with motabi.require(gpus=1), run once per sample, in parallel; motabi.gather, back at home, collects each sample's score into one list.</desc>
+  <desc id="d">A notebook's cells run in order from top to bottom. The first cells run at home. A cell containing motabi.remote(gpus=1) sends the kernel to a site with a GPU. Three independent cells after it, each with the same requirement, run in parallel as copies of the kernel and fold back into one kernel. A cell containing motabi.home() brings the kernel back home. Later, a cell calling motabi.scatter(samples) stays at home and sends copies of the kernel to a GPU site, where the next two cells, each with motabi.remote(gpus=1), run once per sample, in parallel; motabi.gather, back at home, collects each sample's score into one list.</desc>
   <style>
     svg {
       --bg: #ffffff; --band: #f6f8fa; --ink: #1f2328; --muted: #59636e; --cell: #d0d7de;
@@ -41,7 +41,7 @@
   <text class="code" x="46" y="145" xml:space="preserve">clean = prep(data)</text>
   <path class="a" d="M306,140 C396,140 446,200 520,200" marker-end="url(#h)"/>
   <rect class="cell" x="526" y="172" width="270" height="56" rx="6"/>
-  <text class="code req" x="540" y="194" xml:space="preserve">motabi.require(gpus=1)</text>
+  <text class="code req" x="540" y="194" xml:space="preserve">motabi.remote(gpus=1)</text>
   <text class="code" x="540" y="216" xml:space="preserve">model = train(clean)</text>
   <text class="note" x="812" y="194">this line sends the</text>
   <text class="note" x="812" y="213">kernel to a GPU site</text>
@@ -53,13 +53,13 @@
   <path class="a" d="M877,264 V284" marker-end="url(#h)"/>
   <text class="note" x="647" y="253" text-anchor="end">independent cells run in parallel</text>
   <rect class="cell" x="342" y="290" width="206" height="56" rx="6"/>
-  <text class="code req" x="356" y="312" xml:space="preserve">motabi.require(gpus=1)</text>
+  <text class="code req" x="356" y="312" xml:space="preserve">motabi.remote(gpus=1)</text>
   <text class="code" x="356" y="334" xml:space="preserve">a = test(model, 1)</text>
   <rect class="cell" x="558" y="290" width="206" height="56" rx="6"/>
-  <text class="code req" x="572" y="312" xml:space="preserve">motabi.require(gpus=1)</text>
+  <text class="code req" x="572" y="312" xml:space="preserve">motabi.remote(gpus=1)</text>
   <text class="code" x="572" y="334" xml:space="preserve">b = test(model, 2)</text>
   <rect class="cell" x="774" y="290" width="206" height="56" rx="6"/>
-  <text class="code req" x="788" y="312" xml:space="preserve">motabi.require(gpus=1)</text>
+  <text class="code req" x="788" y="312" xml:space="preserve">motabi.remote(gpus=1)</text>
   <text class="code" x="788" y="334" xml:space="preserve">c = test(model, 3)</text>
   <path class="a" d="M445,346 V370 M661,346 V370 M877,346 V370 M445,370 H877"/>
   <text class="note" x="681" y="404">fold into one kernel</text>
@@ -81,10 +81,10 @@
   <rect class="cell" x="538" y="628" width="270" height="124" rx="6"/>
   <rect x="526" y="640" width="270" height="124" rx="6" style="fill:var(--band)"/>
   <rect class="cell" x="526" y="640" width="270" height="56" rx="6"/>
-  <text class="code req" x="540" y="662" xml:space="preserve">motabi.require(gpus=1)</text>
+  <text class="code req" x="540" y="662" xml:space="preserve">motabi.remote(gpus=1)</text>
   <text class="code" x="540" y="684" xml:space="preserve">aligned = align(item)</text>
   <rect class="cell" x="526" y="708" width="270" height="56" rx="6"/>
-  <text class="code req" x="540" y="730" xml:space="preserve">motabi.require(gpus=1)</text>
+  <text class="code req" x="540" y="730" xml:space="preserve">motabi.remote(gpus=1)</text>
   <text class="code" x="540" y="752" xml:space="preserve">score = rate(aligned)</text>
   <path class="a" d="M306,568 C426,568 436,668 520,668" marker-end="url(#h)"/>
   <text class="note" x="340" y="556">this line sends copies of the kernel</text>

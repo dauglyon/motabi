@@ -1,7 +1,7 @@
 # Leg prototype (2026-10-20)
 
 A marimo edit session whose kernel runs inside a gVisor sandbox on this machine. A cell that
-calls `motabi.require(...)` is a leg: the sandbox is checkpointed with the kernel blocked inside
+calls `motabi.remote(...)` is a leg: the sandbox is checkpointed with the kernel blocked inside
 the cell, restored as a new container, the body runs, and the same move brings it back. The
 browser stays attached throughout; the server never learns the kernel moved.
 
@@ -10,7 +10,7 @@ browser stays attached throughout; the server never learns the kernel moved.
     ./run.sh                      # creates .venv for the server; the kernel runs in base/tree when staged (see below)
 
 Open the tokened URL marimo prints and run the cells (the user config has `auto_instantiate = false`;
-Ctrl+Shift+R runs stale cells, Ctrl+Enter in a cell runs it). The require cell's console shows
+Ctrl+Shift+R runs stale cells, Ctrl+Enter in a cell runs it). The remote cell's console shows
 the two moves with timings; `leg-output.txt` collects the writes of one file handle opened before
 the first move. `run/` holds the share directory, the runsc root, the images and the logs.
 
