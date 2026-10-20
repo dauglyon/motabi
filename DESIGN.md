@@ -54,13 +54,13 @@ order: a thawed sandbox needs a CPU feature set covering everything it has used,
 eligible sites can only narrow as it runs.
 
 Datasets are named by URI, never by path. A resolver maps a URI to a path inside the sandbox at
-the start of each stay (a bind mount where the store is mounted, a read-through cache otherwise),
+the start of each leg (a bind mount where the store is mounted, a read-through cache otherwise),
 so the same code runs at every site. Large outputs declare a destination store the same way;
 undeclared large writes into the workspace produce a warning with the size.
 
-### 2.3 The stay
+### 2.3 The leg
 
-A **stay** is a run of consecutive cells, in the graph's topological order, whose selected site
+A **leg** is a run of consecutive cells, in the graph's topological order, whose selected site
 is the same. Selection runs when the first of them comes up; later cells are checked against the
 chosen site rather than re-selected, so a run does not bounce between sites for marginal
 differences.
@@ -93,11 +93,68 @@ Branches cannot be merged as sandboxes. Join is at the object level, over the sh
 This is the delta scheme of ElasticNotebook and Kishu, with the restore's address preservation
 replacing their identity bookkeeping.
 
-### 2.5 `map`
+### 2.5 Scatter and gather
 
-The graph sees cells, not loop iterations, so one primitive is added: `map(f, items)` forks one
-branch per item from the current snapshot and joins their return values. It is the only
-construct motabi adds to the language.
+Graph-level fork (2.4) covers cells that happen to be independent. The common shape, one step
+applied to each of N items and a later step aggregating the results, is one cell with a loop,
+which the graph cannot see. Two library calls, recognized by the executor, express it on a
+range of cells with no new syntax:
+
+```python
+# header
+item = motabi.scatter(samples, require=..., workers=16)
+```
+```python
+# scattered cells: ordinary cells that read `item`
+aligned = align(item)
+```
+```python
+stats = summarize(aligned)
+```
+```python
+# footer
+alignments, all_stats = motabi.gather(aligned, stats)
+```
+
+The scattered cells are defined by the graph, not by position: every cell that depends on
+`item`, up to the cells `gather` names. Nothing else in the notebook is touched.
+
+**Mechanism.** At the header the executor takes a snapshot and forks one worker per block of
+items. In each worker `item` is bound and the scattered cells run. In the root, as the scheduler
+reaches each scattered cell, the executor answers "ran in N workers" with one worker's output;
+at the footer it answers with the gathered lists, in item order. Downstream cells see ordinary
+lists, so a reduce is the next cell. The header's snapshot is retained for the session: editing
+a scattered cell re-forks from it and re-runs only the scattered cells, which is the fork-from-
+snapshot use the refresh outline deferred (D6), made the ordinary edit loop.
+
+**Blocks.** `workers=N` sets the worker count and sizes blocks to fit; `block=k` sets items per
+worker; one or the other. With neither, motabi sizes blocks from the site's capabilities and the
+item count. Inside the scattered cells `item` is one element regardless of blocking; the block
+is a scheduling unit the user's code never sees.
+
+**Reduce at the site.** `gather(x, reduce=g)` with an associative `g` runs the reduction as a
+tree inside the workers before the join, so one value comes home instead of N. A non-associative
+reduce is ordinary code in the root after the join.
+
+**Large results.** A gathered value over a size threshold is written to the leg's declared output
+store and returned as a reference, with a warning naming the size. Per-worker files go under a
+directory the resolver provides (`motabi.worker_dir()`), keyed by worker index, so overlays never
+collide and the join places them under the root workspace by index.
+
+**Failures.** A failed item raises in the root with the item and its traceback.
+`gather(..., on_error="skip")` returns the partial list plus an error list. Preemption of a
+worker is not a failure; the worker is resubmitted from its last checkpoint.
+
+**Mutation.** A worker that mutates a root object is the join conflict of 2.4, and with scatter
+it is the common mistake (appending to a global list). The error says so and tells the user to
+define the value instead.
+
+**Nesting.** A scatter inside scattered cells forks from the worker's own snapshot. Depth is
+bounded only by what sites accept.
+
+**Editor.** Each scattered cell keeps its own output, with a selector to view any worker's
+result. A sub-notebook is scattered the same way: a scattered cell calls `app.run(**item)`, which
+is kfolio's sub-analysis fan-out without a file type.
 
 ### 2.6 Batch
 
@@ -127,7 +184,7 @@ compute nodes already provide for podman-hpc.
 | Privileges at destination | VMM only | CAP_CHECKPOINT_RESTORE or root | user namespaces |
 | Isolation | hardware | none of its own | user-space kernel |
 
-The VM wins on fidelity and branch deltas; it loses on the two things an HPC stay is for, shape
+The VM wins on fidelity and branch deltas; it loses on the two things an HPC leg is for, shape
 and GPU, and cannot run where KVM is absent. CRIU is shape-free but a second mechanism with
 per-resource failure modes. gVisor keeps the VM's "one unit, one image" property without KVM.
 Where hardware isolation is required on the platform side, the sandbox runs inside a VM that
@@ -183,7 +240,7 @@ An adapter implements nine calls:
 3. **fetch(keys, dest)** — pull object-store keys to site storage, from the site side.
 4. **push(paths)** — push site files to the object store; return their keys.
 5. **submit(payload, resources, walltime, n_tasks)** — run the payload as the user; return a job
-   handle. The adapter does not inspect or alter the payload. Per-stay secrets (store
+   handle. The adapter does not inspect or alter the payload. Per-leg secrets (store
    credentials, platform token) are injected at launch and never written to the checkpoint image.
 6. **status(handle)** — queued, running, done, failed, preempted.
 7. **cancel(handle)**.
@@ -192,15 +249,15 @@ An adapter implements nine calls:
    the platform. Outbound only.
 
 The payload, written by motabi and the same at every site: fetch the image and workspace;
-`runsc --rootless --platform=systrap restore`; signal the executor; wait for the stay to end or
+`runsc --rootless --platform=systrap restore`; signal the executor; wait for the leg to end or
 the warning; `runsc checkpoint` (with `--cuda-checkpoint-path` where a GPU is present); push;
 exit. A preempted or walltime-ended job is not a failure: the payload checkpointed on the
-warning and the stay is resubmitted from that image. Fork is the same payload with `n_tasks=N`
+warning and the leg is resubmitted from that image. Fork is the same payload with `n_tasks=N`
 and a branch id per task; each task pushes its delta and the root applies them.
 
 Byte movement is adapter-side (the site fetches and pushes with the credentials it was given),
-since Perlmutter reaches S3 outbound and Globus sites differ. A stay is one job; a long-lived
-allocation hosting many stays is a later option.
+since Perlmutter reaches S3 outbound and Globus sites differ. A leg is one job; a long-lived
+allocation hosting many legs is a later option.
 
 ## 6. First targets
 
@@ -242,7 +299,7 @@ Rejected:
 - **CRIU as the primary mechanism.** Shape-free and GPU-capable, but a second mechanism with a
   per-resource unsupported list. Fallback only.
 - **microVM as the primary mechanism.** Needs KVM on compute nodes; shape fixed at boot, so an
-  HPC stay would need hotplug within a boot-time ceiling and cannot snapshot a passthrough GPU.
+  HPC leg would need hotplug within a boot-time ceiling and cannot snapshot a passthrough GPU.
 - **DMTCP in Apptainer** (NERSC's supported checkpoint path): process-level with LD_PRELOAD
   interception and no sandbox state. Fallback only.
 - **User-Mode Linux**: a full Linux kernel as an unprivileged process, but no snapshot tooling,
