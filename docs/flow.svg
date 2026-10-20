@@ -1,81 +1,78 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 340" width="1000" height="340" role="img" aria-labelledby="t d">
-  <title id="t">How motabi moves a marimo kernel</title>
-  <desc id="d">When a cell needs more than home can give, the kernel is checkpointed and restored in a job at a site. Independent cells run there as copies of the kernel, which fold back into one kernel. The kernel is then checkpointed and restored at home, where the session continues.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 520" width="1000" height="520" role="img" aria-labelledby="t d">
+  <title id="t">How motabi runs a notebook's cells across sites</title>
+  <desc id="d">A notebook's cells run in order from top to bottom. The first cells run at home. A cell that calls motabi.require(gpus=1) sends the kernel to a site with a GPU: the kernel is checkpointed and restored in a job there. Three independent cells after it run in parallel as copies of the kernel. Their results fold back into one kernel, which is checkpointed and returns home, where the remaining cells run.</desc>
   <style>
     svg {
-      --bg: #ffffff; --band: #f6f8fa; --ink: #1f2328; --muted: #59636e; --arrow: #6e7781;
-      --k: #1a7f64; --k-bg: #e3f3ec;
+      --bg: #ffffff; --band: #f6f8fa; --ink: #1f2328; --muted: #59636e; --cell: #d0d7de;
+      --k: #1a7f64;
     }
     @media (prefers-color-scheme: dark) {
       svg {
-        --bg: #0d1117; --band: #161b22; --ink: #e6edf3; --muted: #9198a1; --arrow: #8b949e;
-        --k: #3fb68b; --k-bg: #11261e;
+        --bg: #0d1117; --band: #161b22; --ink: #e6edf3; --muted: #9198a1; --cell: #3d444d;
+        --k: #3fb68b;
       }
     }
-    text { font-family: Inter, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 14px; fill: var(--ink); }
+    text { font-family: Inter, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 15px; fill: var(--ink); }
     .place { font-size: 16px; font-weight: 600; }
-    .note { fill: var(--muted); font-size: 15px; }
-    .k { fill: var(--k-bg); stroke: var(--k); stroke-width: 1.5; }
-    .kt { font-weight: 600; text-anchor: middle; }
-    .a { fill: none; stroke: var(--arrow); stroke-width: 1.8; }
-    .ah { fill: var(--arrow); }
+    .note { fill: var(--muted); }
+    .code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13.5px; }
+    .req { fill: var(--k); font-weight: 600; }
+    .cell { fill: var(--bg); stroke: var(--cell); stroke-width: 1.2; }
+    .a { fill: none; stroke: var(--k); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+    .ah { fill: var(--k); }
   </style>
   <defs>
-    <marker id="h" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="ah" d="M0,0 L10,5 L0,10 z"/></marker>
+    <marker id="h" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto"><path class="ah" d="M0,0 L10,5 L0,10 z"/></marker>
   </defs>
 
-  <rect x="0" y="0" width="1000" height="340" rx="12" style="fill:var(--bg)"/>
+  <rect x="0" y="0" width="1000" height="520" rx="12" style="fill:var(--bg)"/>
 
   <!-- the two places -->
-  <rect x="12" y="12" width="976" height="96" rx="10" style="fill:var(--band)"/>
-  <rect x="12" y="188" width="976" height="140" rx="10" style="fill:var(--band)"/>
-  <text class="place" x="32" y="56">Home</text>
-  <text class="note" x="32" y="78">where you edit</text>
-  <text class="place" x="32" y="252">Site</text>
-  <text class="note" x="32" y="274">cluster or GPU node</text>
+  <rect x="12" y="12" width="360" height="496" rx="10" style="fill:var(--band)"/>
+  <rect x="384" y="12" width="604" height="496" rx="10" style="fill:var(--band)"/>
+  <text class="place" x="40" y="44">Home</text>
+  <text class="note" x="92" y="44">where you edit</text>
+  <text class="place" x="412" y="44">Site</text>
+  <text class="note" x="452" y="44">cluster or GPU node</text>
 
-  <!-- start at home -->
-  <rect class="k" x="160" y="36" width="110" height="48" rx="8"/>
-  <text class="kt" x="215" y="65">kernel</text>
-  <text class="note" x="286" y="65">a cell needs a GPU</text>
+  <!-- cells at home -->
+  <rect class="cell" x="40" y="68" width="304" height="40" rx="6"/>
+  <text class="code" x="56" y="93">data = load("run42")</text>
+  <rect class="cell" x="40" y="120" width="304" height="40" rx="6"/>
+  <text class="code" x="56" y="145">clean = prep(data)</text>
 
-  <!-- go to the site -->
-  <path class="a" d="M215,84 C215,190 240,258 302,258"/>
-  <path class="a" d="M290,258 H304" marker-end="url(#h)"/>
-  <text class="note" x="232" y="140">checkpoint, restore</text>
-  <text class="note" x="232" y="158">in a job at the site</text>
+  <!-- the requirement sends the kernel to the site -->
+  <path class="a" d="M344,140 C420,140 450,208 520,208" marker-end="url(#h)"/>
+  <rect class="cell" x="526" y="180" width="260" height="56" rx="6"/>
+  <text class="code req" x="542" y="202">motabi.require(gpus=1)</text>
+  <text class="code" x="542" y="224">model = train(clean)</text>
+  <text class="note" x="802" y="202">this line sends the</text>
+  <text class="note" x="802" y="221">kernel to a GPU site</text>
 
-  <rect class="k" x="310" y="234" width="110" height="48" rx="8"/>
-  <text class="kt" x="365" y="263">kernel</text>
+  <!-- independent cells run in parallel -->
+  <path class="a" d="M656,236 V258 M476,258 H836"/>
+  <path class="a" d="M476,258 V282" marker-end="url(#h)"/>
+  <path class="a" d="M656,258 V282" marker-end="url(#h)"/>
+  <path class="a" d="M836,258 V282" marker-end="url(#h)"/>
+  <text class="note" x="852" y="254">independent cells</text>
+  <text class="note" x="852" y="273">run in parallel</text>
 
-  <!-- split into copies -->
-  <path class="a" d="M420,258 C450,258 460,214 494,214" marker-end="url(#h)"/>
-  <path class="a" d="M420,258 H494" marker-end="url(#h)"/>
-  <path class="a" d="M420,258 C450,258 460,302 494,302" marker-end="url(#h)"/>
-  <rect class="k" x="500" y="200" width="84" height="28" rx="7"/>
-  <text class="kt" x="542" y="219">copy</text>
-  <rect class="k" x="500" y="244" width="84" height="28" rx="7"/>
-  <text class="kt" x="542" y="263">copy</text>
-  <rect class="k" x="500" y="288" width="84" height="28" rx="7"/>
-  <text class="kt" x="542" y="307">copy</text>
-  <text class="note" x="436" y="140">independent cells</text>
-  <text class="note" x="436" y="158">run at the same time</text>
+  <rect class="cell" x="394" y="288" width="164" height="40" rx="6"/>
+  <text class="code" x="406" y="313">a = test(model, 1)</text>
+  <rect class="cell" x="574" y="288" width="164" height="40" rx="6"/>
+  <text class="code" x="586" y="313">b = test(model, 2)</text>
+  <rect class="cell" x="754" y="288" width="164" height="40" rx="6"/>
+  <text class="code" x="766" y="313">c = test(model, 3)</text>
 
-  <!-- fold back into one -->
-  <path class="a" d="M584,214 C618,214 628,258 658,258" marker-end="url(#h)"/>
-  <path class="a" d="M584,258 H658" marker-end="url(#h)"/>
-  <path class="a" d="M584,302 C618,302 628,258 658,258" marker-end="url(#h)"/>
-  <rect class="k" x="664" y="234" width="110" height="48" rx="8"/>
-  <text class="kt" x="719" y="263">kernel</text>
-  <text class="note" x="600" y="140">their results fold</text>
-  <text class="note" x="600" y="158">back into one kernel</text>
+  <!-- fold into one kernel and return home -->
+  <path class="a" d="M476,328 V352 M656,328 V352 M836,328 V352 M476,352 H836"/>
+  <path class="a" d="M656,352 C656,404 480,420 350,420" marker-end="url(#h)"/>
+  <text class="note" x="676" y="392">fold into one kernel,</text>
+  <text class="note" x="676" y="411">checkpoint, return home</text>
 
-  <!-- come home -->
-  <path class="a" d="M774,258 C836,258 860,190 860,90" marker-end="url(#h)"/>
-  <text class="note" x="874" y="140">checkpoint,</text>
-  <text class="note" x="874" y="158">return home</text>
-
-  <rect class="k" x="805" y="36" width="110" height="48" rx="8"/>
-  <text class="kt" x="860" y="65">kernel</text>
-  <text class="note" x="789" y="65" text-anchor="end">the session continues</text>
+  <!-- cells at home again -->
+  <rect class="cell" x="40" y="400" width="304" height="40" rx="6"/>
+  <text class="code" x="56" y="425">best = max(a, b, c)</text>
+  <rect class="cell" x="40" y="452" width="304" height="40" rx="6"/>
+  <text class="code" x="56" y="477">plot(best)</text>
 </svg>
