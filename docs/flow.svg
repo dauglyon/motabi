@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 560" width="1000" height="560" role="img" aria-labelledby="t d">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 640" width="1000" height="640" role="img" aria-labelledby="t d">
   <title id="t">How motabi moves a marimo kernel</title>
-  <desc id="d">A cell declares a requirement; after approval in the cell, the kernel's gVisor sandbox is checkpointed at home and restored inside a job at a site, where datasets are mounted by URI. Independent cells fork into workers restored from one checkpoint; their defines fold back into the root kernel by address, and the sandbox is checkpointed and restored at home again.</desc>
+  <desc id="d">A cell declares a requirement; the user approves it in the cell. The kernel's gVisor sandbox is checkpointed at home and restored inside a job at a site, where datasets are mounted by URI. Independent cells fork into workers restored from one checkpoint; their defines fold back into the root kernel by address, and the sandbox is checkpointed and restored at home again.</desc>
   <style>
     svg {
       --bg: #ffffff; --lane: #f6f8fa; --line: #d0d7de; --ink: #1f2328; --muted: #59636e;
@@ -14,140 +14,139 @@
         --work: #a371f7; --work-bg: #211a33; --link: #4493f8;
       }
     }
-    text { font-family: Inter, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: var(--ink); font-size: 12px; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 10.5px; }
+    text { font-family: Inter, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: var(--ink); font-size: 13px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; }
+    .small { font-size: 12px; }
     .muted { fill: var(--muted); }
-    .small { font-size: 10.5px; }
-    .lab { font-size: 14px; font-weight: 600; }
+    .lab { font-size: 15px; font-weight: 600; }
     .b { font-weight: 600; }
     .bg { fill: var(--bg); }
     .lane { fill: var(--lane); }
     .bar { fill: var(--bg); stroke: var(--line); }
-    .sandbox { fill: var(--kern-bg); stroke: var(--kern); stroke-width: 1.5; stroke-dasharray: 5 3; }
-    .worker { fill: var(--work-bg); stroke: var(--work); stroke-width: 1.5; stroke-dasharray: 5 3; }
-    .job { fill: none; stroke: var(--muted); stroke-width: 1; stroke-dasharray: 2 3; }
+    .kernel { fill: var(--kern-bg); stroke: var(--kern); stroke-width: 1.5; }
+    .worker { fill: var(--work-bg); stroke: var(--work); stroke-width: 1.5; }
+    .job { fill: none; stroke: var(--muted); stroke-width: 1.2; stroke-dasharray: 1.5 3.5; stroke-linecap: round; }
     .store { fill: var(--bg); stroke: var(--muted); stroke-width: 1.2; }
-    .move { fill: none; stroke: var(--move); stroke-width: 2.2; }
+    .move { fill: none; stroke: var(--move); stroke-width: 2.4; }
     .fork { fill: none; stroke: var(--work); stroke-width: 1.6; }
-    .link { fill: none; stroke: var(--link); stroke-width: 1.4; stroke-dasharray: 4 3; }
-    .idle { fill: none; stroke: var(--muted); stroke-width: 1.2; stroke-dasharray: 2 3; }
+    .link { fill: none; stroke: var(--link); stroke-width: 1.5; stroke-dasharray: 5 4; }
     .data { fill: none; stroke: var(--muted); stroke-width: 1.4; }
+    .axis { fill: none; stroke: var(--muted); stroke-width: 1.2; }
     .chip { fill: var(--move-bg); stroke: var(--move); }
+    .btn { fill: var(--move); }
+    .btn-t { fill: var(--bg); font-size: 12px; font-weight: 600; text-anchor: middle; }
     .badge { fill: var(--move); }
-    .badge-t { fill: var(--bg); font-size: 11px; font-weight: 700; text-anchor: middle; }
+    .badge-t { fill: var(--bg); font-size: 12px; font-weight: 700; text-anchor: middle; }
     .ah-move { fill: var(--move); } .ah-work { fill: var(--work); } .ah-link { fill: var(--link); } .ah-data { fill: var(--muted); }
   </style>
   <defs>
-    <marker id="am" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah-move" d="M0,0 L10,5 L0,10 z"/></marker>
+    <marker id="am" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path class="ah-move" d="M0,0 L10,5 L0,10 z"/></marker>
     <marker id="aw" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path class="ah-work" d="M0,0 L10,5 L0,10 z"/></marker>
     <marker id="al" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path class="ah-link" d="M0,0 L10,5 L0,10 z"/></marker>
     <marker id="ad" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path class="ah-data" d="M0,0 L10,5 L0,10 z"/></marker>
   </defs>
 
-  <rect class="bg" x="0" y="0" width="1000" height="560" rx="12"/>
+  <rect class="bg" x="0" y="0" width="1000" height="640" rx="12"/>
 
   <!-- Lanes -->
   <rect class="lane" x="12" y="12" width="976" height="80" rx="10"/>
-  <rect class="lane" x="12" y="100" width="976" height="164" rx="10"/>
-  <rect class="lane" x="12" y="272" width="976" height="276" rx="10"/>
+  <rect class="lane" x="12" y="100" width="976" height="176" rx="10"/>
+  <rect class="lane" x="12" y="284" width="976" height="312" rx="10"/>
   <text class="lab" x="28" y="48">Laptop</text>
-  <text class="small muted" x="28" y="66">browser only</text>
-  <text class="lab" x="28" y="132">Home</text>
-  <text class="small muted" x="28" y="150">Linux, same ISA</text>
-  <text class="small muted" x="28" y="165">as the sites</text>
-  <text class="lab" x="28" y="304">Site</text>
-  <text class="small muted" x="28" y="322">cluster or</text>
-  <text class="small muted" x="28" y="337">GPU node</text>
+  <text class="small muted" x="28" y="67">browser only</text>
+  <text class="lab" x="28" y="134">Home</text>
+  <text class="small muted" x="28" y="153">Linux, same CPU</text>
+  <text class="small muted" x="28" y="169">family as the sites</text>
+  <text class="lab" x="28" y="316">Site</text>
+  <text class="small muted" x="28" y="335">cluster or</text>
+  <text class="small muted" x="28" y="351">GPU node</text>
 
-  <!-- Laptop: editor with the approval prompt -->
-  <rect class="bar" x="150" y="32" width="826" height="44" rx="8"/>
-  <text class="muted" x="166" y="58">marimo editor</text>
-  <rect class="chip" x="300" y="40" width="420" height="28" rx="6"/>
-  <circle class="badge" cx="318" cy="54" r="9"/><text class="badge-t" x="318" y="58">2</text>
-  <text x="336" y="58">Run on <tspan class="b">perlmutter</tspan>: 1 GPU, 2 h, queue ~10 min?</text>
-  <text class="mono" x="682" y="58">[y]</text>
+  <!-- Laptop: editor with the approval prompt (step 2) -->
+  <rect class="bar" x="160" y="30" width="816" height="44" rx="8"/>
+  <text class="muted" x="176" y="57">marimo editor</text>
+  <rect class="chip" x="290" y="38" width="410" height="28" rx="6"/>
+  <circle class="badge" cx="306" cy="52" r="10"/><text class="badge-t" x="306" y="56">2</text>
+  <text x="324" y="57">Run on <tspan class="b">perlmutter</tspan>: 1 GPU, 2 h, queue ~10 min?</text>
+  <rect class="btn" x="648" y="43" width="44" height="18" rx="4"/><text class="btn-t" x="670" y="56">Run</text>
+  <text class="small muted" x="716" y="57">user approves in the cell</text>
 
-  <!-- Home: server, sandbox before and after -->
-  <rect class="bar" x="150" y="114" width="826" height="34" rx="8"/>
-  <text x="166" y="136">marimo server  ·  motabi orchestrator</text>
-  <line class="data" x1="225" y1="160" x2="225" y2="148"/>
+  <!-- Home: server stays; kernel leaves and returns -->
+  <rect class="bar" x="160" y="114" width="816" height="34" rx="8"/>
+  <text x="176" y="136">marimo server · motabi orchestrator <tspan class="small muted">  stay home and hold the session while the kernel is away</tspan></text>
 
-  <rect class="sandbox" x="150" y="160" width="150" height="76" rx="8"/>
-  <text class="small muted" x="162" y="178">gVisor sandbox</text>
-  <text class="b" x="162" y="200">kernel</text>
-  <text class="mono" x="162" y="222">require(gpus=1)</text>
-  <circle class="badge" cx="300" cy="160" r="9"/><text class="badge-t" x="300" y="164">1</text>
+  <rect class="kernel" x="160" y="166" width="160" height="80" rx="8"/>
+  <text class="b" x="174" y="190">kernel</text>
+  <text class="mono" x="174" y="211">require(gpus=1)</text>
+  <text class="small muted" x="174" y="233">in a gVisor sandbox</text>
+  <circle class="badge" cx="320" cy="166" r="10"/><text class="badge-t" x="320" y="170">1</text>
+  <text class="small" x="336" y="171">cell declares a requirement</text>
 
-  <text class="small muted" x="664" y="200" text-anchor="middle" font-style="italic">the server keeps the session</text>
-  <text class="small muted" x="664" y="215" text-anchor="middle" font-style="italic">while the kernel is away</text>
+  <rect class="kernel" x="856" y="166" width="120" height="80" rx="8"/>
+  <text class="b" x="870" y="190">kernel</text>
+  <text class="small muted" x="870" y="211">same kernel,</text>
+  <text class="small muted" x="870" y="227">back home</text>
 
-  <rect class="sandbox" x="862" y="160" width="114" height="76" rx="8"/>
-  <text class="small muted" x="874" y="178">gVisor sandbox</text>
-  <text class="b" x="874" y="200">kernel</text>
-  <text class="small muted" x="874" y="222">back home</text>
+  <!-- Site: one job; the root kernel, workers forked from it -->
+  <rect class="job" x="384" y="298" width="592" height="286" rx="10"/>
+  <text class="small muted" x="964" y="574" text-anchor="end">one Slurm job · user namespaces only, no root</text>
 
-  <!-- Site: job, root, workers -->
-  <rect class="job" x="372" y="288" width="474" height="248" rx="10"/>
-  <text class="small muted" x="834" y="526" text-anchor="end">one Slurm job · user namespaces only, no root</text>
+  <rect class="kernel" x="400" y="324" width="450" height="60" rx="8"/>
+  <text class="b" x="414" y="348">root kernel</text>
+  <text class="small muted" x="414" y="368">restored here; waits during the fork</text>
+  <text class="small muted" x="836" y="368" text-anchor="end">defines folded in</text>
 
-  <rect class="sandbox" x="392" y="320" width="120" height="64" rx="8"/>
-  <text class="b" x="404" y="346">root kernel</text>
-  <text class="small muted" x="404" y="366">restored</text>
+  <!-- session channel back to the server -->
+  <path class="link" d="M524,322 V152" marker-start="url(#al)" marker-end="url(#al)"/>
+  <text class="small" x="536" y="206" style="fill:var(--link)">kernel ↔ server: ZeroMQ</text>
+  <text class="small" x="536" y="222" style="fill:var(--link)">through the site's tunnel</text>
 
-  <!-- tunnel back to the server -->
-  <path class="link" d="M480,320 V152" marker-end="url(#al)"/>
-  <text class="small" x="490" y="214" style="fill:var(--link)">ZeroMQ via</text>
-  <text class="small" x="490" y="228" style="fill:var(--link)">the site's tunnel</text>
+  <!-- fork (step 5) -->
+  <circle class="badge" cx="480" cy="420" r="10"/><text class="badge-t" x="480" y="424">5</text>
+  <text class="small b" x="496" y="425">fork</text>
+  <text class="small" x="470" y="445">N restores of</text>
+  <text class="small" x="470" y="461">one checkpoint</text>
 
-  <!-- root waits during the fork -->
-  <path class="idle" d="M512,352 H730"/>
-  <text class="small muted" x="610" y="345">root waits</text>
-  <circle cx="544" cy="352" r="5" style="fill:var(--work)"/>
+  <path class="fork" d="M604,384 C604,430 616,445 638,445" marker-end="url(#aw)"/>
+  <path class="fork" d="M604,384 C604,460 616,487 638,487" marker-end="url(#aw)"/>
+  <path class="fork" d="M604,384 C604,490 616,529 638,529" marker-end="url(#aw)"/>
 
-  <path class="fork" d="M544,352 C556,352 560,411 574,411" marker-end="url(#aw)"/>
-  <path class="fork" d="M544,352 C556,352 560,451 574,451" marker-end="url(#aw)"/>
-  <path class="fork" d="M544,352 C556,352 560,491 574,491" marker-end="url(#aw)"/>
+  <rect class="worker" x="640" y="430" width="132" height="30" rx="7"/>
+  <text class="small" x="652" y="450">worker 1 · cell A</text>
+  <rect class="worker" x="640" y="472" width="132" height="30" rx="7"/>
+  <text class="small" x="652" y="492">worker 2 · cell B</text>
+  <rect class="worker" x="640" y="514" width="132" height="30" rx="7"/>
+  <text class="small" x="652" y="534">worker 3 · cell C</text>
 
-  <rect class="worker" x="576" y="396" width="116" height="30" rx="7"/>
-  <text class="small" x="588" y="415">worker 1 · cell A</text>
-  <rect class="worker" x="576" y="436" width="116" height="30" rx="7"/>
-  <text class="small" x="588" y="455">worker 2 · cell B</text>
-  <rect class="worker" x="576" y="476" width="116" height="30" rx="7"/>
-  <text class="small" x="588" y="495">worker 3 · cell C</text>
+  <!-- fold (step 6) -->
+  <path class="fork" d="M772,445 C792,445 798,420 798,388" marker-end="url(#aw)"/>
+  <path class="fork" d="M772,487 C800,487 808,440 808,388" marker-end="url(#aw)"/>
+  <path class="fork" d="M772,529 C808,529 818,460 818,388" marker-end="url(#aw)"/>
+  <circle class="badge" cx="852" cy="440" r="10"/><text class="badge-t" x="852" y="444">6</text>
+  <text class="small b" x="868" y="445">fold</text>
+  <text class="small" x="842" y="465">defines join the</text>
+  <text class="small" x="842" y="481">root by address</text>
 
-  <circle class="badge" cx="432" cy="432" r="9"/><text class="badge-t" x="432" y="436">5</text>
-  <text class="small b" x="446" y="436">fork: N restores</text>
-  <text class="small" x="446" y="451">of one checkpoint</text>
+  <!-- datasets (step 4) -->
+  <circle class="badge" cx="180" cy="412" r="10"/><text class="badge-t" x="180" y="416">4</text>
+  <text class="small" x="196" y="417">datasets mounted</text>
+  <text class="small" x="196" y="433">here, by URI</text>
+  <path class="store" d="M170,456 V516 A66,10 0 0 0 302,516 V456"/>
+  <ellipse class="store" cx="236" cy="456" rx="66" ry="10"/>
+  <text class="b small" x="236" y="490" text-anchor="middle">dataset store</text>
+  <text class="mono muted" x="236" y="508" text-anchor="middle">s3://lab/run42</text>
+  <path class="data" d="M304,486 C380,486 424,450 424,390" marker-end="url(#ad)"/>
 
-  <path class="fork" d="M692,411 C712,411 712,362 728,360" marker-end="url(#aw)"/>
-  <path class="fork" d="M692,451 C716,451 714,370 728,370" marker-end="url(#aw)"/>
-  <path class="fork" d="M692,491 C720,491 716,380 728,380" marker-end="url(#aw)"/>
+  <!-- migration out (step 3) and back (step 7) -->
+  <path class="move" d="M240,246 V312 Q240,352 280,352 H394" marker-end="url(#am)"/>
+  <circle class="badge" cx="262" cy="300" r="10"/><text class="badge-t" x="262" y="304">3</text>
+  <text class="small" x="278" y="305">checkpoint, then</text>
+  <text class="small" x="278" y="321">restore in a job</text>
 
-  <rect class="sandbox" x="730" y="320" width="100" height="64" rx="8"/>
-  <text class="b" x="742" y="346">root kernel</text>
-  <text class="small muted" x="742" y="366">+ their defines</text>
+  <path class="move" d="M820,324 V236 Q820,206 846,206 H850" marker-end="url(#am)"/>
+  <circle class="badge" cx="652" cy="256" r="10"/><text class="badge-t" x="652" y="260">7</text>
+  <text class="small" x="668" y="261">checkpoint, return home</text>
 
-  <circle class="badge" cx="742" cy="420" r="9"/><text class="badge-t" x="742" y="424">6</text>
-  <text class="small b" x="756" y="424">fold</text>
-  <text class="small" x="736" y="442">defines join the</text>
-  <text class="small" x="736" y="457">root by address</text>
-
-  <!-- datasets -->
-  <path class="store" d="M168,412 V478 A66,10 0 0 0 300,478 V412"/>
-  <ellipse class="store" cx="234" cy="412" rx="66" ry="10"/>
-  <text class="b small" x="234" y="446" text-anchor="middle">dataset store</text>
-  <text class="mono muted" x="234" y="463" text-anchor="middle">s3://lab/run42</text>
-  <text class="small" x="234" y="510" text-anchor="middle">mounted at the site, by URI</text>
-  <circle class="badge" cx="300" cy="404" r="9"/><text class="badge-t" x="300" y="408">4</text>
-  <path class="data" d="M302,450 C350,450 404,436 404,390" marker-end="url(#ad)"/>
-
-  <!-- migration out and back -->
-  <path class="move" d="M225,236 V312 Q225,352 265,352 H386" marker-end="url(#am)"/>
-  <circle class="badge" cx="248" cy="296" r="9"/><text class="badge-t" x="248" y="300">3</text>
-  <text class="small" x="262" y="300">checkpoint, then</text>
-  <text class="small" x="262" y="315">restore in a job</text>
-
-  <path class="move" d="M780,320 V230 Q780,198 812,198 H856" marker-end="url(#am)"/>
-  <circle class="badge" cx="796" cy="252" r="9"/><text class="badge-t" x="796" y="256">7</text>
-  <text class="small" x="810" y="256">checkpoint, return home</text>
+  <!-- time axis -->
+  <path class="axis" d="M160,614 H966" marker-end="url(#ad)"/>
+  <text class="small muted" x="160" y="632">time</text>
 </svg>
