@@ -1,0 +1,17 @@
+#cloud-config
+users:
+  - name: dauglyon
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFiBvWCYVnUqbw4v04LnYQ5EEi9kUG+bWVRHSLpG7ywn motabi-site
+# unprivileged user namespaces: rootless runsc needs them (Ubuntu 24.04 restricts via AppArmor)
+write_files:
+  - path: /etc/sysctl.d/60-userns.conf
+    content: |
+      kernel.apparmor_restrict_unprivileged_userns = 0
+      kernel.unprivileged_userns_clone = 1
+runcmd:
+  - sysctl --system
+  - mkdir -p /home/dauglyon/work/motabi /mnt
+  - chown -R dauglyon:dauglyon /home/dauglyon

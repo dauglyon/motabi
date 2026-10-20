@@ -19,6 +19,21 @@ the kernel launch to `motabi.launcher`, which starts `motabi.kernel` as process 
 sandbox, and the kernel as its child. The executor (`motabi.executor`) and the launcher talk
 through files in `run/share`.
 
+## A second machine
+
+    ./env/build.sh                # environment image → rootfs/ (the sandbox's "/"; run.sh uses it when present)
+    docker build -t motabi-sitehost site
+    CPU=Haswell site/run-vm.sh    # Ubuntu cloud-image guest under QEMU/KVM in a container; ssh on :2222
+    site/provision.sh             # runsc, rootfs/, the checkout → the guest, same paths
+    MOTABI_SITE=dauglyon@127.0.0.1 \
+    MOTABI_SITE_SSH="-p 2222 -i $PWD/site/id_site -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
+    MOTABI_CPU_FEATURES=<comma list> ./run.sh
+
+`MOTABI_CPU_FEATURES` is the intersection of the host's and the guest's `/proc/cpuinfo` flags
+restricted to the names gVisor knows (`pkg/cpuid/features_amd64.go`); without it the guest
+refuses every restore and the leg runs at home. The cloud image is 621 MB from
+cloud-images.ubuntu.com into `site/`; the guest needs `/dev/kvm` readable by the user.
+
 ## Result
 
 Seven legs in one session, fourteen checkpoint/restore cycles, all completed; the browser
@@ -59,6 +74,16 @@ offset), the loaded numpy, and the marimo kernel's own threads and ZeroMQ socket
   size each entry needs is recorded at snapshot time instead.
 - A linear scan per seed in the snapshot was quadratic in the heap: 0.6 s at 236k objects,
   26 s at 651k after marimo's completion engine parsed numpy. It is a map lookup now.
+- The runsc release ships sidecar binaries (`gvisor_sentry` and others) beside `runsc` in
+  `gvisor-bin/`; a restore on a machine with only the `runsc` file fails to create the sandbox.
+- An rsync of the share directory without `--delete` left a previous session's request files on
+  the guest, which the next session fetched and acted on. The launcher now clears the site's
+  copy of the run directory at start.
+- A file the kernel holds open while away is reopened at home by path at the same offset. Before
+  the workspace travelled with the kernel, the home copy got a hole of zeros where the guest's
+  write had gone. The workspace (notebook directory minus local-only trees) is now pushed out
+  and fetched back with every move.
+- Playwright: Ctrl+Enter on an unchanged, already-run cell does not run it; edit the cell first.
 - `run.sh` kills every process whose command line matches `motabi.launcher`; the dot matches
   any character, so a shell whose command mentions `motabi/launcher.py` is killed too.
 - The approval gate, site selection and the return policy are not in the prototype.

@@ -74,6 +74,25 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
    those windows. The merge log now reports `dead` (tabled objects freed before the save, 0–30
    in these runs) and `skipped` (increases refused at merge, 0 in every run).
 
+4. **The cross-machine move.** A stand-in site: an Ubuntu 24.04 guest under QEMU/KVM with the
+   CPU model set to Haswell, run from a Docker container on canopy (`prototype/site/`), reached
+   by ssh on port 2222. The kernel's sandbox root is now an environment image exported to a
+   directory (`prototype/env/`, `env/build.sh` → `prototype/rootfs/`) and the guest holds a copy
+   at the same path, with runsc and the checkout. A leg whose session names a site
+   (`MOTABI_SITE`, `MOTABI_SITE_SSH`) is checkpointed at home, pushed with the bundle, the
+   share directory and the workspace, restored in the guest, run there, checkpointed there,
+   pulled back and restored at home; the five server ports are reverse-tunnelled by one ssh
+   process so the kernel's reconnect finds the server at the loopback address it always used.
+   Verified: five legs to the guest in one session plus local scatters between them; a file
+   the cell wrote in the guest is on canopy afterwards; images 140–282 MB; a round trip is
+   about 4 s in the browser, of which transfer is 0.8–1.2 s each way over the local port
+   forward (a real site's link will dominate). The CPU-feature pin is gVisor's own: the spec
+   annotation `dev.gvisor.internal.cpufeatures` fixes the sentry's feature set at boot, the
+   checkpoint carries it, and a restore on a host missing any feature is refused. Pinned to
+   the 54 features canopy and the guest share (`MOTABI_CPU_FEATURES`), every leg restores;
+   unpinned, the guest refuses with "incompatible FeatureSet: missing features" naming adx,
+   rdseed, vmx and the rest, and the launcher runs the leg at home and says so in the cell.
+
 ## Open issues, in the order worth addressing
 
 1. **NumPy array shape is wrong after a scatter merge.** A worker's new NumPy array has its
@@ -94,11 +113,11 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
    scatters will exhaust it. The design's intent is that a range is released when everything
    merged into it has been dropped; that bookkeeping is not built.
 
-3. **The cross-machine move is untested** because there is no second same-architecture Linux
-   machine available. The plan agreed with the user is to run a local Linux virtual machine on
-   canopy as the stand-in second site. That VM proves the image transfer and the connection
-   tunnel back to the server; it does not prove a real scheduler or a real site's policies. See
-   "Next" below.
+3. **No scheduler, no real site.** The guest stands in for a login node: ssh, rsync, and runsc
+   invoked directly. A Slurm or Superfacility adapter (submit, status, cancel, walltime
+   warning) is not written, and nothing has been tried over a real uplink. The pin is also
+   set by hand (`MOTABI_CPU_FEATURES` from the host–guest intersection); the design has it
+   computed from each site's `capabilities(user)` before the kernel starts.
 
 4. **The original kernel is not frozen while workers run.** A worker's new objects may point at
    a pre-fork object; if the original kernel drops its last reference to that object while the
@@ -112,17 +131,28 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
    nodes) to the next snapshot, 236k → 651k. Harmless now that the table is linear, but the
    saved image and the table grow with whatever the kernel's helper threads keep.
 
+6. **The prototype goes out and back around every `require` cell.** The design (2.3, since PR
+   #1) has the kernel stay at the site until `motabi.home()` or the end of the run. Changing
+   the executor to stay halves the transfers per leg.
+
+7. **The environment image is an exported tree, not marimo's inline metadata.** A restore maps
+   the interpreter, libc and every extension by path and needs identical bytes at the site,
+   so the prototype ships `rootfs/`. Marimo's norm is PEP 723 metadata resolved by uv per
+   machine; the reconciliation under discussion is a small digest-named base plus `uv sync`
+   from a lockfile at each site (wheels only for native code), with the checkpoint carrying
+   digests of its mapped files for the payload to verify before restoring. Not decided.
+
 ## Next
 
 In order:
 
-1. **The cross-machine move**, against a local VM on canopy. Needs: a way to make the saved
-   image available to the VM and back (a shared directory or scp), a tunnel so the kernel inside
-   the VM can reach the marimo server on canopy, and a pin so the kernel only uses CPU features
-   both machines share. A VM stands in for a login/compute node; it does not stand in for the
-   job scheduler or the data stores, which come later with a real site.
+1. **Decide the environment question** (issue 7), then make the executor stay out until
+   `motabi.home()` (issue 6).
 
-2. **NumPy metadata** (issue 1), once a scatter is wanted for array work. The tractable path is
+2. **A real site**: the slurm-ssh adapter against Lawrencium, with the pin computed from
+   capabilities. The guest recipe in `prototype/site/` is the test bed until then.
+
+3. **NumPy metadata** (issue 1), once a scatter is wanted for array work. The tractable path is
    the per-type check the design describes, not the allocator-handler route that breaks reload.
 
 Not needed yet: GPU moves (need the hardware), the batch run, the approval prompt and site
@@ -138,6 +168,8 @@ selection (plain logic, nothing to prove about feasibility).
 - `motabi/launcher.py` — runs outside the sandbox, in the slot marimo reserves for its kernel
   process. It starts the kernel inside the sandbox and, on each request left in a shared
   directory, drives the save/load of the sandbox state. It never runs notebook code itself.
+  With `MOTABI_SITE` set it also pushes, restores and checkpoints on the site over ssh and
+  rsync, holds the reverse tunnel, and syncs the workspace with each move.
 - `motabi/kernel.py` — the first process inside the sandbox. It starts marimo's kernel as its
   child (the kernel cannot be the sandbox's first process) and enables the messaging keepalive.
 - `motabi/fold.py` + `motabi/foldalloc.c` — the merge: reserve address ranges, divert a

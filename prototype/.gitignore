@@ -1,0 +1,9 @@
+rootfs/
+site/*.img
+site/*.qcow2
+site/*.iso
+site/id_*
+run/
+.venv/
+leg-output.txt
+__marimo__/

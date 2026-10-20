@@ -152,8 +152,11 @@ class MotabiExecutor:
         _log(f"leg {n}: leaving")
         reply = _ask(n, "req", "go", {"cell": str(cell.cell_id), "requirement": req})
         _log(f"leg {n}: arrived {reply}")
-        print(f"[motabi] leg {n}: arrived in {reply['container']} after {reply['waited_s']}s "
-              f"(checkpoint {reply['checkpoint_s']}s, {reply['image_mb']} MB, restore {reply['restore_s']}s); running")
+        if reply.get("note"):
+            print(f"[motabi] leg {n}: {reply['note']}")
+        print(f"[motabi] leg {n}: arrived in {reply['container']} {reply.get('where', '')} after {reply['waited_s']}s "
+              f"(checkpoint {reply['checkpoint_s']}s, {reply['image_mb']} MB, transfer {reply.get('transfer_s', 0)}s, "
+              f"restore {reply['restore_s']}s); running")
         return n
 
     def _return(self, n: int | None) -> None:
@@ -163,7 +166,8 @@ class MotabiExecutor:
         reply = _ask(n, "done", "home", {})
         _log(f"leg {n}: home {reply}")
         print(f"[motabi] leg {n}: home in {reply['container']} after {reply['waited_s']}s "
-              f"(checkpoint {reply['checkpoint_s']}s, {reply['image_mb']} MB, restore {reply['restore_s']}s)")
+              f"(checkpoint {reply['checkpoint_s']}s, {reply['image_mb']} MB, transfer {reply.get('transfer_s', 0)}s, "
+              f"restore {reply['restore_s']}s)")
 
     # -- scatter -----------------------------------------------------------------------
 
