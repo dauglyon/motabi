@@ -52,21 +52,31 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
    and a footer calls `gather(...)`; the cells between them run once per item as parallel copies
    loaded from one saved image, and what each copy defines is merged back into the original
    kernel by memory address (`motabi/fold.py`, `motabi/foldalloc.c`; design in `DESIGN.md`
-   section 2.4). The first scatter in a session is correct: three workers over the items
+   section 2.4). Repeated scatters in one session are correct: three workers over the items
    `["a","bb","ccc"]` gather back `["a","bb","ccc"]`, the per-item strings `["aa","bbbb",
    "cccccc"]`, and the per-item byte blocks, each worker's new objects landing in its own
-   address range with nothing outside it. Merge of each worker is ~0.1 s.
+   address range with nothing outside it. Verified in three fresh sessions with four or five
+   scatters each, one of them with a leg between the scatters. A scatter takes 1–2 s as seen
+   in the browser; the table of pre-fork objects takes 0.02 s for 236k objects and 0.06 s for
+   651k; merge of each worker is ~0.1 s.
+
+   The second scatter used to fail (a hang in one session, a corrupted dict in another). The
+   cause was in the merge's bookkeeping: the kernel tables every pre-fork object with its
+   reference count just before the save, and after the merge adds each worker's increase back
+   into the original. Between taking that table and the save, the kernel kept running (its own
+   logging, and other threads during the wait), and freed some of the tabled objects; their
+   memory was then reused for other data. A worker computed a nonsense increase against that
+   reused memory (one was 8,243,112,544,532,589,923), and the original kernel wrote it into
+   whatever lived there now. Two changes fix it (`motabi/foldalloc.c`): the allocator hook,
+   which already sees every free, marks a tabled entry dead when its block is freed in any
+   copy, and dead entries export and receive nothing; and the kernel waits for the save and
+   for the manifests without releasing Python's interpreter lock, so no other thread runs in
+   those windows. The merge log now reports `dead` (tabled objects freed before the save, 0–30
+   in these runs) and `skipped` (increases refused at merge, 0 in every run).
 
 ## Open issues, in the order worth addressing
 
-1. **A second scatter in the same session hangs.** The first scatter completes and merges
-   correctly. A second one loads all its workers and merges them (the logs show every worker
-   imported), then stops at the line that prints a summary to the notebook console, and never
-   returns. The original kernel after a scatter is itself a reloaded sandbox, so the suspect is
-   marimo's console-forwarding across a second reload rather than the merge itself, which
-   finished. Not yet diagnosed. A single scatter per session is reliable.
-
-2. **NumPy array shape is wrong after a scatter merge.** A worker's new NumPy array has its
+1. **NumPy array shape is wrong after a scatter merge.** A worker's new NumPy array has its
    data buffer correctly in the worker's range (the merged image sizes scale with the array
    length), but after the merge the array reports the wrong shape and sum. NumPy keeps a small
    cache of freed shape/stride buffers and hands a worker one from before the fork, so the
@@ -79,32 +89,40 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
    dicts, bytes), which merge correctly. Plain NumPy still works fine across a **leg**, because a
    leg moves the whole kernel and never merges ranges.
 
-3. **Ranges are not recycled.** Each scatter permanently consumes one address range per worker
+2. **Ranges are not recycled.** Each scatter permanently consumes one address range per worker
    from a fixed pool (`RANGES` in `motabi/fold.py`, currently 48). A long session with many
    scatters will exhaust it. The design's intent is that a range is released when everything
    merged into it has been dropped; that bookkeeping is not built.
 
-4. **The cross-machine move is untested** because there is no second same-architecture Linux
+3. **The cross-machine move is untested** because there is no second same-architecture Linux
    machine available. The plan agreed with the user is to run a local Linux virtual machine on
    canopy as the stand-in second site. That VM proves the image transfer and the connection
    tunnel back to the server; it does not prove a real scheduler or a real site's policies. See
    "Next" below.
 
+4. **The original kernel is not frozen while workers run.** A worker's new objects may point at
+   a pre-fork object; if the original kernel drops its last reference to that object while the
+   workers are out, the merged objects point at freed memory. The interpreter-lock hold during
+   the manifest wait keeps the kernel's other threads from doing this, and the merge refuses
+   any increase aimed at an object it saw freed, but nothing yet keeps the pre-fork objects a
+   worker reaches alive. `DESIGN.md` 2.4 leaves this open ("root frozen-or-alive").
+
+5. **Marimo's completion engine runs inside the kernel** and its parse trees are tabled with
+   everything else: clicking into a cell after the numpy import added ~400k objects (parso
+   nodes) to the next snapshot, 236k → 651k. Harmless now that the table is linear, but the
+   saved image and the table grow with whatever the kernel's helper threads keep.
+
 ## Next
 
 In order:
 
-1. **Fix the second-scatter hang** (issue 1). Start by confirming whether the original kernel's
-   console channel is what blocks: have the merge write its summary to the trace file only, with
-   no console print, and see if a second and third scatter then complete.
-
-2. **The cross-machine move**, against a local VM on canopy. Needs: a way to make the saved
+1. **The cross-machine move**, against a local VM on canopy. Needs: a way to make the saved
    image available to the VM and back (a shared directory or scp), a tunnel so the kernel inside
    the VM can reach the marimo server on canopy, and a pin so the kernel only uses CPU features
    both machines share. A VM stands in for a login/compute node; it does not stand in for the
    job scheduler or the data stores, which come later with a real site.
 
-3. **NumPy metadata** (issue 2), once a scatter is wanted for array work. The tractable path is
+2. **NumPy metadata** (issue 1), once a scatter is wanted for array work. The tractable path is
    the per-type check the design describes, not the allocator-handler route that breaks reload.
 
 Not needed yet: GPU moves (need the hardware), the batch run, the approval prompt and site
@@ -124,12 +142,15 @@ selection (plain logic, nothing to prove about feasibility).
   child (the kernel cannot be the sandbox's first process) and enables the messaging keepalive.
 - `motabi/fold.py` + `motabi/foldalloc.c` — the merge: reserve address ranges, divert a
   worker's allocations into its range, record what each worker defines and the reference counts
-  it added, and replay that into the original kernel by address. No pickling.
-- `motabi/npdivert.c` — the disabled NumPy-buffer experiment (issue 2).
+  it added, and replay that into the original kernel by address. No pickling. The table of
+  pre-fork objects is an address-keyed map; the free hook marks an entry dead when its block is
+  freed, and `wait_file` blocks for a file without releasing the interpreter lock.
+- `motabi/npdivert.c` — the disabled NumPy-buffer experiment (issue 1).
 
 The communication between the executor (inside the sandbox) and the launcher (outside) is files
 in a shared directory bind-mounted into the sandbox: request files the executor writes, answer
-files the launcher writes. Nothing else crosses the boundary.
+files the launcher writes. Nothing else crosses the boundary. Set `MOTABI_TYPES=1` before
+`run.sh` to log a type histogram of the kernel's heap at each scatter.
 
 ## Running it
 

@@ -16,6 +16,7 @@ The kernel is checkpointed while blocked on an answer file, and resumes blocked 
 from __future__ import annotations
 
 import ast
+import gc
 import itertools
 import json
 import os
@@ -185,13 +186,19 @@ class MotabiExecutor:
         n = next(_SCATTERS)
         base = fold.allot(workers)
         prefix = os.path.join(SHARE, f"scatter-{n}")
-        table = fold.snapshot(glbls)
-        print(f"[motabi] scatter {n}: {workers} workers over {len(order)} cell(s), "
-              f"{table} pre-fork objects; forking")
+        print(f"[motabi] scatter {n}: {workers} workers over {len(order)} cell(s); forking")
         _log(f"scatter {n}: forking {workers} workers, region {order}, names {sorted(names)}")
         t0 = time.monotonic()
+        # Between the snapshot and the checkpoint the kernel does as little as it can and
+        # waits with the GIL held, so the table of pre-fork refcounts stays true in the image.
+        if os.environ.get("MOTABI_TYPES"):  # diagnostic: what the kernel's heap is made of
+            import collections
+            hist = collections.Counter(type(o).__name__ for o in gc.get_objects())
+            _log(f"scatter {n}: gc objects by type {hist.most_common(12)}")
+        table, timing = fold.snapshot(glbls)
+        _log(f"scatter {n}: snapshot {table} objects {timing}")
         _write(prefix + ".req", {"cell": str(cell.cell_id), "workers": workers})
-        _wait(prefix + ".go")
+        fold.wait_file(prefix + ".go")
         role = None
         for i in range(workers):
             try:
@@ -202,16 +209,14 @@ class MotabiExecutor:
                 pass
         if role is not None:
             self._work(role, base + role, items[role], target, order, names, glbls, graph, f"{prefix}.manifest_{role}")
-        _log(f"scatter {n}: root copy awake, waiting for {workers} manifests")
+        _log(f"scatter {n}: root copy awake ({table} pre-fork objects), waiting for {workers} manifests")
         values: dict[str, list[Any]] = {k: [] for k in names}
         for i in range(workers):
-            ns, stats = fold.root_import(base + i, _wait_file(f"{prefix}.manifest_{i}"))
+            ns, stats = fold.root_import(base + i, fold.wait_file(f"{prefix}.manifest_{i}"))
             _log(f"scatter {n}: imported worker {i}: {stats}")
             for k in names:
                 if k in ns:
                     values[k].append(ns[k])
-        import gc
-
         gc.unfreeze()
         _REGION = {"cells": set(order), "values": values, "workers": workers}
         for k, vals in values.items():
@@ -289,12 +294,6 @@ class MotabiExecutor:
             self._fork(cell, glbls)
         _log(f"cell {cell.cell_id}: done")
         return result
-
-
-def _wait_file(path: str) -> str:
-    while not os.path.exists(path):
-        time.sleep(0.2)
-    return path
 
 
 def factory() -> MotabiExecutor:

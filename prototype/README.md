@@ -49,4 +49,16 @@ offset), the loaded numpy, and the marimo kernel's own threads and ZeroMQ socket
 - marimo builds a new executor instance per run, so the leg sequence lives at module level.
 - The kernel's shared-memory virtual files are in the sandbox's /dev/shm, not the server's; the
   prototype turns them off (data URLs). Images and large outputs need another path.
+- The table of pre-fork refcounts must stay true from the moment it is taken until the
+  checkpoint, and in every copy afterwards. The kernel's own logging and its other threads freed
+  tabled objects in that window; a worker then read a refcount off reused memory and the root
+  wrote the garbage delta into a live dict (a second scatter failed every time). The free hook
+  now marks tabled entries dead, and the waits hold the interpreter lock.
+- Reading a tabled object's type at free time is unsafe: a float on CPython's freelist keeps its
+  memory but its type slot becomes the freelist link, and the last link is null. The pre-header
+  size each entry needs is recorded at snapshot time instead.
+- A linear scan per seed in the snapshot was quadratic in the heap: 0.6 s at 236k objects,
+  26 s at 651k after marimo's completion engine parsed numpy. It is a map lookup now.
+- `run.sh` kills every process whose command line matches `motabi.launcher`; the dot matches
+  any character, so a shell whose command mentions `motabi/launcher.py` is killed too.
 - The approval gate, site selection and the return policy are not in the prototype.

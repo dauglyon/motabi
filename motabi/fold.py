@@ -38,11 +38,21 @@ def allot(workers: int) -> int:
     return base
 
 
-def snapshot(glbls: Any) -> int:
+def snapshot(glbls: Any) -> tuple[int, dict[str, float]]:
+    """Table every reachable object; returns its size and the seconds each step took."""
+    import time
+
+    t0 = time.monotonic()
     gc.collect()
-    n = foldalloc.snapshot(gc.get_objects() + [glbls, sys.modules])
+    t1 = time.monotonic()
+    seeds = gc.get_objects() + [glbls, sys.modules]
+    t2 = time.monotonic()
+    n = foldalloc.snapshot(seeds)
+    t3 = time.monotonic()
     gc.freeze()
-    return n
+    t4 = time.monotonic()
+    return n, {"collect": round(t1 - t0, 2), "seeds": round(t2 - t1, 2), "table": round(t3 - t2, 2),
+               "freeze": round(t4 - t3, 2), "gc_objects": len(seeds)}
 
 
 def worker_begin(rng: int) -> None:
@@ -70,11 +80,18 @@ def root_import(rng: int, path: str) -> tuple[dict[str, Any], dict[str, Any]]:
     if "error" in m:
         raise RuntimeError(m["error"])
     foldalloc.import_file(rng, path + ".bin", m["bytes"])
-    foldalloc.apply_deltas(m["deltas"])
+    applied, skipped = foldalloc.apply_deltas(m["deltas"])
     for a in m["tracked"]:
         foldalloc.track(ctypes.cast(a, ctypes.py_object).value)
     ns = {k: ctypes.cast(a, ctypes.py_object).value for k, a in m["defs"].items()}
     for o in ns.values():
         foldalloc.release(o)  # the worker's own globals binding lived in a discarded page
     return ns, {"bytes": m["bytes"], "defs": len(ns), "tracked": len(m["tracked"]),
-                "deltas": len(m["deltas"]), "outside": m["outside"]}
+                "deltas": len(m["deltas"]), "applied": applied, "skipped": skipped,
+                "dead": foldalloc.dead(), "outside": m["outside"]}
+
+
+def wait_file(path: str) -> str:
+    """Block until `path` exists without releasing the GIL (see foldalloc.wait_file)."""
+    foldalloc.wait_file(path)
+    return path

@@ -71,7 +71,7 @@ class Launcher:
             "PYTHONDONTWRITEBYTECODE": "1",
             "VIRTUAL_ENV": os.path.dirname(os.path.dirname(python)),
         }
-        env.update({k: v for k, v in os.environ.items() if k.startswith("MARIMO_")})
+        env.update({k: v for k, v in os.environ.items() if k.startswith(("MARIMO_", "MOTABI_"))})
         caps = ["CAP_AUDIT_WRITE", "CAP_KILL", "CAP_NET_BIND_SERVICE"]
         spec: dict[str, Any] = {
             "ociVersion": "1.0.0",
@@ -187,7 +187,8 @@ class Launcher:
                 state = subprocess.run(
                     ["unshare", "-Ur", RUNSC, "--ignore-cgroups", "--root", self.state, "state", f"sc{n}-w{i}"],
                     capture_output=True, text=True)
-                if '"status": "stopped"' in state.stdout or state.returncode:
+                if ('"status": "stopped"' in state.stdout or state.returncode) and not os.path.exists(manifest):
+                    # the second check: the worker may have exported and exited since the first
                     import pickle
                     with open(manifest + ".tmp", "wb") as f:
                         pickle.dump({"error": f"worker {i} exited without exporting; see kernel.err"}, f)
