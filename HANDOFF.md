@@ -127,7 +127,9 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
    its data buffer land in the range (NumPy 2 allocates data through `PyMem_Raw*`) and only
    the shape-and-strides buffer does not (NumPy's own cache over libc). Libraries that own
    their memory would fail whole; none is measured yet. This decides whether scatter works
-   for real data, and it is weeks, not a day. Scatter is plain-Python values only until then.
+   for real data, and it is weeks, not a day. It limits every fork, the independent-branch
+   parallelism of 2.4 as much as scatter; a leg moves the whole kernel and is unaffected.
+   Fork and join are plain-Python values only until then.
    The research state, candidates and harness: `docs/scatter-research.md`. `motabi/npdivert.c`
    stays **disabled** (`MOTABI_NPDIVERT=1`): unnecessary on NumPy 2 and it breaks reload.
 

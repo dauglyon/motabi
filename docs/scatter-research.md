@@ -61,6 +61,12 @@ those windows. The design states the rule as "the root is frozen while workers a
 extension allocates on its own path lands in the worker's ordinary heap, which is discarded at
 the join, and a define that points at it dangles in the root.
 
+This is a limit of every fork, not of scatter alone. The design's other parallel form, several
+mutually independent cells with the same requirement run as branches and folded back (2.4, the
+three side-by-side cells in the README figure), is the same checkpoint restored once per branch
+and the same join by address, so a branch that defines an Arrow table loses it exactly as a
+scatter worker would. Only a leg is unaffected: the whole kernel moves and nothing is merged.
+
 Measured today, NumPy 2.5.4 under the diverted allocator (`prototype/.venv`, the check is ten
 lines against `foldalloc` directly):
 
