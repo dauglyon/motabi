@@ -106,7 +106,6 @@
   <text class="code req" x="788" y="756" xml:space="preserve">motabi.require(gpus=1)</text>
   <text class="code" x="788" y="778" xml:space="preserve">score = rate(aligned)</text>
   <path class="a" d="M445,790 V814 M661,790 V814 M877,790 V814 M445,814 H877"/>
-  <text class="note" x="46" y="720">kernel waits here</text>
 
   <!-- gather: results come home -->
   <path class="a" d="M661,814 C661,870 466,874 312,874" marker-end="url(#h)"/>
