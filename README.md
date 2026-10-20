@@ -27,8 +27,9 @@ wherever the kernel is.
 A session starts on its **home** host, which also runs the marimo server. Home must be Linux
 (native, WSL2, or a VM) on the same CPU architecture as the remote sites, because a checkpoint
 can only be restored on the architecture it was taken on. A lab workstation, a login node, or an
-x86 laptop running WSL2 all work. On a machine with a different architecture, such as an arm64
-laptop connecting to x86 clusters, only the browser runs locally.
+x86 laptop running WSL2 all work. If your laptop's architecture differs from the clusters' (for
+example, an Apple Silicon Mac with x86 clusters), run home on a matching Linux machine such as a
+workstation or login node, and open the notebook from your laptop's browser.
 
 ## Features
 
