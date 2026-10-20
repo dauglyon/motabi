@@ -156,13 +156,15 @@ range of cells with no new syntax:
 
 ```python
 # header
-item = motabi.scatter(samples, require=..., workers=16)
+item = motabi.scatter(samples, workers=16)
 ```
 ```python
-# scattered cells: ordinary cells that read `item`
+# scattered cells: ordinary cells that read `item`, each with its requirement
+motabi.require(gpus=1)
 aligned = align(item)
 ```
 ```python
+motabi.require(gpus=1)
 stats = summarize(aligned)
 ```
 ```python
@@ -179,7 +181,18 @@ notebook is touched.
 items. In each worker `item` is bound and the scattered cells run. In the root, as the scheduler
 reaches each scattered cell, the executor answers "ran in N workers" with one worker's output;
 at the footer it answers with the gathered lists, in item order. Downstream cells see ordinary
-lists, so a reduce is the next cell. The header's snapshot is retained for the session: editing
+lists, so a reduce is the next cell.
+
+The root does not move for a scatter. The header has no requirement and runs where the kernel
+is, at home in the usual case. The scattered cells carry their requirements as any cell does;
+inside a scatter those select the site for the workers only, not for the root. The snapshot goes
+there, and the workers' ranges come back as files that the root imports at the footer (2.4). The
+footer and the cells after it therefore run where the root is, with no `motabi.home()`. The
+scattered cells must agree on one requirement, since each worker runs all of them; differing
+requirements are an error naming the cells. A requirement on the header itself makes it an
+ordinary required cell and takes the kernel to the site first (2.2).
+
+The header's snapshot is retained for the session: editing
 a scattered cell re-forks from it and re-runs only the scattered cells, which is the fork-from-
 snapshot use the refresh outline deferred (D6), made the ordinary edit loop.
 
