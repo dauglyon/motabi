@@ -1,9 +1,10 @@
 # motabi
 
-motabi takes a running [marimo](https://github.com/marimo-team/marimo) notebook to the compute
-its cells need. A cell declares the resources it requires; motabi moves the live kernel, state
-and all, to a site that has them, runs the cell there, and brings the kernel back. No state is
-rebuilt by re-execution and no notebook is rewritten as a pipeline.
+motabi is a [marimo](https://github.com/marimo-team/marimo) extension that runs notebook
+cells on HPC clusters and GPU nodes without changing the notebook. It checkpoints the sandbox
+the kernel runs in, restores it inside a job at the target site, executes the cells there, and
+checkpoints it back. Variables are never pickled across machines and no cell is re-run to
+rebuild state: the process itself moves.
 
 **Highlights**
 
