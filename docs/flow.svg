@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 520" width="1000" height="520" role="img" aria-labelledby="t d">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 530" width="1000" height="530" role="img" aria-labelledby="t d">
   <title id="t">How motabi runs a notebook's cells across sites</title>
-  <desc id="d">A notebook's cells run in order from top to bottom. The first cells run at home. A cell that calls motabi.require(gpus=1) sends the kernel to a site with a GPU: the kernel is checkpointed and restored in a job there. Three independent cells after it run in parallel as copies of the kernel. Their results fold back into one kernel, which is checkpointed and returns home, where the remaining cells run.</desc>
+  <desc id="d">A notebook's cells run in order from top to bottom. The first cells run at home. A cell containing motabi.require(gpus=1) sends the kernel to a site with a GPU. Three independent cells after it, each with the same requirement, run in parallel as copies of the kernel. Their results fold back into one kernel, which returns home, where the remaining cells run.</desc>
   <style>
     svg {
       --bg: #ffffff; --band: #f6f8fa; --ink: #1f2328; --muted: #59636e; --cell: #d0d7de;
@@ -25,54 +25,57 @@
     <marker id="h" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto"><path class="ah" d="M0,0 L10,5 L0,10 z"/></marker>
   </defs>
 
-  <rect x="0" y="0" width="1000" height="520" rx="12" style="fill:var(--bg)"/>
+  <rect x="0" y="0" width="1000" height="530" rx="12" style="fill:var(--bg)"/>
 
   <!-- the two places -->
-  <rect x="12" y="12" width="360" height="496" rx="10" style="fill:var(--band)"/>
-  <rect x="384" y="12" width="604" height="496" rx="10" style="fill:var(--band)"/>
-  <text class="place" x="40" y="44">Home</text>
-  <text class="note" x="92" y="44">where you edit</text>
-  <text class="place" x="412" y="44">Site</text>
-  <text class="note" x="452" y="44">cluster or GPU node</text>
+  <rect x="12" y="12" width="300" height="506" rx="10" style="fill:var(--band)"/>
+  <rect x="324" y="12" width="664" height="506" rx="10" style="fill:var(--band)"/>
+  <text class="place" x="36" y="44">Home</text>
+  <text class="note" x="88" y="44">where you edit</text>
+  <text class="place" x="348" y="44">Site</text>
+  <text class="note" x="388" y="44">cluster or GPU node</text>
 
   <!-- cells at home -->
-  <rect class="cell" x="40" y="68" width="304" height="40" rx="6"/>
-  <text class="code" x="56" y="93">data = load("run42")</text>
-  <rect class="cell" x="40" y="120" width="304" height="40" rx="6"/>
-  <text class="code" x="56" y="145">clean = prep(data)</text>
+  <rect class="cell" x="36" y="68" width="252" height="40" rx="6"/>
+  <text class="code" x="52" y="93">data = load("run42")</text>
+  <rect class="cell" x="36" y="120" width="252" height="40" rx="6"/>
+  <text class="code" x="52" y="145">clean = prep(data)</text>
 
   <!-- the requirement sends the kernel to the site -->
-  <path class="a" d="M344,140 C420,140 450,208 520,208" marker-end="url(#h)"/>
-  <rect class="cell" x="526" y="180" width="260" height="56" rx="6"/>
-  <text class="code req" x="542" y="202">motabi.require(gpus=1)</text>
-  <text class="code" x="542" y="224">model = train(clean)</text>
-  <text class="note" x="802" y="198">this line sends the</text>
-  <text class="note" x="802" y="217">kernel to a GPU site</text>
+  <path class="a" d="M288,140 C380,140 440,200 516,200" marker-end="url(#h)"/>
 
-  <!-- independent cells run in parallel -->
-  <path class="a" d="M656,236 V258 M476,258 H836"/>
-  <path class="a" d="M476,258 V282" marker-end="url(#h)"/>
-  <path class="a" d="M656,258 V282" marker-end="url(#h)"/>
-  <path class="a" d="M836,258 V282" marker-end="url(#h)"/>
-  <text class="note" x="852" y="257">independent cells</text>
-  <text class="note" x="852" y="276">run in parallel</text>
+  <rect class="cell" x="522" y="172" width="270" height="56" rx="6"/>
+  <text class="code req" x="538" y="194">motabi.require(gpus=1)</text>
+  <text class="code" x="538" y="216">model = train(clean)</text>
+  <text class="note" x="808" y="194">this line sends the</text>
+  <text class="note" x="808" y="213">kernel to a GPU site</text>
 
-  <rect class="cell" x="394" y="288" width="164" height="40" rx="6"/>
-  <text class="code" x="406" y="313">a = test(model, 1)</text>
-  <rect class="cell" x="574" y="288" width="164" height="40" rx="6"/>
-  <text class="code" x="586" y="313">b = test(model, 2)</text>
-  <rect class="cell" x="754" y="288" width="164" height="40" rx="6"/>
-  <text class="code" x="766" y="313">c = test(model, 3)</text>
+  <!-- independent cells, same requirement, run in parallel -->
+  <path class="a" d="M657,228 V264 M439,264 H875"/>
+  <path class="a" d="M439,264 V284" marker-end="url(#h)"/>
+  <path class="a" d="M657,264 V284" marker-end="url(#h)"/>
+  <path class="a" d="M875,264 V284" marker-end="url(#h)"/>
+  <text class="note" x="643" y="253" text-anchor="end">independent cells run in parallel</text>
+
+  <rect class="cell" x="336" y="290" width="206" height="56" rx="6"/>
+  <text class="code req" x="350" y="312">motabi.require(gpus=1)</text>
+  <text class="code" x="350" y="334">a = test(model, 1)</text>
+  <rect class="cell" x="554" y="290" width="206" height="56" rx="6"/>
+  <text class="code req" x="568" y="312">motabi.require(gpus=1)</text>
+  <text class="code" x="568" y="334">b = test(model, 2)</text>
+  <rect class="cell" x="772" y="290" width="206" height="56" rx="6"/>
+  <text class="code req" x="786" y="312">motabi.require(gpus=1)</text>
+  <text class="code" x="786" y="334">c = test(model, 3)</text>
 
   <!-- fold into one kernel and return home -->
-  <path class="a" d="M476,328 V352 M656,328 V352 M836,328 V352 M476,352 H836"/>
-  <path class="a" d="M656,352 C656,404 480,420 350,420" marker-end="url(#h)"/>
-  <text class="note" x="676" y="392">fold into one kernel,</text>
-  <text class="note" x="676" y="411">checkpoint, return home</text>
+  <path class="a" d="M439,346 V370 M657,346 V370 M875,346 V370 M439,370 H875"/>
+  <path class="a" d="M657,370 C657,420 480,440 294,440" marker-end="url(#h)"/>
+  <text class="note" x="677" y="410">fold into one kernel,</text>
+  <text class="note" x="677" y="429">checkpoint, return home</text>
 
   <!-- cells at home again -->
-  <rect class="cell" x="40" y="400" width="304" height="40" rx="6"/>
-  <text class="code" x="56" y="425">best = max(a, b, c)</text>
-  <rect class="cell" x="40" y="452" width="304" height="40" rx="6"/>
-  <text class="code" x="56" y="477">plot(best)</text>
+  <rect class="cell" x="36" y="420" width="252" height="40" rx="6"/>
+  <text class="code" x="52" y="445">best = max(a, b, c)</text>
+  <rect class="cell" x="36" y="472" width="252" height="40" rx="6"/>
+  <text class="code" x="52" y="497">plot(best)</text>
 </svg>
