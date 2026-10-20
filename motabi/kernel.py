@@ -53,6 +53,11 @@ def _child() -> None:
         return s
 
     zmq.Context.socket = socket  # type: ignore[method-assign]
+    from marimo._runtime.runner.hooks_on_finish import ON_FINISH_HOOKS
+
+    from motabi.executor import on_finish
+
+    ON_FINISH_HOOKS.append(on_finish)  # the kernel comes home when the run that sent it out ends
     from marimo._ipc.launch_kernel import main as launch
 
     launch()

@@ -34,10 +34,20 @@ def _(data, log, motabi, os):
 
 
 @app.cell
-def _(data, log):
+def _(data, log, os):
+    # no requirement: runs where the kernel is, which after the cell above is the site
+    log.write(f"plain cell, still away, pid {os.getpid()}\n")
+    log.flush()
+    stayed = data.sum()
+    return (stayed,)
+
+
+@app.cell
+def _(data, log, motabi, stayed):
+    motabi.home()
     log.write("written back home\n")
     log.flush()
-    print(data.sum())
+    print(data.sum(), stayed)
     with open("leg-output.txt") as f:
         print(f.read())
     return
@@ -65,6 +75,14 @@ def _(motabi, payload, tally):
     print("hits:  ", [t["hits"][2] for t in tallies])
     print("bytes: ", [len(p) >> 20 for p in payloads], "MB")
     return
+
+
+@app.cell
+def _(motabi):
+    # a leg with no descendants: the run ends while the kernel is away, and it comes home
+    motabi.require(cores=2)
+    alone = 42
+    return (alone,)
 
 
 if __name__ == "__main__":

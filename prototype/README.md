@@ -86,4 +86,5 @@ offset), the loaded numpy, and the marimo kernel's own threads and ZeroMQ socket
 - Playwright: Ctrl+Enter on an unchanged, already-run cell does not run it; edit the cell first.
 - `run.sh` kills every process whose command line matches `motabi.launcher`; the dot matches
   any character, so a shell whose command mentions `motabi/launcher.py` is killed too.
-- The approval gate, site selection and the return policy are not in the prototype.
+- The approval gate and site selection are not in the prototype. The return policy is: home at
+  `motabi.home()`, at a scatter header, or at the end of the run.

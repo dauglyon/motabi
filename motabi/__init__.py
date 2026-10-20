@@ -1,7 +1,7 @@
 """motabi moves a running marimo kernel to the compute its cells need.
 
 A cell that needs more than the machine it is edited on calls `require()` as its first
-statement. A range of cells to run once per item is bracketed by `scatter()` in a header cell
+statement; the kernel then stays at the site until a cell calls `home()` or the run ends. A range of cells to run once per item is bracketed by `scatter()` in a header cell
 and `gather()` in a footer cell. The executor (motabi.executor) reads these calls from the
 cells' source; at run time `require` does nothing, `scatter` records its items and `gather`
 looks up what the workers defined.
@@ -25,6 +25,11 @@ def require(
     duration: str | None = None,
     datasets: tuple[str, ...] = (),
 ) -> None:
+    return None
+
+
+def home() -> None:
+    """First statement of a cell that must run at home: the kernel returns before it runs."""
     return None
 
 

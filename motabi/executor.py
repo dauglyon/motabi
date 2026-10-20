@@ -5,7 +5,8 @@ marimo's default executor. The executor and the launcher (motabi.launcher, outsi
 sandbox) talk through files in the share directory, so nothing crosses the sandbox boundary
 but bytes on a bind mount:
 
-    leg-<n>.req / .go / .done / .home       one cell out and back (DESIGN.md 2.3)
+    leg-<n>.req / .go / .done / .home       out at a require cell; home at a home() cell or
+                                            when the run ends (DESIGN.md 2.3)
     scatter-<n>.req / .go                   fork: W workers restored without network, then the
     scatter-<n>.claim_<i>                   root copy; each copy claims a role on waking
     scatter-<n>.manifest_<i> (+ .bin)       a worker's exported range (DESIGN.md 2.4)
@@ -32,6 +33,7 @@ SHARE = os.environ.get("MOTABI_SHARE")
 # marimo builds a new executor for every run, so all sequence and scatter state is module level.
 _LEGS = itertools.count()
 _SCATTERS = itertools.count()
+_AWAY: int | None = None  # the leg the kernel is out on, if any
 _REGION: dict[str, Any] | None = None  # the last scatter: its cells and per-name worker values
 
 
@@ -140,14 +142,17 @@ class MotabiExecutor:
 
     # -- leg ---------------------------------------------------------------------------
 
-    def _depart(self, cell: Any) -> int | None:
+    def _depart(self, cell: Any) -> None:
+        """A require cell starts a leg unless the kernel is already out; the prototype has one
+        site, so "out" is the site that meets every requirement."""
+        global _AWAY
         req = requirement_of(cell.code)
-        if req is None:
-            return None
+        if req is None or _AWAY is not None:
+            return
         n = next(_LEGS)
         if SHARE is None:
             print(f"[motabi] leg {n}: requires {req}; kernel is not in a sandbox, running here")
-            return None
+            return
         print(f"[motabi] leg {n}: requires {req}; leaving (pid {os.getpid()})")
         _log(f"leg {n}: leaving")
         reply = _ask(n, "req", "go", {"cell": str(cell.cell_id), "requirement": req})
@@ -155,18 +160,21 @@ class MotabiExecutor:
         if reply.get("error"):
             _log(f"leg {n}: {reply['error']}")
             raise RuntimeError(f"leg {n} could not run: {reply['error']}")
+        _AWAY = n
         print(f"[motabi] leg {n}: arrived in {reply['container']} {reply.get('where', '')} after {reply['waited_s']}s "
               f"(checkpoint {reply['checkpoint_s']}s, {reply['image_mb']} MB, transfer {reply.get('transfer_s', 0)}s, "
-              f"restore {reply['restore_s']}s); running")
-        return n
+              f"restore {reply['restore_s']}s); staying")
 
-    def _return(self, n: int | None) -> None:
-        if n is None:
+    def _return(self, why: str) -> None:
+        """Bring the kernel home: a home() cell, a scatter header, or the end of the run."""
+        global _AWAY
+        if _AWAY is None:
             return
-        _log(f"leg {n}: body finished, returning")
-        reply = _ask(n, "done", "home", {})
+        n, _AWAY = _AWAY, None
+        _log(f"leg {n}: returning ({why})")
+        reply = _ask(n, "done", "home", {"why": why})
         _log(f"leg {n}: home {reply}")
-        print(f"[motabi] leg {n}: home in {reply['container']} after {reply['waited_s']}s "
+        print(f"[motabi] leg {n}: home ({why}) in {reply['container']} after {reply['waited_s']}s "
               f"(checkpoint {reply['checkpoint_s']}s, {reply['image_mb']} MB, transfer {reply.get('transfer_s', 0)}s, "
               f"restore {reply['restore_s']}s)")
 
@@ -270,14 +278,16 @@ class MotabiExecutor:
         _log(f"cell {cell.cell_id}: start")
         if _REGION is not None and cell.cell_id in _REGION["cells"]:
             return self._answer(cell, glbls)
-        n = self._depart(cell)
+        if _call(cell.code, "home") is not None:
+            self._return("home() cell")
+        elif _call(cell.code, "scatter") is not None:
+            self._return("scatter header runs at home")  # the prototype forks only at home
+        self._depart(cell)
         try:
             result = self._default.execute_cell(cell, glbls)
         except BaseException as e:
             _log(f"cell {cell.cell_id}: raised {e!r}")
             raise
-        finally:
-            self._return(n)
         if motabi._SCATTER is not None and SHARE is not None:
             self._fork(cell, glbls)
         _log(f"cell {cell.cell_id}: done")
@@ -287,18 +297,28 @@ class MotabiExecutor:
         _log(f"cell {cell.cell_id}: start (async)")
         if _REGION is not None and cell.cell_id in _REGION["cells"]:
             return self._answer(cell, glbls)
-        n = self._depart(cell)
+        if _call(cell.code, "home") is not None:
+            self._return("home() cell")
+        elif _call(cell.code, "scatter") is not None:
+            self._return("scatter header runs at home")  # the prototype forks only at home
+        self._depart(cell)
         try:
             result = await self._default.execute_cell_async(cell, glbls)
         except BaseException as e:
             _log(f"cell {cell.cell_id}: raised {e!r}")
             raise
-        finally:
-            self._return(n)
         if motabi._SCATTER is not None and SHARE is not None:
             self._fork(cell, glbls)
         _log(f"cell {cell.cell_id}: done")
         return result
+
+
+def on_finish(ctx: Any) -> None:
+    """marimo's run-finished hook (registered in motabi.kernel): the run that sent the kernel
+    out has ended, so it comes home."""
+    del ctx
+    if _AWAY is not None:
+        MotabiExecutor()._return("run ended")
 
 
 def factory() -> MotabiExecutor:

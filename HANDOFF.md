@@ -94,6 +94,14 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
    rdseed, vmx and the rest; the kernel is restored at home, the cell raises with the site's
    reason and does not run, and the kernel stays usable for the next run.
 
+5. **The kernel stays out.** A `require` cell starts a leg and the kernel stays at the site;
+   cells without a requirement run where it is; it comes home at a cell beginning with
+   `motabi.home()`, at a scatter header (the prototype forks only at home), or when the run
+   ends (a hook on marimo's run-finished list, registered in `motabi/kernel.py`). Verified
+   against the guest: a plain cell after the require cell wrote its line to the workspace
+   file while away and no move happened between them; the `home()` cell brought the kernel
+   back; a require cell with no descendants went out and came home at run end, three times.
+
 ## Open issues, in the order worth addressing
 
 1. **NumPy array shape is wrong after a scatter merge.** A worker's new NumPy array has its
@@ -132,9 +140,9 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
    nodes) to the next snapshot, 236k → 651k. Harmless now that the table is linear, but the
    saved image and the table grow with whatever the kernel's helper threads keep.
 
-6. **The prototype goes out and back around every `require` cell.** The design (2.3, since PR
-   #1) has the kernel stay at the site until `motabi.home()` or the end of the run. Changing
-   the executor to stay halves the transfers per leg.
+6. **The run-end return is silent in the notebook.** It prints outside any cell, and marimo's
+   console redirect drops output with no running cell, so only the trace file records that
+   the kernel came home. The user should see it; marimo has no obvious place for it yet.
 
 7. **The prototype's environment is an exported tree; the design (2.7, decided 2026-10-20) is
    the notebook's PEP 723 metadata.** A restore maps the interpreter, libc and every extension
@@ -156,8 +164,7 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
 
 In order:
 
-1. **Build the environment as designed** (issue 7) and make the executor stay out until
-   `motabi.home()` (issue 6), in either order.
+1. **Build the environment as designed** (issue 7).
 
 2. **A real site**: the slurm-ssh adapter against Lawrencium, with the pin computed from
    capabilities. The guest recipe in `prototype/site/` is the test bed until then.
