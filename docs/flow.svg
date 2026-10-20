@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 990" width="1000" height="990" role="img" aria-labelledby="t d">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 920" width="1000" height="920" role="img" aria-labelledby="t d">
   <title id="t">How motabi runs a notebook's cells across sites</title>
   <desc id="d">A notebook's cells run in order from top to bottom. The first cells run at home. A cell containing motabi.require(gpus=1) sends the kernel to a site with a GPU. Three independent cells after it, each with the same requirement, run in parallel as copies of the kernel and fold back into one kernel. A cell containing motabi.home() brings the kernel back home. Later, a cell calling motabi.scatter(samples) stays at home and sends copies of the kernel to a GPU site, where the next two cells, each with motabi.require(gpus=1), run once per sample, in parallel; motabi.gather, back at home, collects each sample's score into one list.</desc>
   <style>
@@ -25,9 +25,9 @@
     <marker id="h" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto"><path class="ah" d="M0,0 L10,5 L0,10 z"/></marker>
   </defs>
 
-  <rect x="0" y="0" width="1000" height="990" rx="12" style="fill:var(--bg)"/>
-  <rect x="12" y="12" width="310" height="966" rx="10" style="fill:var(--band)"/>
-  <rect x="334" y="12" width="654" height="966" rx="10" style="fill:var(--band)"/>
+  <rect x="0" y="0" width="1000" height="920" rx="12" style="fill:var(--bg)"/>
+  <rect x="12" y="12" width="310" height="896" rx="10" style="fill:var(--band)"/>
+  <rect x="334" y="12" width="654" height="896" rx="10" style="fill:var(--band)"/>
   <text class="place" x="32" y="44">Home</text>
   <text class="note" x="84" y="44">where you edit</text>
   <text class="place" x="358" y="44">Site</text>
@@ -74,45 +74,30 @@
   <rect class="cell" x="32" y="488" width="274" height="40" rx="6"/>
   <text class="code" x="46" y="513" xml:space="preserve">plot(best)</text>
 
-  <!-- scatter: the kernel stays home, copies go out -->
+  <!-- scatter: copies of the kernel run the same cells once per sample -->
   <rect class="cell" x="32" y="548" width="274" height="40" rx="6"/>
   <text class="code req" x="46" y="573" xml:space="preserve">item = motabi.scatter(samples)</text>
-  <path class="a" d="M306,568 H637 Q661,568 661,592 V640"/>
-  <path class="a" d="M445,640 H877"/>
-  <path class="a" d="M445,640 V660" marker-end="url(#h)"/>
-  <path class="a" d="M661,640 V660" marker-end="url(#h)"/>
-  <path class="a" d="M877,640 V660" marker-end="url(#h)"/>
-  <text class="note" x="677" y="598">this line sends copies of the kernel;</text>
-  <text class="note" x="677" y="617">each runs the cells below for one sample</text>
-  <text class="note" x="356" y="656">sample 1</text>
-  <text class="note" x="572" y="656">sample 2</text>
-  <text class="note" x="788" y="656">sample 3</text>
-  <rect class="cell" x="342" y="666" width="206" height="56" rx="6"/>
-  <text class="code req" x="356" y="688" xml:space="preserve">motabi.require(gpus=1)</text>
-  <text class="code" x="356" y="710" xml:space="preserve">aligned = align(item)</text>
-  <rect class="cell" x="342" y="734" width="206" height="56" rx="6"/>
-  <text class="code req" x="356" y="756" xml:space="preserve">motabi.require(gpus=1)</text>
-  <text class="code" x="356" y="778" xml:space="preserve">score = rate(aligned)</text>
-  <rect class="cell" x="558" y="666" width="206" height="56" rx="6"/>
-  <text class="code req" x="572" y="688" xml:space="preserve">motabi.require(gpus=1)</text>
-  <text class="code" x="572" y="710" xml:space="preserve">aligned = align(item)</text>
-  <rect class="cell" x="558" y="734" width="206" height="56" rx="6"/>
-  <text class="code req" x="572" y="756" xml:space="preserve">motabi.require(gpus=1)</text>
-  <text class="code" x="572" y="778" xml:space="preserve">score = rate(aligned)</text>
-  <rect class="cell" x="774" y="666" width="206" height="56" rx="6"/>
-  <text class="code req" x="788" y="688" xml:space="preserve">motabi.require(gpus=1)</text>
-  <text class="code" x="788" y="710" xml:space="preserve">aligned = align(item)</text>
-  <rect class="cell" x="774" y="734" width="206" height="56" rx="6"/>
-  <text class="code req" x="788" y="756" xml:space="preserve">motabi.require(gpus=1)</text>
-  <text class="code" x="788" y="778" xml:space="preserve">score = rate(aligned)</text>
-  <path class="a" d="M445,790 V814 M661,790 V814 M877,790 V814 M445,814 H877"/>
+  <rect class="cell" x="550" y="616" width="270" height="124" rx="6"/>
+  <rect class="cell" x="538" y="628" width="270" height="124" rx="6"/>
+  <rect x="526" y="640" width="270" height="124" rx="6" style="fill:var(--band)"/>
+  <rect class="cell" x="526" y="640" width="270" height="56" rx="6"/>
+  <text class="code req" x="540" y="662" xml:space="preserve">motabi.require(gpus=1)</text>
+  <text class="code" x="540" y="684" xml:space="preserve">aligned = align(item)</text>
+  <rect class="cell" x="526" y="708" width="270" height="56" rx="6"/>
+  <text class="code req" x="540" y="730" xml:space="preserve">motabi.require(gpus=1)</text>
+  <text class="code" x="540" y="752" xml:space="preserve">score = rate(aligned)</text>
+  <path class="a" d="M306,568 C426,568 436,668 520,668" marker-end="url(#h)"/>
+  <text class="note" x="340" y="556">this line sends copies of the kernel</text>
+  <text class="note" x="836" y="664">the same cells run</text>
+  <text class="note" x="836" y="683">once per sample,</text>
+  <text class="note" x="836" y="702">in parallel</text>
 
   <!-- gather: results come home -->
-  <path class="a" d="M661,814 C661,870 466,874 312,874" marker-end="url(#h)"/>
-  <rect class="cell" x="32" y="854" width="274" height="40" rx="6"/>
-  <text class="code req" x="46" y="879" xml:space="preserve">scores = motabi.gather(score)</text>
-  <text class="note" x="340" y="906">collects each sample&#x27;s score</text>
-  <text class="note" x="340" y="925">into one list, at home</text>
-  <rect class="cell" x="32" y="906" width="274" height="40" rx="6"/>
-  <text class="code" x="46" y="931" xml:space="preserve">table(scores)</text>
+  <path class="a" d="M526,736 C436,736 396,820 312,820" marker-end="url(#h)"/>
+  <rect class="cell" x="32" y="800" width="274" height="40" rx="6"/>
+  <text class="code req" x="46" y="825" xml:space="preserve">scores = motabi.gather(score)</text>
+  <text class="note" x="340" y="856">collects each sample&#x27;s score</text>
+  <text class="note" x="340" y="875">into one list, at home</text>
+  <rect class="cell" x="32" y="852" width="274" height="40" rx="6"/>
+  <text class="code" x="46" y="877" xml:space="preserve">table(scores)</text>
 </svg>
