@@ -5,3 +5,6 @@ prototype/run/
 prototype/leg-output.txt
 __marimo__/
 *.so
+experiments/fold/rangemalloc/jemalloc-src/
+experiments/fold/rangemalloc/mimalloc-src/
+experiments/fold/rangemalloc/build/

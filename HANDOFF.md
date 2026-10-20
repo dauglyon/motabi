@@ -130,8 +130,19 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
    for real data, and it is weeks, not a day. It limits every fork, the independent-branch
    parallelism of 2.4 as much as scatter; a leg moves the whole kernel and is unaffected.
    Fork and join are plain-Python values only until then.
-   The research state, candidates and harness: `docs/scatter-research.md`. `motabi/npdivert.c`
-   stays **disabled** (`MOTABI_NPDIVERT=1`): unnecessary on NumPy 2 and it breaks reload.
+   Measured 2026-10-20 for numpy, torch, pyarrow and polars, and a preloaded libc-allocator
+   shim (jemalloc or mimalloc behind one interface) tried against them: the two tables in
+   `docs/scatter-research.md`. The shim places every libc allocation in the range, from any
+   thread, including threads alive at the checkpoint; a torch tensor comes back whole. It does
+   not settle the join: an Arrow table comes back readable but cannot be dropped, because its
+   `shared_ptr`s into pre-fork C++ objects were counted in the worker's discarded pages (the
+   native form of the refcount problem `foldalloc` solves for Python objects); numpy's dims come
+   from its own cache of pre-fork buffers, which no allocator sees; Arrow's default pool and
+   polars allocate with `mmap` below libc. The gate is per-type knowledge (approach C), with
+   the shim as the placement mechanism for libc users under it. The shim lives in
+   `experiments/fold/rangemalloc/`; the launcher passes `MOTABI_LD_PRELOAD` into the sandbox.
+   `motabi/npdivert.c` stays **disabled** (`MOTABI_NPDIVERT=1`): unnecessary on NumPy 2 and it
+   breaks reload.
 
 2. **Ranges are not recycled.** Each scatter permanently consumes one address range per worker
    from a fixed pool (`RANGES` in `motabi/fold.py`, currently 48). A long session with many

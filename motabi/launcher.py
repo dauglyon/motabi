@@ -197,6 +197,8 @@ class Launcher:
             for d in ("mnt", repo.lstrip("/")):
                 os.makedirs(os.path.join(ROOTFS, d), exist_ok=True)  # bind targets must exist in the rootfs
         env.update({k: v for k, v in os.environ.items() if k.startswith(("MARIMO_", "MOTABI_"))})
+        if os.environ.get("MOTABI_LD_PRELOAD"):  # a libc-allocator shim under trial (docs/scatter-research.md)
+            env["LD_PRELOAD"] = os.environ["MOTABI_LD_PRELOAD"]
         caps = ["CAP_AUDIT_WRITE", "CAP_KILL", "CAP_NET_BIND_SERVICE"]
         spec: dict[str, Any] = {
             "ociVersion": "1.0.0",

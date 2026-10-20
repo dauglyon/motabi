@@ -1,0 +1,249 @@
+/* rangemalloc: a preloaded libc-allocator shim that can divert every malloc-family call, from any
+   thread, into a reserved address range (approach A in docs/scatter-research.md). It is the same
+   rule as motabi/foldalloc.c one level down:
+
+   - at home (no range current) a call goes to the HOME allocator: glibc (HOME_GLIBC, found with
+     dlsym(RTLD_NEXT)) or the backing allocator itself (HOME_BACKING);
+   - while a range is current every allocation comes from that range through the BACKING: a
+     jemalloc arena whose extents are bumped from the range (BACKING_JEMALLOC), or a mimalloc heap
+     in an exclusive arena over the range (BACKING_MIMALLOC);
+   - a pointer inside a registered range that is not the current one (the root after a join, or a
+     worker touching an earlier scatter's range) is never handed to the backing, whose metadata for
+     it lives in another process copy: it is counted, and large blocks are madvise'd away;
+   - realloc of a home block while diverted copies it into the range and frees the old one at home.
+
+   Every diverted block carries a 16-byte header (size, offset to the backing's block start) so
+   free, realloc and malloc_usable_size work on it in a copy that has no backing metadata.
+   Control (called by the test driver through ctypes):
+     int rangemalloc_register(void *base, size_t size)  -> index; every copy must know every range
+     int rangemalloc_use(int idx)                        -> 0; makes the range writable and current
+     void rangemalloc_off(void)
+     const char *rangemalloc_stats(void)                 -> counters as text */
+#define _GNU_SOURCE
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdbool.h>
+#include <errno.h>
+#include <unistd.h>
+#include <dlfcn.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <sys/mman.h>
+
+#if defined(BACKING_JEMALLOC)
+#  include <jemalloc/jemalloc.h>
+#elif defined(BACKING_MIMALLOC)
+#  include <mimalloc.h>
+#else
+#  error "define BACKING_JEMALLOC or BACKING_MIMALLOC"
+#endif
+#if !defined(HOME_GLIBC) && !defined(HOME_BACKING)
+#  error "define HOME_GLIBC or HOME_BACKING"
+#endif
+
+#define MAXR 64
+#define HDR 16
+typedef struct { size_t size; uint32_t off; uint32_t magic; } Hdr;   /* sits HDR bytes before the block */
+#define MAGIC 0x52414e47u                                            /* "RANG" */
+typedef struct {
+  char *base; size_t size;
+  size_t bump;                 /* jemalloc: bytes of the range handed out as extents */
+  unsigned arena; bool ready;  /* jemalloc arena index / mimalloc heap made */
+  void *heap; void *arena_id;  /* mimalloc */
+  atomic_size_t foreign_freed_bytes, foreign_freed_blocks;
+} Range;
+static Range R[MAXR]; static int NR = 0; static atomic_int cur = -1;
+static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
+static atomic_size_t n_home, n_divert, n_divert_bytes, n_realloc_home_to_range, n_free_range_current;
+
+static inline int in_range(const void *p){ const char *c = p; for (int i = 0; i < NR; i++) if (c >= R[i].base && c < R[i].base + R[i].size) return i; return -1; }
+
+/* ---------------- home allocator ---------------- */
+#if defined(HOME_GLIBC)
+static void *(*h_malloc)(size_t); static void (*h_free)(void *); static void *(*h_calloc)(size_t, size_t);
+static void *(*h_realloc)(void *, size_t); static int (*h_posix_memalign)(void **, size_t, size_t);
+static void *(*h_aligned_alloc)(size_t, size_t); static size_t (*h_usable)(void *);
+/* dlsym may itself call calloc: those early calls are served from a static buffer that is never freed */
+static char boot[1 << 16]; static size_t boot_used; static atomic_int booting;
+static int in_boot(const void *p){ return (const char *)p >= boot && (const char *)p < boot + sizeof boot; }
+static void *boot_alloc(size_t n){ size_t off = (boot_used + 15) & ~(size_t)15; if (off + n > sizeof boot) abort(); boot_used = off + n; memset(boot + off, 0, n); return boot + off; }
+static void init_home(void){
+  if (h_malloc) return;
+  atomic_store(&booting, 1);
+  h_malloc = dlsym(RTLD_NEXT, "malloc"); h_free = dlsym(RTLD_NEXT, "free"); h_calloc = dlsym(RTLD_NEXT, "calloc");
+  h_realloc = dlsym(RTLD_NEXT, "realloc"); h_posix_memalign = dlsym(RTLD_NEXT, "posix_memalign");
+  h_aligned_alloc = dlsym(RTLD_NEXT, "aligned_alloc"); h_usable = dlsym(RTLD_NEXT, "malloc_usable_size");
+  atomic_store(&booting, 0);
+}
+#define HOME_MALLOC(n) (init_home(), h_malloc(n))
+#define HOME_FREE(p) h_free(p)
+#define HOME_CALLOC(a, b) (init_home(), h_calloc(a, b))
+#define HOME_REALLOC(p, n) h_realloc(p, n)
+#define HOME_MEMALIGN(pp, al, n) h_posix_memalign(pp, al, n)
+#define HOME_USABLE(p) h_usable(p)
+#define HOME_NAME "glibc"
+#elif defined(BACKING_JEMALLOC)
+static void init_home(void){}
+static int in_boot(const void *p){ (void)p; return 0; }
+#define HOME_MALLOC(n) rj_malloc(n)
+#define HOME_FREE(p) rj_free(p)
+#define HOME_CALLOC(a, b) rj_calloc(a, b)
+#define HOME_REALLOC(p, n) rj_realloc(p, n)
+#define HOME_MEMALIGN(pp, al, n) rj_posix_memalign(pp, al, n)
+#define HOME_USABLE(p) rj_malloc_usable_size(p)
+#define HOME_NAME "jemalloc"
+#else
+static void init_home(void){}
+static int in_boot(const void *p){ (void)p; return 0; }
+#define HOME_MALLOC(n) mi_malloc(n)
+#define HOME_FREE(p) mi_free(p)
+#define HOME_CALLOC(a, b) mi_calloc(a, b)
+#define HOME_REALLOC(p, n) mi_realloc(p, n)
+#define HOME_MEMALIGN(pp, al, n) mi_posix_memalign(pp, al, n)
+#define HOME_USABLE(p) mi_usable_size(p)
+#define HOME_NAME "mimalloc"
+#endif
+
+/* ---------------- backing: raw blocks from the current range ---------------- */
+#if defined(BACKING_JEMALLOC)
+#define BACKING_NAME "jemalloc"
+/* arenas.create allocates the arena's own metadata through the hooks before the index is known,
+   so the range being opened is found through `opening` until backing_open records the index */
+static Range *opening = NULL;
+static Range *range_of_arena(unsigned ind){ for (int i = 0; i < NR; i++) if (R[i].ready && R[i].arena == ind) return &R[i]; return opening; }
+/* Extents are bumped from the range. new_addr is honoured only when it is exactly the bump
+   pointer (jemalloc asks for it to grow an extent in place). dalloc is refused so jemalloc
+   retains and reuses extents itself; nothing is ever returned to the range. */
+static void *ext_alloc(extent_hooks_t *h, void *new_addr, size_t size, size_t alignment, bool *zero, bool *commit, unsigned ind){
+  (void)h; Range *r = range_of_arena(ind); if (!r) return NULL;
+  pthread_mutex_lock(&lk);
+  uintptr_t p = ((uintptr_t)r->base + r->bump + alignment - 1) & ~(uintptr_t)(alignment - 1);
+  if ((new_addr && (uintptr_t)new_addr != p) || p + size > (uintptr_t)r->base + r->size) { pthread_mutex_unlock(&lk); return NULL; }
+  r->bump = p + size - (uintptr_t)r->base;
+  pthread_mutex_unlock(&lk);
+  *zero = true; *commit = true; return (void *)p;
+}
+static bool ext_dalloc(extent_hooks_t *h, void *a, size_t s, bool c, unsigned i){ (void)h;(void)a;(void)s;(void)c;(void)i; return true; }
+static void ext_destroy(extent_hooks_t *h, void *a, size_t s, bool c, unsigned i){ (void)h;(void)a;(void)s;(void)c;(void)i; }
+static bool ext_commit(extent_hooks_t *h, void *a, size_t s, size_t o, size_t l, unsigned i){ (void)h;(void)a;(void)s;(void)o;(void)l;(void)i; return false; }
+static bool ext_decommit(extent_hooks_t *h, void *a, size_t s, size_t o, size_t l, unsigned i){ (void)h;(void)a;(void)s;(void)o;(void)l;(void)i; return true; }
+static bool ext_purge(extent_hooks_t *h, void *a, size_t s, size_t o, size_t l, unsigned i){ (void)h;(void)a;(void)s;(void)o;(void)l;(void)i; return true; }
+static bool ext_split(extent_hooks_t *h, void *a, size_t s, size_t sa, size_t sb, bool c, unsigned i){ (void)h;(void)a;(void)s;(void)sa;(void)sb;(void)c;(void)i; return false; }
+static bool ext_merge(extent_hooks_t *h, void *a, size_t sa, void *b, size_t sb, bool c, unsigned i){ (void)h;(void)a;(void)sa;(void)b;(void)sb;(void)c;(void)i; return false; }
+static extent_hooks_t hooks = { ext_alloc, ext_dalloc, ext_destroy, ext_commit, ext_decommit, ext_purge, ext_purge, ext_split, ext_merge };
+static int backing_open(Range *r){
+  unsigned ind; size_t sz = sizeof ind; extent_hooks_t *hp = &hooks;
+  r->bump = 0; opening = r;
+  int err = rj_mallctl("arenas.create", &ind, &sz, &hp, sizeof hp);
+  if (!err) { r->arena = ind; r->ready = true; }
+  opening = NULL; return err ? -1 : 0;
+}
+static void *backing_alloc(Range *r, size_t n){ return rj_mallocx(n ? n : 1, MALLOCX_ARENA(r->arena) | MALLOCX_TCACHE_NONE); }
+static void backing_free(void *p){ rj_dallocx(p, MALLOCX_TCACHE_NONE); }
+#else
+#define BACKING_NAME "mimalloc"
+static int backing_open(Range *r){
+  if (!mi_manage_os_memory_ex(r->base, r->size, true, true, true, -1, true, &r->arena_id)) return -1;
+  r->heap = mi_heap_new_in_arena(r->arena_id); if (!r->heap) return -1;
+  r->ready = true; return 0;
+}
+static void *backing_alloc(Range *r, size_t n){ return mi_heap_malloc((mi_heap_t *)r->heap, n ? n : 1); }
+static void backing_free(void *p){ mi_free(p); }
+#endif
+
+/* ---------------- diverted blocks with headers ---------------- */
+static inline Hdr *hdr(void *p){ return (Hdr *)((char *)p - HDR); }
+static void *range_alloc(Range *r, size_t n, size_t align){
+  if (align < 16) align = 16;
+  char *raw = backing_alloc(r, n + align + HDR); if (!raw) return NULL;
+  char *p = (char *)(((uintptr_t)raw + HDR + align - 1) & ~(uintptr_t)(align - 1));
+  Hdr *h = hdr(p); h->size = n; h->off = (uint32_t)(p - raw); h->magic = MAGIC;
+  atomic_fetch_add(&n_divert, 1); atomic_fetch_add(&n_divert_bytes, n);
+  return p;
+}
+static void range_free(int ri, void *p){
+  Hdr *h = hdr(p);
+  if (ri == atomic_load(&cur)) { atomic_fetch_add(&n_free_range_current, 1); backing_free((char *)p - h->off); return; }
+  /* another copy's metadata: count, and give large blocks' pages back */
+  atomic_fetch_add(&R[ri].foreign_freed_blocks, 1); atomic_fetch_add(&R[ri].foreign_freed_bytes, h->size);
+  if (h->size >= 65536) { uintptr_t a = ((uintptr_t)p + 4095) & ~(uintptr_t)4095, e = ((uintptr_t)p + h->size) & ~(uintptr_t)4095; if (e > a) madvise((void *)a, e - a, MADV_DONTNEED); }
+}
+
+/* ---------------- the libc surface ---------------- */
+static void *do_malloc(size_t n, size_t align){
+  int c = atomic_load(&cur);
+  if (c >= 0) return range_alloc(&R[c], n, align);
+  atomic_fetch_add(&n_home, 1);
+  if (align <= 16) return HOME_MALLOC(n);
+  void *p = NULL; init_home(); return HOME_MEMALIGN(&p, align, n) ? NULL : p;
+}
+void *malloc(size_t n){
+#if defined(HOME_GLIBC)
+  if (atomic_load(&booting)) return boot_alloc(n);
+#endif
+  return do_malloc(n, 0);
+}
+void *calloc(size_t a, size_t b){
+  size_t n; if (__builtin_mul_overflow(a, b, &n)) { errno = ENOMEM; return NULL; }
+#if defined(HOME_GLIBC)
+  if (atomic_load(&booting)) return boot_alloc(n);
+#endif
+  int c = atomic_load(&cur);
+  if (c >= 0) { void *p = range_alloc(&R[c], n, 0); if (p) memset(p, 0, n); return p; }
+  atomic_fetch_add(&n_home, 1); return HOME_CALLOC(a, b);
+}
+size_t malloc_usable_size(void *p){
+  if (!p || in_boot(p)) return 0;
+  int ri = in_range(p); if (ri >= 0) return hdr(p)->size;
+  init_home(); return HOME_USABLE(p);
+}
+void free(void *p){
+  if (!p || in_boot(p)) return;
+  int ri = in_range(p); if (ri >= 0) { range_free(ri, p); return; }
+  init_home(); HOME_FREE(p);
+}
+void *realloc(void *p, size_t n){
+  if (!p) return malloc(n);
+  if (n == 0) { free(p); return NULL; }
+  int c = atomic_load(&cur), ri = in_range(p);
+  if (ri < 0 && c < 0) { atomic_fetch_add(&n_home, 1); init_home(); return HOME_REALLOC(p, n); }
+  /* every other case moves the block: into the range if diverted, else home */
+  size_t old = ri >= 0 ? hdr(p)->size : (in_boot(p) ? 0 : (init_home(), HOME_USABLE(p)));
+  void *q = c >= 0 ? range_alloc(&R[c], n, 0) : (atomic_fetch_add(&n_home, 1), HOME_MALLOC(n));
+  if (!q) return NULL;
+  memcpy(q, p, old < n ? old : n);
+  if (ri >= 0) range_free(ri, p); else { if (c >= 0) atomic_fetch_add(&n_realloc_home_to_range, 1); if (!in_boot(p)) HOME_FREE(p); }
+  return q;
+}
+int posix_memalign(void **pp, size_t align, size_t n){ void *p = do_malloc(n, align); if (!p) return ENOMEM; *pp = p; return 0; }
+void *aligned_alloc(size_t align, size_t n){ return do_malloc(n, align); }
+void *memalign(size_t align, size_t n){ return do_malloc(n, align); }
+void *valloc(size_t n){ return do_malloc(n, 4096); }
+void *pvalloc(size_t n){ return do_malloc((n + 4095) & ~(size_t)4095, 4096); }
+
+/* ---------------- control ---------------- */
+int rangemalloc_register(void *base, size_t size){
+  pthread_mutex_lock(&lk);
+  if (NR == MAXR) { pthread_mutex_unlock(&lk); return -1; }
+  int i = NR++; memset(&R[i], 0, sizeof R[i]); R[i].base = base; R[i].size = size;
+  pthread_mutex_unlock(&lk); return i;
+}
+int rangemalloc_use(int i){
+  if (i < 0 || i >= NR) return -1;
+  if (mprotect(R[i].base, R[i].size, PROT_READ | PROT_WRITE)) return -1;
+  if (!R[i].ready && backing_open(&R[i])) return -2;
+  atomic_store(&cur, i); return 0;
+}
+void rangemalloc_off(void){ atomic_store(&cur, -1); }
+static char statbuf[512];
+const char *rangemalloc_stats(void){
+  size_t fb = 0, fk = 0; for (int i = 0; i < NR; i++) { fb += atomic_load(&R[i].foreign_freed_blocks); fk += atomic_load(&R[i].foreign_freed_bytes); }
+  snprintf(statbuf, sizeof statbuf, "backing=%s home=%s ranges=%d cur=%d home_calls=%zu diverted=%zu diverted_bytes=%zu "
+           "freed_in_current=%zu realloc_home_to_range=%zu foreign_freed_blocks=%zu foreign_freed_bytes=%zu",
+           BACKING_NAME, HOME_NAME, NR, atomic_load(&cur), atomic_load(&n_home), atomic_load(&n_divert), atomic_load(&n_divert_bytes),
+           atomic_load(&n_free_range_current), atomic_load(&n_realloc_home_to_range), fb, fk);
+  return statbuf;
+}
+__attribute__((constructor)) static void ctor(void){ init_home(); }
