@@ -40,7 +40,7 @@ task system such as Parsl or a workflow engine is the better fit.
 ## Status
 
 Design stage; nothing is implemented. The design, including the comparison with microVM
-snapshots and CRIU and the items still to verify on NERSC Perlmutter, is in
+snapshots and CRIU and the two items still to verify on NERSC Perlmutter, is in
 [DESIGN.md](DESIGN.md).
 
 The name is 藻旅 (*mo*, alga, as in marimo; *tabi*, journey).

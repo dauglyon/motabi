@@ -265,15 +265,18 @@ allocation hosting many legs is a later option.
 - **slurm-ssh** — sbatch over ssh. Lawrencium.
 - **superfacility** — NERSC's REST API. Perlmutter.
 
-Three checks to run on Perlmutter before anything else, each unverified today:
+Precondition on any site: unprivileged user namespaces on the compute nodes, the same facility
+rootless podman-hpc uses, so a site that runs rootless podman runs `runsc --rootless`. Where a
+site lacks it, the fallback is DMTCP inside Apptainer (section 7), at the cost of sandbox
+fidelity. Perlmutter has it.
+
+Two checks to run on Perlmutter before anything else, each unverified today:
 
 1. A sandbox checkpointed on a host without a GPU restores on a GPU node with the GPU usable.
    gVisor creates nvproxy device files on restore regardless of the checkpoint's metadata
    (google/gvisor#14525), which suggests yes.
 2. Which networking mode `runsc --rootless` gets inside a Slurm allocation, and that an outbound
    connection from the sandbox to the platform works.
-3. That site policy has no objection to running `runsc` in a job. It is an unprivileged user
-   binary; user namespaces are already enabled for podman-hpc.
 
 Also to read before the batch section is final: marimo-team/expd, which runs a trial notebook
 across varying inputs in parallel and overlaps with `map`.
