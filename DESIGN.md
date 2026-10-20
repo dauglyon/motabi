@@ -42,10 +42,9 @@ a queue or cost estimate if the site has one.
 below chooses). Independently of mode, a run that reaches cells whose selection has not been
 approved stops at the first of them and shows, for each, the site, resources, walltime, and
 queue estimate; nothing is submitted until the user approves. Approval is recorded on the cell,
-so a later run with the same requirement and selection does not ask again. The prompt is carried
-as a host-protocol *decision* (`protocols/host/spec.md`, "Requests and decisions"), the mechanism
-marimo already uses for choices such as a kernel environment, so the editor, `marimo pair`, and
-a batch runner receive the same request.
+so a later run with the same requirement and selection does not ask again. In the editor the prompt
+is the header cell's output (section 4); for `marimo pair` and batch runners it can later travel
+as a host-protocol *decision* (`protocols/host/spec.md`, "Requests and decisions").
 
 The policy takes the sites whose capabilities satisfy the requirement and prefers, in order:
 where the kernel already is; least data movement (sum over declared datasets of size times the
@@ -198,7 +197,7 @@ object-level join does not depend on; GPU restore ties to the host driver versio
 
 ## 4. Inside Marimo
 
-Two pieces live in Marimo; both exist or are small.
+Two pieces live in Marimo; both use what Marimo ships.
 
 - **Executor plug-in.** The entry-point group `marimo.cell.executor` lets one installed package
   supply the executor that runs every cell body (`marimo/_runtime/executor/evaluator.py:147-178`).
@@ -209,16 +208,23 @@ Two pieces live in Marimo; both exist or are small.
   already in hand, the way the cache lifecycle answers with a hit
   (`marimo/_runtime/executor/lifecycles/cached.py:144`). Marimo's `SequentialScheduler`
   (`marimo/_runtime/runner/scheduler.py:77`) is therefore not an obstacle.
-- **Requirement on the cell.** `CellConfig` has only `column`, `disabled`, `hide_code`,
-  `expand_output` (`marimo/_ast/cell.py:35-53`), so a requirement cannot ride on the file format
-  today. Interim form: a `motabi.require(...)` call at the top of the cell, visible to the
-  executor through the cell's AST. Upstream ask: extension-owned keys on `CellConfig`.
+- **Requirement on the cell.** A call at the top of the cell (`motabi.require(...)`,
+  `item = motabi.scatter(...)`) is persistent per-cell metadata: it is in the file, it diffs, and
+  the executor reads it from the cell's source before running the body. The executor renders the
+  cell's state (site, resources, queued, running) by prefixing the cell's output with a status
+  element, so no editor change is needed. `CellConfig` carries only `column`, `disabled`,
+  `hide_code`, `expand_output` (`marimo/_ast/cell.py:35-53`); a key there would add nothing the
+  call does not.
+- **Approval gate.** The executor returns a Marimo UI element as the header cell's output, an
+  approve control showing the proposed site, resources, walltime and queue estimate, and stops
+  the cell's descendants until it is used, the pattern of `mo.ui.run_button` with `mo.stop`. The
+  control's callback records the approval and the run proceeds. The host-protocol *decision*
+  (`protocols/host/spec.md`, "Requests and decisions") can carry the same prompt to `marimo pair`
+  and batch runners later; it is not required.
 
-Upstream asks, to be filed as a Marimo Enhancement Proposal (marimo-team/meps):
-
-1. Extension-owned keys on `CellConfig`, so a requirement survives save and load.
-2. A documented hand-off point in the executor for "this cell runs after the host does
-   something", which the entry point already provides de facto.
+Nothing is required from Marimo. One courtesy item for the team, as a Marimo Enhancement
+Proposal or a conversation: motabi depends on the `marimo.cell.executor` entry point and on the
+executor's access to the graph and globals; a note that these are stable extension points.
 
 Not asked for: remote kernels (marimo-team/marimo#5506), parallel cell scheduling
 (marimo-team/marimo#1103), or any change to the editor or format.
