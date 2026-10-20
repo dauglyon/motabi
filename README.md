@@ -20,7 +20,7 @@ because moving the kernel to a large dataset is cheaper than moving the dataset 
 and the same code must run unchanged wherever the kernel is.
 
 <p align="center">
-  <img src="docs/flow.svg" width="100%" alt="Notebook cells run top to bottom. The first cells run at home; a cell containing motabi.require(gpus=1) sends the kernel to a GPU site, where three independent cells run in parallel and fold back into one kernel, which returns home for the remaining cells.">
+  <img src="docs/flow.svg" width="100%" alt="Notebook cells run top to bottom. The first cells run at home; a cell containing motabi.require(gpus=1) sends the kernel to a GPU site, where three independent cells with the same requirement run in parallel and fold back into one kernel; a cell containing motabi.home() brings the kernel back home for the remaining cells.">
 </p>
 
 ## What you get

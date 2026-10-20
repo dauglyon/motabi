@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 530" width="1000" height="530" role="img" aria-labelledby="t d">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 550" width="1000" height="550" role="img" aria-labelledby="t d">
   <title id="t">How motabi runs a notebook's cells across sites</title>
-  <desc id="d">A notebook's cells run in order from top to bottom. The first cells run at home. A cell containing motabi.require(gpus=1) sends the kernel to a site with a GPU. Three independent cells after it, each with the same requirement, run in parallel as copies of the kernel. Their results fold back into one kernel, which returns home, where the remaining cells run.</desc>
+  <desc id="d">A notebook's cells run in order from top to bottom. The first cells run at home. A cell containing motabi.require(gpus=1) sends the kernel to a site with a GPU. Three independent cells after it, each with the same requirement, run in parallel as copies of the kernel. Their results fold back into one kernel. A cell containing motabi.home() brings the kernel back home, where the remaining cells run.</desc>
   <style>
     svg {
       --bg: #ffffff; --band: #f6f8fa; --ink: #1f2328; --muted: #59636e; --cell: #d0d7de;
@@ -25,11 +25,11 @@
     <marker id="h" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto"><path class="ah" d="M0,0 L10,5 L0,10 z"/></marker>
   </defs>
 
-  <rect x="0" y="0" width="1000" height="530" rx="12" style="fill:var(--bg)"/>
+  <rect x="0" y="0" width="1000" height="550" rx="12" style="fill:var(--bg)"/>
 
   <!-- the two places -->
-  <rect x="12" y="12" width="300" height="506" rx="10" style="fill:var(--band)"/>
-  <rect x="324" y="12" width="664" height="506" rx="10" style="fill:var(--band)"/>
+  <rect x="12" y="12" width="300" height="526" rx="10" style="fill:var(--band)"/>
+  <rect x="324" y="12" width="664" height="526" rx="10" style="fill:var(--band)"/>
   <text class="place" x="36" y="44">Home</text>
   <text class="note" x="88" y="44">where you edit</text>
   <text class="place" x="348" y="44">Site</text>
@@ -69,13 +69,15 @@
 
   <!-- fold into one kernel and return home -->
   <path class="a" d="M439,346 V370 M657,346 V370 M875,346 V370 M439,370 H875"/>
-  <path class="a" d="M657,370 C657,420 480,440 294,440" marker-end="url(#h)"/>
-  <text class="note" x="677" y="410">fold into one kernel,</text>
-  <text class="note" x="677" y="429">checkpoint, return home</text>
+  <path class="a" d="M657,370 C657,420 480,442 294,442" marker-end="url(#h)"/>
+  <text class="note" x="677" y="404">fold into one kernel</text>
+  <text class="note" x="342" y="478">this line brings the</text>
+  <text class="note" x="342" y="497">kernel back home</text>
 
   <!-- cells at home again -->
-  <rect class="cell" x="36" y="420" width="252" height="40" rx="6"/>
-  <text class="code" x="52" y="445">best = max(a, b, c)</text>
-  <rect class="cell" x="36" y="472" width="252" height="40" rx="6"/>
-  <text class="code" x="52" y="497">plot(best)</text>
+  <rect class="cell" x="36" y="420" width="252" height="56" rx="6"/>
+  <text class="code req" x="52" y="442">motabi.home()</text>
+  <text class="code" x="52" y="464">best = max(a, b, c)</text>
+  <rect class="cell" x="36" y="488" width="252" height="40" rx="6"/>
+  <text class="code" x="52" y="513">plot(best)</text>
 </svg>

@@ -36,6 +36,8 @@ declared interface, and the graph is already the DAG. motabi adds nothing to thi
 A cell may carry a **requirement**: cores, memory, GPUs (count, class, minimum VRAM), expected
 duration, and dataset URIs it reads. A requirement never names a site; a site name on a cell is
 an override of selection, not the mechanism. A cell without a requirement runs where the kernel is.
+A cell that begins with `motabi.home()` runs at home: if the kernel is away, it is brought back
+before the cell runs (2.3).
 
 A site declares **capabilities**, answered for one user: cores and memory per node, GPU types,
 maximum walltime, ISA and CPU feature set, whether rootless sandboxes work, which data stores the
@@ -85,9 +87,11 @@ session, so a machine of another ISA than the sites runs only the browser; with 
 (section 6) that means an arm64 laptop, and an arm64 session would also have no GPU legs, since
 gVisor's GPU checkpoint is not available on arm64. Home is a site in the selection above, with
 its own capabilities, and when it is a VM on a laptop the session is pinned to the VM's CPU
-features and every image crosses the laptop's uplink. The session returns when the run that sent it out ends and home's
-capabilities cover its footprint; otherwise it stays where it is and the user is told what to
-drop or write out. There is no separate return policy.
+features and every image crosses the laptop's uplink. The session returns at the first cell
+marked `motabi.home()` (2.2), or when the run that sent it out ends, provided home's capabilities
+cover its footprint; otherwise it stays where it is and the user is told what to drop or write
+out. Nothing else brings it back mid-run, so cells without a requirement after a leg run at the
+site until one is marked.
 
 ### 2.4 Fork and join
 
@@ -276,13 +280,14 @@ Three pieces live in Marimo; all use what Marimo ships.
   supply the executor that runs every cell body (`marimo/_runtime/executor/evaluator.py:147-178`).
   motabi's executor runs an unrequired cell with the default; for a required cell it reports the
   requirement to the orchestrator over a file in the workspace and blocks until the orchestrator
-  signals that the sandbox is at the selected site, then runs the body. For a parallel group it
+  signals that the sandbox is at the selected site, then runs the body. A cell marked
+  `motabi.home()` is handled the same way, with home as the selected site. For a parallel group it
   launches the branches on the first cell and answers each later branch cell with the result
   already in hand, the way the cache lifecycle answers with a hit
   (`marimo/_runtime/executor/lifecycles/cached.py:144`). Marimo's `SequentialScheduler`
   (`marimo/_runtime/runner/scheduler.py:77`) is therefore not an obstacle.
 - **Requirement on the cell.** A call at the top of the cell (`motabi.require(...)`,
-  `item = motabi.scatter(...)`) is persistent per-cell metadata: it is in the file, it diffs, and
+  `motabi.home()`, `item = motabi.scatter(...)`) is persistent per-cell metadata: it is in the file, it diffs, and
   the executor reads it from the cell's source before running the body. The executor renders the
   cell's state (site, resources, queued, running) by prefixing the cell's output with a status
   element, so no editor change is needed. `CellConfig` carries only `column`, `disabled`,
