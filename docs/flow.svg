@@ -46,16 +46,16 @@
   <rect class="cell" x="526" y="180" width="260" height="56" rx="6"/>
   <text class="code req" x="542" y="202">motabi.require(gpus=1)</text>
   <text class="code" x="542" y="224">model = train(clean)</text>
-  <text class="note" x="802" y="202">this line sends the</text>
-  <text class="note" x="802" y="221">kernel to a GPU site</text>
+  <text class="note" x="802" y="198">this line sends the</text>
+  <text class="note" x="802" y="217">kernel to a GPU site</text>
 
   <!-- independent cells run in parallel -->
   <path class="a" d="M656,236 V258 M476,258 H836"/>
   <path class="a" d="M476,258 V282" marker-end="url(#h)"/>
   <path class="a" d="M656,258 V282" marker-end="url(#h)"/>
   <path class="a" d="M836,258 V282" marker-end="url(#h)"/>
-  <text class="note" x="852" y="254">independent cells</text>
-  <text class="note" x="852" y="273">run in parallel</text>
+  <text class="note" x="852" y="257">independent cells</text>
+  <text class="note" x="852" y="276">run in parallel</text>
 
   <rect class="cell" x="394" y="288" width="164" height="40" rx="6"/>
   <text class="code" x="406" y="313">a = test(model, 1)</text>
