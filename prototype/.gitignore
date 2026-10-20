@@ -7,3 +7,5 @@ run/
 .venv/
 leg-output.txt
 __marimo__/
+base/tree/
+base/stage-work/

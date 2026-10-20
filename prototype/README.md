@@ -7,7 +7,7 @@ browser stays attached throughout; the server never learns the kernel moved.
 
 ## Run
 
-    ./run.sh                      # creates .venv (marimo 0.25.2, numpy, motabi), serves nb.py on :2718
+    ./run.sh                      # creates .venv for the server; the kernel runs in base/tree when staged (see below)
 
 Open the tokened URL marimo prints and run the cells (the user config has `auto_instantiate = false`;
 Ctrl+Shift+R runs stale cells, Ctrl+Enter in a cell runs it). The require cell's console shows
@@ -21,7 +21,9 @@ through files in `run/share`.
 
 ## A second machine
 
-    ./env/build.sh                # environment image → rootfs/ (the sandbox's "/"; run.sh uses it when present)
+    docker build -t motabi-base base && (cid=$(docker create motabi-base); docker export $cid | tar -x -C base/tree --exclude='dev/*' --no-same-owner --no-same-permissions; docker rm $cid)
+    base/tree/usr/local/bin/uv lock --script nb.py && base/tree/usr/local/bin/uv export --script nb.py -o env.requirements.txt
+    base/stage.sh                 # the venv onto the base tree, inside a sandbox (what every site runs)
     docker build -t motabi-sitehost site
     CPU=Haswell site/run-vm.sh    # Ubuntu cloud-image guest under QEMU/KVM in a container; ssh on :2222
     site/provision.sh             # runsc, rootfs/, the checkout → the guest, same paths
@@ -84,6 +86,11 @@ offset), the loaded numpy, and the marimo kernel's own threads and ZeroMQ socket
   write had gone. The workspace (notebook directory minus local-only trees) is now pushed out
   and fetched back with every move.
 - Playwright: Ctrl+Enter on an unchanged, already-run cell does not run it; edit the cell first.
+- runsc's default `--overlay2=root:self` puts a discardable layer over the root filesystem: a
+  container that is meant to write into its rootfs (staging the venv) needs `--overlay2=none`.
+- The workspace sync must leave the base tree alone. With `base/` included, every push repaired
+  the site's copy from home before the digest check, and the fetch back appended the site's
+  extra bytes onto home's library.
 - `run.sh` kills every process whose command line matches `motabi.launcher`; the dot matches
   any character, so a shell whose command mentions `motabi/launcher.py` is killed too.
 - The approval gate and site selection are not in the prototype. The return policy is: home at

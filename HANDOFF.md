@@ -21,8 +21,9 @@ ships for container migration; motabi drives it per cell.
 
 - Repo: `~/work/motabi`, github.com/dauglyon/motabi (private), branch `main`.
 - `motabi/` — the package (see "Code map" below).
-- `prototype/` — a runnable demo: a three-topic notebook (`nb.py`), a launch script
-  (`run.sh`), and a README with the run recipe and results.
+- `prototype/` — a runnable demo: a three-topic notebook (`nb.py`, with its PEP 723 block), a
+  launch script (`run.sh`), the base and staging recipe (`base/`), the stand-in site (`site/`),
+  and a README with the run recipe and results.
 - `experiments/fold/` — the earlier standalone experiments the join mechanism was prototyped in
   (plain `os.fork` and a bare gVisor save/load, before marimo was involved).
 - Toolchain on this machine (canopy): gVisor `runsc` release-20261012.0 at `/tmp/gv/runsc`;
@@ -102,6 +103,21 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
    file while away and no move happened between them; the `home()` cell brought the kernel
    back; a require cell with no descendants went out and came home at run end, three times.
 
+6. **The environment as designed (2.7).** The notebook carries a PEP 723 block (`nb.py`);
+   `uv lock --script` and `uv export --script` at home produce `nb.py.lock` and
+   `env.requirements.txt` (hash-pinned). `base/Dockerfile` is the base: Ubuntu 22.04 with
+   ca-certificates and uv, exported to `base/tree/` (127 MB). `base/stage.sh` runs the same on
+   every machine: a one-shot runsc container rooted at the base tree (`--overlay2=none`, or the
+   writes vanish with the container) in which uv installs the pinned interpreter and syncs the
+   venv from the requirements file, wheels only. 3–4 minutes a machine, mostly downloads. The
+   guest staged its own venv this way, and the digest check proved the design's premise: the
+   24 files the kernel had mapped (python3.12, libc, numpy's core library, motabi's extension
+   among them) were byte-identical on the guest, and the leg restored. One byte appended to
+   numpy's library on the guest and the next leg was refused with that path in the cell;
+   home's copy put back, the leg after that restored. The launcher lists the mapped files from
+   the live process's `/proc/2/maps` before each checkpoint, hashes them beside the image
+   (`mapped.sha256`), and runs `sha256sum -c` on the site before the restore.
+
 ## Open issues, in the order worth addressing
 
 1. **NumPy array shape is wrong after a scatter merge.** A worker's new NumPy array has its
@@ -144,12 +160,10 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
    console redirect drops output with no running cell, so only the trace file records that
    the kernel came home. The user should see it; marimo has no obvious place for it yet.
 
-7. **The prototype's environment is an exported tree; the design (2.7, decided 2026-10-20) is
-   the notebook's PEP 723 metadata.** A restore maps the interpreter, libc and every extension
-   by path and needs identical bytes at the site, so the prototype ships `rootfs/`. The design
-   gets the same bytes from uv: a small digest-named base, the notebook's metadata resolved to
-   a lockfile at home, `uv sync` at each site, wheels only for native code, and the checkpoint
-   carrying digests of its mapped files for the payload to verify before restoring. Not built.
+7. **The base is not yet named by digest, and staging is by hand.** `base/tree/` is whatever
+   the last `docker export` produced; nothing records or checks its digest, and `stage.sh` is
+   run by provisioning rather than by an adapter's `stage(base, lockfile)`. The mapped-file
+   check covers the gap for now: a base that differs in a mapped file is refused by name.
 
 8. **The site path is not safe on a shared login node.** Two things the guest hides: the
    reverse tunnel binds the server's five ports on the site's loopback, where any user of that
@@ -164,12 +178,10 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
 
 In order:
 
-1. **Build the environment as designed** (issue 7).
-
-2. **A real site**: the slurm-ssh adapter against Lawrencium, with the pin computed from
+1. **A real site**: the slurm-ssh adapter against Lawrencium, with the pin computed from
    capabilities. The guest recipe in `prototype/site/` is the test bed until then.
 
-3. **NumPy metadata** (issue 1), once a scatter is wanted for array work. The tractable path is
+2. **NumPy metadata** (issue 1), once a scatter is wanted for array work. The tractable path is
    the per-type check the design describes, not the allocator-handler route that breaks reload.
 
 Not needed yet: GPU moves (need the hardware), the batch run, the approval prompt and site

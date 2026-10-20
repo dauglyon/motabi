@@ -98,7 +98,7 @@ class Launcher:
 
     # Trees under the workspace that stay where they are: the run directory moves piecewise,
     # the rest is tooling that is not the notebook's.
-    WORKSPACE_EXCLUDES = ("run", "rootfs", "site", ".venv", "kernel-venv", "env", "__marimo__", "__pycache__")
+    WORKSPACE_EXCLUDES = ("run", "rootfs", "base", "site", ".venv", "kernel-venv", "env", "__marimo__", "__pycache__")
 
     def push(self, *paths: str) -> float:
         """Copy directories to the site at the same paths (creating parents)."""
@@ -128,6 +128,41 @@ class Launcher:
     def site_has(self, path: str) -> bool:
         return subprocess.run(self.ssh() + [f"test -e {shlex.quote(path)}"], stdin=subprocess.DEVNULL,
                               stdout=subprocess.DEVNULL, stderr=self.log).returncode == 0
+
+    # -- the environment's mapped files (DESIGN.md 2.7) ---------------------------------------
+
+    def mapped_files(self) -> list[str]:
+        """Paths the kernel process has mapped, as the sandbox sees them."""
+        assert self.cid is not None
+        r = subprocess.run(["unshare", "-Ur", "-m", "--propagation", "unchanged", RUNSC, "--network=host",
+                            "--ignore-cgroups", "--root", self.state, "exec", self.cid, "cat", "/proc/2/maps"],
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        paths = {ln.split(None, 5)[5].strip() for ln in r.stdout.splitlines() if len(ln.split(None, 5)) == 6}
+        return sorted(p for p in paths if p.startswith("/") and not p.startswith(("/mnt", "/dev", "/tmp")))
+
+    def write_digests(self, img: str) -> int:
+        """sha256 of every mapped file, written beside the image for the site to check before
+        restoring; a path under a bind mount is hashed from its source, the rest from the rootfs."""
+        import hashlib
+
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        lines = []
+        for p in self.mapped_files():
+            host = p if p.startswith(repo) or not ROOTFS else os.path.join(ROOTFS, p.lstrip("/"))
+            try:
+                with open(host, "rb") as f:
+                    lines.append(f"{hashlib.sha256(f.read()).hexdigest()}  {host}\n")
+            except OSError:
+                continue  # a deleted or unreadable mapping: not checkable, not fatal
+        with open(os.path.join(img, "mapped.sha256"), "w") as f:
+            f.writelines(lines)
+        return len(lines)
+
+    def site_check(self, img: str) -> str:
+        """The first mapped file whose bytes differ on the site, or ''."""
+        r = subprocess.run(self.ssh() + [f"sha256sum --quiet -c {shlex.quote(os.path.join(img, 'mapped.sha256'))} 2>&1 | head -1"],
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        return r.stdout.strip()
 
     def site_reason(self) -> str:
         """The fatal line of the site's newest runsc log, or the feature mismatch if that is it."""
@@ -227,6 +262,10 @@ class Launcher:
         old, new = self.cid, f"leg{n}-{tag}"
         img = os.path.join(self.run, f"img-{n}-{tag}")
         going_out = SITE is not None and tag == "out"
+        n_mapped = 0
+        if going_out:  # the list comes from the live process, so before the checkpoint stops it
+            os.makedirs(img, exist_ok=True)
+            n_mapped = self.write_digests(img)
         rc, t_ckpt = self.runsc("checkpoint", "--image-path", img, old, remote=self.away)
         if rc:
             self.say(f"leg {n} {tag}: checkpoint of {old} failed (rc {rc}); see launcher.log")
@@ -238,14 +277,19 @@ class Launcher:
         elif self.away:
             t_xfer = self.fetch(img, self.share, self.notebook_dir)
         size = sum(os.path.getsize(os.path.join(img, f)) for f in os.listdir(img)) if os.path.isdir(img) else 0
-        rc2, t_rest = self.runsc("restore", "--image-path", img, "-bundle", self.bundle, "-detach", new,
-                                 sandbox_stdio=True, remote=going_out)
+        mismatch = self.site_check(img) if going_out else ""
+        if mismatch:
+            self.say(f"leg {n} {tag}: {n_mapped} mapped files checked on {SITE}: {mismatch}")
+            rc2, t_rest = 1, 0.0
+        else:
+            rc2, t_rest = self.runsc("restore", "--image-path", img, "-bundle", self.bundle, "-detach", new,
+                                     sandbox_stdio=True, remote=going_out)
         error = ""
         if rc2 and going_out:
             # The site refused the image (a CPU feature it lacks, a missing file). The kernel
             # has to live somewhere, so it is restored at home, but the cell does not run: the
             # executor raises with the site's reason, and the user decides what to change.
-            error = f"{SITE} refused the restore: {self.site_reason()}"
+            error = f"{SITE} refused the restore: {mismatch or self.site_reason()}"
             self.say(f"leg {n} {tag}: {error}")
             going_out = False
             rc2, t_rest = self.runsc("restore", "--image-path", img, "-bundle", self.bundle, "-detach", new,

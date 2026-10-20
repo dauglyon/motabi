@@ -1,3 +1,11 @@
+# /// script
+# requires-python = "==3.12.10"
+# dependencies = ["marimo==0.25.2", "numpy==2.5.4", "pyzmq==27.2.0", "motabi"]
+#
+# [tool.uv.sources]
+# motabi = { path = "/home/dauglyon/work/motabi", editable = true }
+# ///
+
 import marimo
 
 __generated_with = "0.25.2"
