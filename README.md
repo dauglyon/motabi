@@ -8,8 +8,10 @@ rebuild state: the process itself moves.
 
 **Highlights**
 
-- **The kernel travels, not the data.** The whole interpreter is checkpointed and resumed at the
-  site, so variables, open files, in-place mutations and imported modules arrive intact.
+- **The process travels, not the datasets.** The interpreter and its working directory are
+  checkpointed and resumed together at the site, so variables, open workspace files, in-place
+  mutations and imported modules arrive intact. Datasets stay where they are; cells are placed
+  near them.
 - **The notebook is the workflow.** marimo's dependency graph decides what runs where and what
   can run at once. Independent cells become parallel branches resumed from one snapshot and
   merged back into the original kernel.
