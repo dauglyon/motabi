@@ -39,11 +39,13 @@ offset), the loaded numpy, and the marimo kernel's own threads and ZeroMQ socket
 - The kernel cannot be process 1: it calls `setsid()`, which fails for a group leader, and its
   parent poller kills it when the server's pid is not visible. As a child of process 1 both
   stand down (`marimo/_runtime/parent_poller.py`).
-- Host-network sockets are saved and restored by gVisor (`hostinet` save/restore code in the
-  binary); on restore the kernel's five ZeroMQ connections were dead and ZeroMQ reconnected
-  them. In one of nine legs across three sessions only one of five channels came back and the
-  cell outputs after the move were lost. Not yet understood; a kernel-side reconnect on arrival
-  would remove the dependence on ZeroMQ noticing.
+- gVisor restores a connected host socket with no descriptor: reads fail with ECONNRESET,
+  writes with EPIPE, readiness reports hangup (`pkg/sentry/socket/hostinet/save_restore.go`).
+  ZeroMQ reconnects on any of those, and did in 46 of 47 legs; in the one failure only one of
+  five channels came back and the outputs after the move were lost, consistent with a pull
+  socket's poller missing the wake. The kernel's sockets now carry a ZMTP heartbeat
+  (`motabi/kernel.py`), so detection is a one-second timer: 20 legs over five fresh sessions
+  with the first leg fired right after kernel start, no failure.
 - marimo builds a new executor instance per run, so the leg sequence lives at module level.
 - The kernel's shared-memory virtual files are in the sandbox's /dev/shm, not the server's; the
   prototype turns them off (data URLs). Images and large outputs need another path.
