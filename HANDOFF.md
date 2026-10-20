@@ -91,7 +91,8 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
    checkpoint carries it, and a restore on a host missing any feature is refused. Pinned to
    the 54 features canopy and the guest share (`MOTABI_CPU_FEATURES`), every leg restores;
    unpinned, the guest refuses with "incompatible FeatureSet: missing features" naming adx,
-   rdseed, vmx and the rest, and the launcher runs the leg at home and says so in the cell.
+   rdseed, vmx and the rest; the kernel is restored at home, the cell raises with the site's
+   reason and does not run, and the kernel stays usable for the next run.
 
 ## Open issues, in the order worth addressing
 

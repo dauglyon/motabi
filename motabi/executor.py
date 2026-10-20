@@ -152,8 +152,9 @@ class MotabiExecutor:
         _log(f"leg {n}: leaving")
         reply = _ask(n, "req", "go", {"cell": str(cell.cell_id), "requirement": req})
         _log(f"leg {n}: arrived {reply}")
-        if reply.get("note"):
-            print(f"[motabi] leg {n}: {reply['note']}")
+        if reply.get("error"):
+            _log(f"leg {n}: {reply['error']}")
+            raise RuntimeError(f"leg {n} could not run: {reply['error']}")
         print(f"[motabi] leg {n}: arrived in {reply['container']} {reply.get('where', '')} after {reply['waited_s']}s "
               f"(checkpoint {reply['checkpoint_s']}s, {reply['image_mb']} MB, transfer {reply.get('transfer_s', 0)}s, "
               f"restore {reply['restore_s']}s); running")

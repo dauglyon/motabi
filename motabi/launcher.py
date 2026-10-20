@@ -129,6 +129,15 @@ class Launcher:
         return subprocess.run(self.ssh() + [f"test -e {shlex.quote(path)}"], stdin=subprocess.DEVNULL,
                               stdout=subprocess.DEVNULL, stderr=self.log).returncode == 0
 
+    def site_reason(self) -> str:
+        """The fatal line of the site's newest runsc log, or the feature mismatch if that is it."""
+        logs = os.path.join(self.run, "runsc-logs")
+        cmd = (f"cd {shlex.quote(logs)} && grep -a -h -o -m1 'incompatible FeatureSet.*' $(ls -t | head -3) 2>/dev/null | head -1"
+               f" || true; grep -a -h -o -m1 'FATAL ERROR.*' $(ls -t | head -3) 2>/dev/null | head -1")
+        r = subprocess.run(self.ssh() + [cmd], stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
+        return (lines[0] if lines else "no reason in the site's runsc log")[:400]
+
     def open_tunnel(self) -> None:
         """One ssh holding a reverse forward per server port, bound on the site's loopback."""
         with open(os.path.join(self.share, "kernel_args.json")) as f:
@@ -231,12 +240,13 @@ class Launcher:
         size = sum(os.path.getsize(os.path.join(img, f)) for f in os.listdir(img)) if os.path.isdir(img) else 0
         rc2, t_rest = self.runsc("restore", "--image-path", img, "-bundle", self.bundle, "-detach", new,
                                  sandbox_stdio=True, remote=going_out)
-        note = ""
+        error = ""
         if rc2 and going_out:
-            # The site refused the image (a CPU feature it lacks, a missing file): the leg runs
-            # at home instead, and the cell is told so. The site's runsc log has the reason.
-            note = f"site restore failed (rc {rc2}), ran at home"
-            self.say(f"leg {n} {tag}: {note}")
+            # The site refused the image (a CPU feature it lacks, a missing file). The kernel
+            # has to live somewhere, so it is restored at home, but the cell does not run: the
+            # executor raises with the site's reason, and the user decides what to change.
+            error = f"{SITE} refused the restore: {self.site_reason()}"
+            self.say(f"leg {n} {tag}: {error}")
             going_out = False
             rc2, t_rest = self.runsc("restore", "--image-path", img, "-bundle", self.bundle, "-detach", new,
                                      sandbox_stdio=True)
@@ -246,7 +256,7 @@ class Launcher:
         self.cid, self.away = new, going_out
         where = f"on {SITE}" if going_out else "here"
         reply = {"container": new, "checkpoint_s": round(t_ckpt, 1), "image_mb": round(size / 1e6),
-                 "restore_s": round(t_rest, 1), "transfer_s": round(t_xfer, 1), "where": where, "note": note}
+                 "restore_s": round(t_rest, 1), "transfer_s": round(t_xfer, 1), "where": where, "error": error}
         self.say(f"leg {n} {tag}: {old} -> {new} {where}: checkpoint {t_ckpt:.1f}s, {size / 1e6:.0f} MB, "
                  f"transfer {t_xfer:.1f}s, restore {t_rest:.1f}s")
         return reply
