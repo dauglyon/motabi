@@ -24,7 +24,7 @@ the dataset to the kernel, and the same code must run unchanged wherever the ker
   reaches cells whose selection has not been approved stops and shows the site, resources, and
   queue estimate for each; nothing is submitted until the user approves.
 - Kernel migration by sandbox checkpoint and restore, rather than by re-executing cells.
-- Parallel execution of independent cells as branches of one checkpoint, and `scatter` /
+- Parallel execution of independent cells in workers restored from one checkpoint, and `scatter` /
   `gather` to run a range of cells once per item of a collection, with per-cell outputs kept
   for every worker.
 - Batch runs with `python notebook.py` under the same mechanism.

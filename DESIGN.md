@@ -74,8 +74,8 @@ need no carriers; nothing is ever taken out of the process.
 ### 2.4 Fork and join
 
 Where several cells are mutually independent, their ancestors are complete, and they resolve to
-the same site, the snapshot is restored once per branch. A branch is a root cell plus the
-descendants that depend only on it and share its requirement.
+the same site, the snapshot is restored once per branch, each restore being a **worker**. A branch is a root
+cell plus the descendants that depend only on it and share its requirement.
 
 Branches cannot be merged as sandboxes. Join is at the object level, over the shared root:
 
