@@ -20,9 +20,9 @@ the dataset to the kernel, and the same code must run unchanged wherever the ker
 
 - Resource requirements declared per cell: cores, memory, GPUs, expected duration, datasets read.
 - Site selection from declared site capabilities, including data locality. Selection is
-  manual, automatic, or proposed for approval: a run that reaches a cell whose requirement has
-  no site yet shows the proposed site, resources, and queue estimate, and submits nothing until
-  the user approves.
+  manual (the user names the site) or automatic (motabi chooses). In either mode, a run that
+  reaches cells whose selection has not been approved stops and shows the site, resources, and
+  queue estimate for each; nothing is submitted until the user approves.
 - Kernel migration by sandbox checkpoint and restore, rather than by re-executing cells.
 - Parallel execution of independent cells as branches of one checkpoint.
 - Batch runs with `python notebook.py` under the same mechanism.
