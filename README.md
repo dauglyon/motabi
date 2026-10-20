@@ -10,14 +10,19 @@ The kernel runs inside a gVisor sandbox. When a cell declares a resource require
 selects a site whose capabilities satisfy it, checkpoints the sandbox together with the
 notebook's working directory, restores it inside a job at that site, runs the cell, and
 checkpoints it back. Cells that marimo's dependency graph identifies as independent run as
-separate restores of the same checkpoint, and their results are merged back into the original
-kernel. Datasets are referenced by URI and resolved at each site, so site selection can prefer
-the site nearest the data.
+separate restores of the same checkpoint, so that work with no dependency between its parts
+runs at the same time rather than in sequence; their results are merged back into the original
+kernel so that the notebook continues as one kernel afterwards. Datasets are referenced by URI
+and resolved at each site, because moving the kernel to a large dataset is cheaper than moving
+the dataset to the kernel, and the same code must run unchanged wherever the kernel is.
 
 ## What you get
 
 - Resource requirements declared per cell: cores, memory, GPUs, expected duration, datasets read.
-- Site selection from declared site capabilities, including data locality.
+- Site selection from declared site capabilities, including data locality. Selection is
+  manual, automatic, or proposed for approval: a run that reaches a cell whose requirement has
+  no site yet shows the proposed site, resources, and queue estimate, and submits nothing until
+  the user approves.
 - Kernel migration by sandbox checkpoint and restore, rather than by re-executing cells.
 - Parallel execution of independent cells as branches of one checkpoint.
 - Batch runs with `python notebook.py` under the same mechanism.

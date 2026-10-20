@@ -38,7 +38,16 @@ maximum walltime, ISA and CPU feature set, whether rootless sandboxes work, whic
 user can reach and how (mounted filesystem, same-datacenter object store, over the internet), and
 a queue or cost estimate if the site has one.
 
-**Selection** takes the sites whose capabilities satisfy the requirement and prefers, in order:
+**Selection** runs in one of three modes, set per notebook or per run: *manual* (the user names
+the site for each requirement), *automatic* (the policy below decides and submits), or *approve*
+(the policy proposes; the run pauses at the first cell whose requirement has no site and shows
+the proposed site, resources, walltime, and queue estimate; nothing is submitted until the user
+approves). Approve is the default. The prompt is carried as a host-protocol *decision*
+(`protocols/host/spec.md`, "Requests and decisions"), which is the mechanism marimo already uses
+for choices such as a kernel environment, so the editor, `marimo pair`, and a batch runner see
+the same request.
+
+The policy takes the sites whose capabilities satisfy the requirement and prefers, in order:
 where the kernel already is; least data movement (sum over declared datasets of size times the
 store's reachability penalty); shortest queue or lowest cost. One hard constraint sits above the
 order: a thawed sandbox needs a CPU feature set covering everything it has used, so a session's
