@@ -19,6 +19,10 @@ continues as one kernel afterwards. Datasets are referenced by URI and resolved 
 because moving the kernel to a large dataset is cheaper than moving the dataset to the kernel,
 and the same code must run unchanged wherever the kernel is.
 
+<p align="center">
+  <img src="docs/flow.svg" width="100%" alt="A cell declares a requirement and the user approves it in the cell; the kernel's sandbox is checkpointed at home and restored in a job at a site, where datasets are mounted by URI; independent cells fork into workers restored from one checkpoint, their defines fold back into the root by address, and the sandbox is checkpointed and restored at home again.">
+</p>
+
 ## What you get
 
 - Resource requirements declared per cell: cores, memory, GPUs, expected duration, datasets read.
