@@ -143,6 +143,15 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
    from a lockfile at each site (wheels only for native code), with the checkpoint carrying
    digests of its mapped files for the payload to verify before restoring. Not decided.
 
+8. **The site path is not safe on a shared login node.** Two things the guest hides: the
+   reverse tunnel binds the server's five ports on the site's loopback, where any user of that
+   host can connect, and marimo's kernel channel has no authentication, so a neighbour could
+   speak as the kernel; and runsc is run from `/tmp/gv` on the site, a world-writable parent
+   another user could pre-create or replace. For the slurm-ssh adapter: forward to a Unix
+   socket in a 0700 directory and bridge it to the kernel's loopback inside the payload, or
+   authenticate the channel (ZMQ CURVE); install runsc under the user's home and check its
+   hash before use; create the run directory with mode 0700.
+
 ## Next
 
 In order:
