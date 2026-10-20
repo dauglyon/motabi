@@ -7,4 +7,4 @@ cd "$(dirname "$0")"
 uv pip install -q --python .venv/bin/python "marimo==0.25.2" numpy -e ..
 pkill -f "runsc.*--root $PWD/run/state" 2>/dev/null || true
 rm -rf run leg-output.txt
-exec .venv/bin/marimo edit --headless --no-token --port 2718 nb.py
+exec .venv/bin/marimo edit --headless --port 2718 nb.py

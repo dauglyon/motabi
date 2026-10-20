@@ -9,7 +9,7 @@ browser stays attached throughout; the server never learns the kernel moved.
 
     ./run.sh                      # creates .venv (marimo 0.25.2, numpy, motabi), serves nb.py on :2718
 
-Open http://localhost:2718 and run the cells (the user config has `auto_instantiate = false`;
+Open the tokened URL marimo prints and run the cells (the user config has `auto_instantiate = false`;
 Ctrl+Shift+R runs stale cells, Ctrl+Enter in a cell runs it). The require cell's console shows
 the two moves with timings; `leg-output.txt` collects the writes of one file handle opened before
 the first move. `run/` holds the share directory, the runsc root, the images and the logs.
