@@ -1,0 +1,9 @@
+#!/bin/sh
+# marimo takes this directory for the kernel's venv ([tool.marimo.venv] in ../../pyproject.toml).
+# The kernel launch goes to motabi's launcher, which runs the kernel in the sandbox; every other
+# invocation (marimo checking that marimo and zmq import) goes to the real venv.
+REAL="$(cd "$(dirname "$0")/../../.venv/bin" && pwd)/python"
+if [ "${1-}" = "-m" ] && [ "${2-}" = "marimo._ipc.launch_kernel" ]; then
+  exec "$REAL" -m motabi.launcher
+fi
+exec "$REAL" "$@"

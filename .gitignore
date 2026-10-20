@@ -1,3 +1,6 @@
 __pycache__/
 *.egg-info/
 .venv/
+prototype/run/
+prototype/leg-output.txt
+__marimo__/

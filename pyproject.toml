@@ -1,0 +1,16 @@
+[project]
+name = "motabi"
+version = "0.0.1"
+description = "Moves a running marimo kernel to the compute its cells need"
+requires-python = ">=3.12"
+dependencies = ["marimo>=0.25.2"]
+
+[project.entry-points."marimo.cell.executor"]
+motabi = "motabi.executor:factory"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["motabi"]

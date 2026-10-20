@@ -1,0 +1,2 @@
+[tool.marimo.venv]
+path = "kernel-venv"
