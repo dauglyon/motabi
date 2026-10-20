@@ -4,3 +4,4 @@ __pycache__/
 prototype/run/
 prototype/leg-output.txt
 __marimo__/
+*.so

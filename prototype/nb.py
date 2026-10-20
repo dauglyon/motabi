@@ -43,5 +43,29 @@ def _(data, log):
     return
 
 
+@app.cell
+def _(motabi):
+    samples = ["a", "bb", "ccc"]
+    item = motabi.scatter(samples)
+    return item, samples
+
+
+@app.cell
+def _(item):
+    payload = bytes(len(item) << 20)  # new bytes in the worker's range, sized by the item
+    tally = {"item": item, "len": len(item), "hits": [item * k for k in range(3)]}
+    tally
+    return payload, tally
+
+
+@app.cell
+def _(motabi, payload, tally):
+    tallies, payloads = motabi.gather(tally, payload)
+    print("items: ", [t["item"] for t in tallies])
+    print("hits:  ", [t["hits"][2] for t in tallies])
+    print("bytes: ", [len(p) >> 20 for p in payloads], "MB")
+    return
+
+
 if __name__ == "__main__":
     app.run()

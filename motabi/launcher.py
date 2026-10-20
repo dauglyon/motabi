@@ -47,8 +47,10 @@ class Launcher:
         print(line, file=sys.stderr, flush=True)
         print(time.strftime("%H:%M:%S"), line, file=self.log, flush=True)
 
-    def runsc(self, *args: str, sandbox_stdio: bool = False) -> tuple[int, float]:
-        cmd = ["unshare", "-Ur", "-m", "--propagation", "unchanged", RUNSC,
+    def runsc(self, *args: str, sandbox_stdio: bool = False, network: bool = True) -> tuple[int, float]:
+        # A worker is restored in an empty network namespace: its restored sockets are dead
+        # anyway, and its reconnect attempts must not reach the server.
+        cmd = ["unshare", "-Ur", "-m" if network else "-nm", "--propagation", "unchanged", RUNSC,
                "--network=host", "--ignore-cgroups", "--root", self.state,
                "--debug", "--debug-log", os.path.join(self.run, "runsc-logs") + "/", *args]
         t0 = time.monotonic()
@@ -140,21 +142,87 @@ class Launcher:
         self.say(f"leg {n} {tag}: {old} -> {new}: checkpoint {t_ckpt:.1f}s, {size / 1e6:.0f} MB, restore {t_rest:.1f}s")
         return reply
 
+    def answer(self, name: str, reply: dict[str, Any]) -> None:
+        final = os.path.join(self.share, name)
+        with open(final + ".tmp", "w") as f:
+            json.dump(reply, f)
+        os.rename(final + ".tmp", final)
+
+    def fork(self, n: int, workers: int) -> None:
+        """Checkpoint, restore W workers without network, let them claim roles, then the root."""
+        assert self.cid is not None
+        old = self.cid
+        img = os.path.join(self.run, f"img-scatter-{n}")
+        prefix = os.path.join(self.share, f"scatter-{n}")
+        rc, t_ckpt = self.runsc("checkpoint", "--image-path", img, old)
+        if rc:
+            self.say(f"scatter {n}: checkpoint failed (rc {rc})")
+        t0 = time.monotonic()
+        for i in range(workers):
+            rc, _ = self.runsc("restore", "--image-path", img, "-bundle", self.bundle, "-detach",
+                               f"sc{n}-w{i}", sandbox_stdio=True, network=False)
+            if rc:
+                self.say(f"scatter {n}: restore of worker {i} failed (rc {rc})")
+        self.answer(f"scatter-{n}.go", {})
+        while not all(os.path.exists(f"{prefix}.claim_{i}") for i in range(workers)):
+            time.sleep(0.1)
+        t_workers = time.monotonic() - t0
+        new = f"sc{n}-root"
+        rc, t_root = self.runsc("restore", "--image-path", img, "-bundle", self.bundle, "-detach", new,
+                                sandbox_stdio=True)
+        if rc:
+            self.say(f"scatter {n}: restore of root failed (rc {rc})")
+        self.runsc("delete", "-force", old)
+        self.cid = new
+        self.say(f"scatter {n}: checkpoint {t_ckpt:.1f}s, {workers} workers up and claimed in "
+                 f"{t_workers:.1f}s, root copy {new} restored in {t_root:.1f}s")
+        # Workers exit after exporting; a worker that dies first gets an error manifest.
+        pending = set(range(workers))
+        while pending:
+            for i in sorted(pending):
+                manifest = f"{prefix}.manifest_{i}"
+                if os.path.exists(manifest):
+                    pending.discard(i)
+                    continue
+                state = subprocess.run(
+                    ["unshare", "-Ur", RUNSC, "--ignore-cgroups", "--root", self.state, "state", f"sc{n}-w{i}"],
+                    capture_output=True, text=True)
+                if '"status": "stopped"' in state.stdout or state.returncode:
+                    import pickle
+                    with open(manifest + ".tmp", "wb") as f:
+                        pickle.dump({"error": f"worker {i} exited without exporting; see kernel.err"}, f)
+                    os.rename(manifest + ".tmp", manifest)
+                    pending.discard(i)
+            time.sleep(0.2)
+        for i in range(workers):
+            self.runsc("delete", "-force", f"sc{n}-w{i}")
+        self.say(f"scatter {n}: all {workers} manifests in after {time.monotonic() - t0:.1f}s; workers deleted")
+
     def serve(self) -> None:
-        n = 0
+        """Answer request files as the executor writes them."""
+        handled: set[str] = set()
         while True:
-            for ask, answer, tag in (("req", "go", "out"), ("done", "home", "home")):
-                path = os.path.join(self.share, f"leg-{n}.{ask}")
-                while not os.path.exists(path):
-                    time.sleep(0.2)
-                with open(path) as f:
-                    self.say(f"leg {n}: {ask} {f.read()}")
-                reply = self.move(n, tag)
-                final = os.path.join(self.share, f"leg-{n}.{answer}")
-                with open(final + ".tmp", "w") as f:
-                    json.dump(reply, f)
-                os.rename(final + ".tmp", final)
-            n += 1
+            try:
+                names = sorted(os.listdir(self.share))
+            except FileNotFoundError:
+                time.sleep(0.2)
+                continue
+            for name in names:
+                if name in handled or not name.endswith((".req", ".done")):
+                    continue
+                handled.add(name)
+                kind, rest = name.split("-", 1)
+                n = int(rest.split(".")[0])
+                with open(os.path.join(self.share, name)) as f:
+                    body = json.load(f)
+                self.say(f"{kind} {n}: {name.split('.')[1]} {body}")
+                if kind == "leg" and name.endswith(".req"):
+                    self.answer(f"leg-{n}.go", self.move(n, "out"))
+                elif kind == "leg":
+                    self.answer(f"leg-{n}.home", self.move(n, "home"))
+                elif kind == "scatter":
+                    self.fork(n, int(body["workers"]))
+            time.sleep(0.2)
 
     def stop(self, sig: int) -> None:
         if self.cid is None:

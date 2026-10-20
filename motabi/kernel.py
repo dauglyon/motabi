@@ -7,8 +7,9 @@ what makes a restored kernel not exit on finding the server's pid absent from th
 kernel arguments the launcher saved are fed on stdin, with virtual-file storage switched off:
 the kernel's /dev/shm is not the server's. Signals are forwarded to the kernel's process group.
 
-As the child (`--child`): marimo's own kernel entry point, with one change made before any
-socket exists. gVisor restores a connected host socket with no descriptor: reads fail with
+As the child (`--child`): marimo's own kernel entry point, with two changes made before
+anything else: the fold allocator (motabi.fold) is installed and its ranges reserved, so they
+are at the same addresses in every checkpoint; and the ZeroMQ sockets get a heartbeat. gVisor restores a connected host socket with no descriptor: reads fail with
 ECONNRESET, writes with EPIPE, and readiness reports hangup to wake pollers. ZeroMQ reconnects
 when it sees any of those, but a poller that misses the wake sits on the dead socket until the
 next send, which for a pull socket is never. A ZMTP heartbeat turns detection into a timer: the
@@ -29,6 +30,17 @@ HEARTBEAT_TIMEOUT_MS = 5000
 
 
 def _child() -> None:
+    from motabi import fold
+
+    fold.install()  # allocator wrappers and the reserved ranges exist before any object does
+    if os.environ.get("MOTABI_NPDIVERT") == "1":
+        try:
+            from motabi import npdivert
+
+            npdivert.divert()  # NumPy data buffers through Python's raw domain, so a worker's land in its range
+        except ImportError:
+            pass
+
     import zmq
 
     original_socket = zmq.Context.socket
