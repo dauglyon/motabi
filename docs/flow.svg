@@ -72,7 +72,8 @@
 
   <!-- Home: server stays; kernel leaves and returns -->
   <rect class="bar" x="160" y="114" width="816" height="34" rx="8"/>
-  <text x="176" y="136">marimo server · motabi orchestrator <tspan class="small muted">  stay home and hold the session while the kernel is away</tspan></text>
+  <text x="176" y="136">marimo server · motabi orchestrator</text>
+  <text class="small muted" x="962" y="136" text-anchor="end">stay home and hold the session while the kernel is away</text>
 
   <rect class="kernel" x="160" y="166" width="160" height="80" rx="8"/>
   <text class="b" x="174" y="190">kernel</text>
@@ -143,8 +144,9 @@
   <text class="small" x="278" y="321">restore in a job</text>
 
   <path class="move" d="M820,324 V236 Q820,206 846,206 H850" marker-end="url(#am)"/>
-  <circle class="badge" cx="652" cy="256" r="10"/><text class="badge-t" x="652" y="260">7</text>
-  <text class="small" x="668" y="261">checkpoint, return home</text>
+  <circle class="badge" cx="838" cy="262" r="10"/><text class="badge-t" x="838" y="266">7</text>
+  <text class="small" x="854" y="267">checkpoint,</text>
+  <text class="small" x="854" y="283">return home</text>
 
   <!-- time axis -->
   <path class="axis" d="M160,614 H966" marker-end="url(#ad)"/>
