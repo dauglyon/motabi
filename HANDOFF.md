@@ -120,18 +120,16 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
 
 ## Open issues, in the order worth addressing
 
-1. **NumPy array shape is wrong after a scatter merge.** A worker's new NumPy array has its
-   data buffer correctly in the worker's range (the merged image sizes scale with the array
-   length), but after the merge the array reports the wrong shape and sum. NumPy keeps a small
-   cache of freed shape/stride buffers and hands a worker one from before the fork, so the
-   array's metadata points outside the worker's range. The design names this and a per-type
-   check that would catch it (`DESIGN.md` 2.4, "The check"). `motabi/npdivert.c` was an attempt
-   to route NumPy's own buffers through the tracked allocator, but installing NumPy's buffer
-   handler leaves state that gVisor cannot reload (the sandbox fails to load with a panic in its
-   Unix-socket code), so it is **disabled by default**, gated behind `MOTABI_NPDIVERT=1`. Until
-   this is solved, the prototype's scatter demo uses only plain-Python values (strings, lists,
-   dicts, bytes), which merge correctly. Plain NumPy still works fine across a **leg**, because a
-   leg moves the whole kernel and never merges ranges.
+1. **The join carries only memory that came through Python's allocators.** Everything a
+   native extension allocates on its own path (libc `malloc`, Arrow's pools, PyTorch's
+   allocator, Rust and C++ runtimes) is in the worker's ordinary heap, discarded at the join.
+   NumPy's wrong shape after a merge is the mild case: measured today, the array object and
+   its data buffer land in the range (NumPy 2 allocates data through `PyMem_Raw*`) and only
+   the shape-and-strides buffer does not (NumPy's own cache over libc). Libraries that own
+   their memory would fail whole; none is measured yet. This decides whether scatter works
+   for real data, and it is weeks, not a day. Scatter is plain-Python values only until then.
+   The research state, candidates and harness: `docs/scatter-research.md`. `motabi/npdivert.c`
+   stays **disabled** (`MOTABI_NPDIVERT=1`): unnecessary on NumPy 2 and it breaks reload.
 
 2. **Ranges are not recycled.** Each scatter permanently consumes one address range per worker
    from a fixed pool (`RANGES` in `motabi/fold.py`, currently 48). A long session with many
@@ -181,8 +179,8 @@ In order:
 1. **A real site**: the slurm-ssh adapter against Lawrencium, with the pin computed from
    capabilities. The guest recipe in `prototype/site/` is the test bed until then.
 
-2. **NumPy metadata** (issue 1), once a scatter is wanted for array work. The tractable path is
-   the per-type check the design describes, not the allocator-handler route that breaks reload.
+2. **Scatter over real data** (issue 1): measure the libraries, then an allocator below Python
+   in the fork harness. `docs/scatter-research.md`.
 
 Not needed yet: GPU moves (need the hardware), the batch run, the approval prompt and site
 selection (plain logic, nothing to prove about feasibility).
@@ -206,7 +204,7 @@ selection (plain logic, nothing to prove about feasibility).
   it added, and replay that into the original kernel by address. No pickling. The table of
   pre-fork objects is an address-keyed map; the free hook marks an entry dead when its block is
   freed, and `wait_file` blocks for a file without releasing the interpreter lock.
-- `motabi/npdivert.c` — the disabled NumPy-buffer experiment (issue 1).
+- `motabi/npdivert.c` — the disabled NumPy-buffer experiment (issue 1); see `docs/scatter-research.md`.
 
 The communication between the executor (inside the sandbox) and the launcher (outside) is files
 in a shared directory bind-mounted into the sandbox: request files the executor writes, answer
