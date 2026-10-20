@@ -93,12 +93,35 @@ cover its footprint; otherwise it stays where it is and the user is told what to
 out. Nothing else brings it back mid-run, so cells without a requirement after a leg run at the
 site until one is marked.
 
+**The CPU-feature pin is fixed when the session starts.** gVisor writes the sentry's CPU
+feature set into every checkpoint and refuses to restore on a machine missing any feature in
+it; the set is chosen once, when the home sandbox boots, from an annotation on its OCI spec
+(`dev.gvisor.internal.cpufeatures`, a list of `/proc/cpuinfo` names), and the sandbox reports
+that set through CPUID, so libraries that pick code paths by CPUID (OpenBLAS, NumPy, PyTorch)
+pick ones every site can run. The session therefore pins to the intersection of the feature
+lists in `capabilities(user)` of home and of every site configured for the session, computed
+before the kernel starts. A site added mid-session whose features do not cover the pin is
+refused for that session; using it means restarting the kernel with a narrower pin. A pin
+narrower than home's own CPU costs home some speed, which is the price of being able to leave.
+
 ### 2.4 Fork and join
 
 Where several cells are mutually independent, their ancestors are complete, and they resolve to
 the same site, the snapshot is restored once per branch, each restore being a **worker**. A
 branch is a root cell plus the descendants that depend only on it and share its requirement.
-The root runs nothing while workers are out, as it would run nothing during any long cell.
+
+**The root is frozen while workers are out.** It runs nothing, as it would run nothing during
+any long cell, and its helper threads (marimo's control reader, the completion engine) do not
+run either: the kernel waits for the manifests holding the interpreter lock, and the same hold
+covers the gap between tabling the pre-fork objects and the checkpoint. The only event served
+in that state is an interrupt, delivered as a signal. The point is the join below: a worker's
+new objects point at pre-fork objects by address, and those addresses stay valid only if the
+root frees nothing in between. The alternative, a root that keeps working while workers are
+out and pins every pre-fork object a worker might reach, was not taken; nothing in the model
+needs the root to act during a scatter. Pre-fork objects the root freed before the checkpoint,
+in its own bookkeeping between the table and the save, are marked dead in the table by the
+allocator's free hook, so every copy agrees they are gone and no count is read from or written
+to their memory.
 
 Workers cannot be merged as sandboxes. The join brings each worker's **defines** into the root
 by address, and nothing else: not its mutations of pre-fork objects, not its housekeeping, not
@@ -137,7 +160,7 @@ its process state.
   which is the rule marimo applies to cell dependencies; a hash of the pre-fork objects the
   worker's cells read, before and after, warns when it happened.
 - **Memory.** Nothing is pinned. Pre-fork objects keep ordinary refcounts and die when the root
-  drops them. Only code-like objects (types, modules, functions, code) are made permanent at the
+  drops them, which it cannot do while workers are out (above). Only code-like objects (types, modules, functions, code) are made permanent at the
   snapshot. A large block freed inside an imported range returns its pages to the OS at once,
   and a range is unmapped when everything in it is dead.
 
