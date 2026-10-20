@@ -77,10 +77,15 @@ cells run, and the sandbox is checkpointed and pulled back. The interpreter neve
 boundary, so files, in-place mutations, process state and imports need no carriers; nothing is
 ever taken out of the process.
 
-**Home** is a Linux x86 host with user namespaces: the lab workstation, a login or workflow node,
-or a dedicated box. The session starts there and the marimo server runs there; the laptop runs
-only the browser, so its OS and ISA do not matter. Home is a site in the selection above, with
-its own capabilities. The session returns when the run that sent it out ends and home's
+**Home** is a Linux kernel with user namespaces, native or in a VM, on the same ISA as every
+site the session may visit: a lab workstation, a login or workflow node, a dedicated box, or a
+laptop running WSL2 or a Linux VM. The session starts there and the marimo server runs there. A
+checkpoint restores only on its own ISA, and full-system emulation is too slow for a working
+session, so a machine of another ISA than the sites runs only the browser; with the first targets
+(section 6) that means an arm64 laptop, and an arm64 session would also have no GPU legs, since
+gVisor's GPU checkpoint is not available on arm64. Home is a site in the selection above, with
+its own capabilities, and when it is a VM on a laptop the session is pinned to the VM's CPU
+features and every image crosses the laptop's uplink. The session returns when the run that sent it out ends and home's
 capabilities cover its footprint; otherwise it stays where it is and the user is told what to
 drop or write out. There is no separate return policy.
 

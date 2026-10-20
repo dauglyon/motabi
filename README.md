@@ -6,8 +6,9 @@ It is built for scientific notebooks whose cells need more cores, memory, or GPU
 machine the notebook is edited on, and whose state (large arrays, open files, objects mutated in
 place) would be expensive or impossible to serialize.
 
-The kernel runs inside a gVisor sandbox on a Linux host: a lab workstation or a node at a
-facility. The laptop runs only the browser. When a cell declares a resource requirement, motabi
+The kernel runs inside a gVisor sandbox on a Linux host of the same processor family as the
+sites it will visit: a lab workstation, a node at a facility, or a laptop with WSL2 or a Linux
+VM. A laptop of another family runs only the browser. When a cell declares a resource requirement, motabi
 selects a site whose capabilities satisfy it, checkpoints the sandbox together with the
 notebook's working directory, restores it inside a job at that site, runs the cell, and
 checkpoints it back. Cells that marimo's dependency graph identifies as independent run as
