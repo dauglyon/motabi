@@ -165,6 +165,138 @@ mechanism under it. Nothing of this is in `motabi/` yet; the shim is under
 `experiments/fold/rangemalloc/`, and the one package change is a launcher line passing
 `MOTABI_LD_PRELOAD` into the sandbox as `LD_PRELOAD`.
 
+## Follow-up, same day: the two corrections tested, and the conflict rate measured
+
+Scripts and flags: `experiments/scatter-libs/README.md` and `experiments/fold/rangemalloc/README.md`.
+
+### Drop without destroying: works for torch, works for Arrow, with one unexplained exit crash
+
+Each imported native define gets its type swapped for a same-layout heap subtype (`__slots__ = ()`;
+`type()` gives such a subtype the GC flag even when the base has none, which had to be undone, since
+the instances were allocated without a GC head) whose `tp_dealloc` untracks the object and returns.
+Instances of the shadow type made at home, which torch produces for every result unless
+`__torch_function__` is disabled on it, are destroyed normally. When the defines are dead, the root
+does a full collection (which also clears CPython's freelists, where range blocks can sit), scans
+every writable mapping for words pointing into the range, refuses if a tracked object outside the
+range references into it, untracks the worker's leftover objects (1154 for the Arrow table, 2 for
+the tensor) and `madvise`s both ranges away.
+
+| target, 5 runs each | jemalloc shim | mimalloc shim |
+|---|---|---|
+| Arrow table, system pool: read, drop, release, churn, exit | 5/5 clean, RSS 112 to 83 MB at release | 5/5 clean |
+| Arrow table plus its column as a second define | 5/5 clean | 2/5 clean; 3 SIGSEGV in `PyDict_SetItem` during interpreter finalisation, after read, both drops, release and churn had passed |
+| torch tensor | 5/5 clean | 5/5 clean |
+
+The 3 failures do not depend on the release (6 runs with the ranges kept mapped: 3 crashed the same
+way) and vary with address layout. The pointer scan before release finds, besides the GC generation
+list heads in `_PyRuntime` (benign: the re-tracked worker objects) and the stack, 5 words in a
+Python arena pointing into the Python range, which `tp_traverse` over `gc.get_objects()` did not
+reach: an untracked container or a borrowed pointer. Not isolated. Everything before finalisation
+is clean in 30 of 30 runs, so the drop rule itself holds; what is not proven is that no root-side
+structure keeps a pointer to an imported object the root never sees.
+
+Two hazards the experiment exposes rather than solves. Reclamation is by Python-level evidence
+only: a home object holding a C++ or Rust pointer into the range (a column taken from the imported
+table at home, a view of the tensor) is invisible to the scan, and releasing the range under it is
+a use-after-free the next time it is touched. And the worker's leftover objects (everything it
+allocated and did not export) are leaked until the range goes, since their references from the
+worker's discarded pages are gone and their refcounts are too high to collect.
+
+### `mmap` in the shim: places new mappings, and shows the reuse problem exactly
+
+With `mmap`, `mmap64`, `munmap`, `mremap` interposed (anonymous private requests while diverted go
+to the top of the range with `MAP_FIXED`, so the kernel's and gVisor's view stays ordinary):
+
+| target | placement of the data buffer | join |
+|---|---|---|
+| polars, fresh (nothing of that size freed at home) | **in the range** (its jemalloc asked for 23 new extents, 500 MB of address space) | FAIL: see below |
+| polars, after a same-sized frame was made and freed at home | outside, 5/5: its jemalloc reuses the pre-fork extent | FAIL |
+| pyarrow, default (mimalloc) pool, either way | outside, 7/7: mimalloc reserved its arena at home and serves from it | FAIL, values garbage |
+| pyarrow, system pool; torch; either way | in the range, 10/10: glibc returned the freed 8 MB to the kernel, so the new request is a fresh `mmap` | PASS |
+| numpy | dims and strides from its cache, 5/5 | as before |
+
+So `mmap` placement reaches exactly the allocations that are new mappings, and an allocator that
+reserved address space before the fork keeps serving from it after. That is the reuse problem of
+the previous section, now with numbers: for glibc it does not arise at this size (8 MB is above
+its `mmap` threshold), for Arrow's mimalloc it is total, for polars' jemalloc it depends on what was
+freed before.
+
+polars fails for a further reason that is not placement. Two of its 9,290 range objects have type
+slots pointing at pre-fork addresses that hold other data in the root (consecutive integers, a
+freed buffer), and the worker saw those addresses as tabled pre-fork objects: the worker allocated
+type objects in memory a pre-fork object had been freed from, through a path the free hook never
+saw. pyo3's type objects live in the glibc heap at home (checked: `type(df._df)` is in `[heap]`),
+and polars' Rust allocator is its own jemalloc. Three pre-fork strings also came back with a
+refcount delta of 2^32-4: the worker interned them, which immortalises in 3.12; the delta mechanism
+should replay that as "immortalise in the root" rather than add it.
+
+### Workers restored from one checkpoint dirty the same pre-fork pages
+
+Two methods, two environments, one answer.
+
+On the host (`conflict_host.py`): two workers forked from one parent, soft-dirty bits cleared in
+each right after the fork, both diverting into their own ranges, both building a numpy array, a
+tensor, an Arrow table and a polars frame; the dirtied pre-fork pages read from `/proc/self/pagemap`
+and attributed to their mapping.
+
+| configuration | pre-fork pages dirtied by each worker | by both | by only one |
+|---|---|---|---|
+| no shim | 18,855 / 18,853 | 18,498 | 712 (all `[anon]` and `[heap]`) |
+| mimalloc shim | 14,911 / 14,910 | 14,910 | 1 |
+| no shim, same-sized objects freed at home first | 16,615 / 16,618 | 16,614 | 5 |
+| mimalloc shim, same | 16,546 / 16,548 | 16,545 | 4 |
+
+By mapping, the shared pages are `[anon]` (Python's arenas and the libraries' allocator regions,
+12-15k pages), `[heap]` (2.8-2.9k), the Python binary's data (40-70), the stack, and a handful of
+pages in each extension's data segment.
+
+In gVisor (`run_gv_conflict.sh`, after `run_gv_offsets.sh` showed that pages keep their offset in
+`pages.img` across a restore: 1,505 of 1,507 pages identical, `pages_meta.img` identical): root
+checkpointed, two workers restored and checkpointed after building, page images diffed.
+
+| | root pages | changed by each worker | by both | by only one | identical bytes in both workers |
+|---|---|---|---|---|---|
+| fresh | 38,840 | 16,483 / 16,484 | 16,483 | 1 | |
+| same-sized objects freed first | 43,073 | 16,719 / 16,720 | 16,719 | 1 | 16,659 of 16,719; 60 differ, by 27 words on average |
+
+What this decides. **Importing pre-fork pages that only one worker dirtied is a null operation**:
+with identical code paths from identical state, the workers touch the same 60-75 MB of pre-fork
+pages. The design's rule that a worker's pre-fork pages are discarded is not a simplification; it is
+the only consistent choice, and the refcount deltas are the one additive write that can be replayed.
+The identical-bytes column suggests a "consensus import" of pages every worker changed the same way
+(lazily built caches, types created on first use): it would carry state the root lacks, but it would
+also carry allocator metadata that describes the worker's heap, not the root's, so it is recorded as
+an idea with a known hazard, not tried.
+
+### Alternatives met on the way
+
+- **Restore worker 0 as the new root.** For a fork with one branch (2.4 with a single worker) the
+  join is unnecessary: the worker's full image is a consistent process, with every native object
+  intact, and only its pre-fork writes differ from the root's, which no one else needs. Scatter with
+  N workers still needs N-1 joins by address into that root. Not tried; it follows from the leg.
+- **Patch the root's image rather than the root's memory.** The import by address could be done on
+  `pages.img` before the root is restored (append the worker's range pages, with the page-offset
+  stability shown above) instead of inside the root through `/proc/pid/mem`. Same semantics, no
+  change to what is carried; it moves the join into the launcher. Not tried.
+- **A gVisor flag to place new anonymous mappings** (approach B proper) is unnecessary for
+  libraries that call libc's `mmap`, and would not change the reuse result, since reuse happens
+  inside address space reserved before the fork.
+
+### Where this leaves the join
+
+- Carried today, by evidence: plain Python values; torch CPU tensors (placement by the shim, drop
+  by the shadow rule, from any thread, with the range reclaimable).
+- Carried with a condition: Arrow tables on the system pool (values right, drop safe, exit crash in
+  3 of 30 runs with two defines, cause not isolated); any type whose home-made views share native
+  memory with the import cannot have its range reclaimed by Python-level evidence alone.
+- Not carried, by construction: anything served from address space an allocator reserved before
+  the fork (Arrow's default pool, polars after warm-up), unless that allocator can be made to
+  abandon pre-fork space after the restore (Arrow: start with the system pool; mimalloc and
+  jemalloc inside a library: no runtime switch found); numpy until its dims cache is drained or
+  the two buffers are copied at export; polars until its type objects stop landing in pre-fork
+  free space.
+- Not an option: merging pre-fork pages by "only one worker touched it".
+
 A note on what was tried earlier: `motabi/npdivert.c` installed a NumPy data-memory handler that
 forwards to `PyMem_Raw*`. It is unnecessary on NumPy 2 (data already goes that way) and it broke
 gVisor reload (the sandbox failed to load with a panic in its Unix-socket code, not understood),
@@ -209,9 +341,13 @@ so it is gated off (`MOTABI_NPDIVERT=1`). Do not re-enable it.
 ## In one paragraph
 
 Fork and join work, by address, for plain-Python values, across real sandbox restores, with
-memory freed normally afterwards. A preloaded allocator shim now places every libc allocation
-in the range as well, from any thread, at no measurable cost, and a torch tensor comes back
-whole. What still stands between that and scatter over real data: libraries that allocate with
-`mmap` below libc (Arrow's default pool, polars), numpy's cache of pre-fork buffers, and,
-deepest, native objects that count references into pre-fork native objects, which can be read
-but not dropped. The per-type check is the gate; the shim is the placement mechanism under it.
+memory freed normally afterwards. A preloaded allocator shim places every libc allocation and
+every new anonymous mapping in the range as well, from any thread, at no measurable cost; a torch
+tensor comes back whole and can be dropped and its range reclaimed; an Arrow table on the system
+pool comes back whole and can be dropped once its destructor is never run. What still stands
+between that and scatter over real data: allocators that reserved address space before the fork
+and keep serving from it (Arrow's default pool, polars after any warm-up), numpy's cache of
+pre-fork buffers, polars' type objects landing in pre-fork free space, and reclamation of a range
+that home-made native views may still point into. Two workers restored from one checkpoint dirty
+the same pre-fork pages, so discarding them is the only consistent rule. The per-type check is
+the gate; the shim is the placement mechanism under it.

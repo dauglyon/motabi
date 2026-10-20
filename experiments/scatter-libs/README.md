@@ -22,7 +22,7 @@ Scripts, each printing one line per check prefixed with the library name:
 - `placement.py <lib>`: under `foldalloc.install(); reserve; use_range(0)`, where each address the
   library exposes lands (the range, `[heap]`, an anonymous mapping, a file) plus the RSS change
   per mapping kind, which places bytes no address is exposed for.
-- `join.py <lib> [--thread] [--keep] [--hard-exit]`: the real criterion. The root imports the
+- `join.py <lib> [--thread] [--keep] [--hard-exit] [--shadow] [--two] [--sequence] [--no-release]`: the real criterion. The root imports the
   library and warms it with a *different* shape, forks; the worker diverts, builds the object,
   exports; the root imports the range by address, reads the object, drops it, churns, exits.
   PASS needs correct values and no crash through the drop and the exit. `--thread` builds the
@@ -30,6 +30,18 @@ Scripts, each printing one line per check prefixed with the library name:
   skips interpreter finalisation. The last two localise a crash.
   If a `rangemalloc` shim is preloaded, the second reserved range is handed to it and its resident
   pages are brought over with the Python range (step 2).
+  Follow-up flags: `--shadow` swaps each imported native define's type for a same-layout subtype
+  whose dealloc never runs the library's destructor, and releases both ranges (after a pointer
+  scan of every writable mapping and an untrack of the worker's objects) once the defines are
+  dead; `--two` adds a second define over the same native graph (a column of the table);
+  `--sequence` makes and frees a same-sized object at home before the fork so free lists hold its
+  blocks; `--no-release` keeps the ranges mapped; `--c-backtrace` prints a C backtrace on a crash.
+- `conflict_host.py [--sequence] libs...`: two workers forked from one parent, soft-dirty bits
+  cleared after the fork, the set of pre-fork pages each dirtied read from `/proc/self/pagemap`
+  and attributed to its mapping; reports the pages both dirtied.
+- `foldalloc_x.c`: the experiment copy of `motabi/foldalloc.c` (shadow types, range release with
+  pointer scan, stale-id guard on re-track, C backtrace). Built here as the `foldalloc` module;
+  `motabi/foldalloc.c` is untouched.
 - `run_step1.py [--shim librangemalloc-*.so] [targets]`: runs the three scripts per target as
   subprocesses (a crash is a FAIL row, never a missing one) and prints the summary table.
   Without a shim, `join.py` runs under glibc's `libc_malloc_debug` with `MALLOC_CHECK_=3`.

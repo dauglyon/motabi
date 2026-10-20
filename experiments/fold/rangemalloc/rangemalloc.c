@@ -10,7 +10,12 @@
    - a pointer inside a registered range that is not the current one (the root after a join, or a
      worker touching an earlier scatter's range) is never handed to the backing, whose metadata for
      it lives in another process copy: it is counted, and large blocks are madvise'd away;
-   - realloc of a home block while diverted copies it into the range and frees the old one at home.
+   - realloc of a home block while diverted copies it into the range and frees the old one at home;
+   - mmap (step 2 of the follow-up): while diverted, an anonymous private mapping that names no
+     address is placed in the range at a bump pointer with MAP_FIXED_NOREPLACE through the real
+     mmap, so the kernel's (and gVisor's) view of the mapping is ordinary; munmap of range pages
+     outside the current range is turned into madvise so the reservation survives; mremap of a
+     range mapping is refused (allocators fall back to allocate-copy-free).
 
    Every diverted block carries a 16-byte header (size, offset to the backing's block start) so
    free, realloc and malloc_usable_size work on it in a copy that has no backing metadata.
@@ -31,6 +36,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <sys/mman.h>
+#include <stdarg.h>
 
 #if defined(BACKING_JEMALLOC)
 #  include <jemalloc/jemalloc.h>
@@ -53,10 +59,12 @@ typedef struct {
   unsigned arena; bool ready;  /* jemalloc arena index / mimalloc heap made */
   void *heap; void *arena_id;  /* mimalloc */
   atomic_size_t foreign_freed_bytes, foreign_freed_blocks;
+  size_t mbump;                /* bytes of the range's top half handed out to mmap, from the top down */
 } Range;
 static Range R[MAXR]; static int NR = 0; static atomic_int cur = -1;
 static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
 static atomic_size_t n_home, n_divert, n_divert_bytes, n_realloc_home_to_range, n_free_range_current;
+static atomic_size_t n_mmap_divert, n_mmap_divert_bytes, n_mmap_pass, n_munmap_range_foreign, n_mremap_refused;
 
 static inline int in_range(const void *p){ const char *c = p; for (int i = 0; i < NR; i++) if (c >= R[i].base && c < R[i].base + R[i].size) return i; return -1; }
 
@@ -223,6 +231,49 @@ void *memalign(size_t align, size_t n){ return do_malloc(n, align); }
 void *valloc(size_t n){ return do_malloc(n, 4096); }
 void *pvalloc(size_t n){ return do_malloc((n + 4095) & ~(size_t)4095, 4096); }
 
+
+/* ---------------- mmap family ----------------
+   The backing allocators take the bottom of the range upward; diverted mmaps take the top of the
+   range downward, so the two never meet until the range is full. */
+static void *(*h_mmap)(void *, size_t, int, int, int, off_t); static int (*h_munmap)(void *, size_t); static void *(*h_mremap)(void *, size_t, size_t, int, ...);
+static void init_mm(void){ if (h_mmap) return; h_mmap = dlsym(RTLD_NEXT, "mmap"); h_munmap = dlsym(RTLD_NEXT, "munmap"); h_mremap = dlsym(RTLD_NEXT, "mremap"); }
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off){
+  init_mm();
+  int c = atomic_load(&cur);
+  if (c < 0 || addr || fd >= 0 || !(flags & MAP_ANONYMOUS) || !(flags & MAP_PRIVATE) || (flags & MAP_FIXED)) { atomic_fetch_add(&n_mmap_pass, 1); return h_mmap(addr, len, prot, flags, fd, off); }
+  Range *r = &R[c]; size_t align = len >= (2u << 20) ? (2u << 20) : 4096;      /* big requests get THP-friendly alignment */
+  pthread_mutex_lock(&lk);
+  uintptr_t top = (uintptr_t)r->base + r->size - r->mbump;
+  uintptr_t p = (top - len) & ~(uintptr_t)(align - 1);
+  if (p < (uintptr_t)r->base + r->bump + (r->size / 2)) { pthread_mutex_unlock(&lk); errno = ENOMEM; return MAP_FAILED; }   /* keep the bottom half for the backing */
+  r->mbump = (uintptr_t)r->base + r->size - p;
+  pthread_mutex_unlock(&lk);
+  /* the range is already mapped PROT_NONE|RW; remap this piece so its flags and the kernel's accounting are what the caller asked for */
+  void *got = h_mmap((void *)p, len, prot, (flags & ~MAP_FIXED_NOREPLACE) | MAP_FIXED, -1, 0);
+  if (got == MAP_FAILED) return got;
+  atomic_fetch_add(&n_mmap_divert, 1); atomic_fetch_add(&n_mmap_divert_bytes, len); return got;
+}
+void *mmap64(void *addr, size_t len, int prot, int flags, int fd, off_t off){ return mmap(addr, len, prot, flags, fd, off); }
+int munmap(void *addr, size_t len){
+  init_mm();
+  int ri = in_range(addr);
+  if (ri >= 0 && ri != atomic_load(&cur)) { atomic_fetch_add(&n_munmap_range_foreign, 1); return madvise(addr, len, MADV_DONTNEED); }
+  if (ri >= 0) {  /* the worker's own range: the pages come back but the address stays reserved */
+    void *p = h_mmap(addr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0); return p == MAP_FAILED ? -1 : 0;
+  }
+  return h_munmap(addr, len);
+}
+void *mremap(void *old, size_t old_len, size_t new_len, int flags, ...){
+  init_mm();
+  void *new_addr = NULL;
+  if (flags & 2 /* MREMAP_FIXED */) { va_list ap; va_start(ap, flags); new_addr = va_arg(ap, void *); va_end(ap); }
+  if (in_range(old) >= 0) { atomic_fetch_add(&n_mremap_refused, 1); errno = ENOMEM; return MAP_FAILED; }
+  return new_addr ? h_mremap(old, old_len, new_len, flags, new_addr) : h_mremap(old, old_len, new_len, flags);
+}
+
 /* ---------------- control ---------------- */
 int rangemalloc_register(void *base, size_t size){
   pthread_mutex_lock(&lk);
@@ -237,13 +288,15 @@ int rangemalloc_use(int i){
   atomic_store(&cur, i); return 0;
 }
 void rangemalloc_off(void){ atomic_store(&cur, -1); }
-static char statbuf[512];
+static char statbuf[768];
 const char *rangemalloc_stats(void){
   size_t fb = 0, fk = 0; for (int i = 0; i < NR; i++) { fb += atomic_load(&R[i].foreign_freed_blocks); fk += atomic_load(&R[i].foreign_freed_bytes); }
   snprintf(statbuf, sizeof statbuf, "backing=%s home=%s ranges=%d cur=%d home_calls=%zu diverted=%zu diverted_bytes=%zu "
-           "freed_in_current=%zu realloc_home_to_range=%zu foreign_freed_blocks=%zu foreign_freed_bytes=%zu",
+           "freed_in_current=%zu realloc_home_to_range=%zu foreign_freed_blocks=%zu foreign_freed_bytes=%zu "
+           "mmap_diverted=%zu mmap_diverted_bytes=%zu mmap_passed=%zu munmap_foreign=%zu mremap_refused=%zu",
            BACKING_NAME, HOME_NAME, NR, atomic_load(&cur), atomic_load(&n_home), atomic_load(&n_divert), atomic_load(&n_divert_bytes),
-           atomic_load(&n_free_range_current), atomic_load(&n_realloc_home_to_range), fb, fk);
+           atomic_load(&n_free_range_current), atomic_load(&n_realloc_home_to_range), fb, fk,
+           atomic_load(&n_mmap_divert), atomic_load(&n_mmap_divert_bytes), atomic_load(&n_mmap_pass), atomic_load(&n_munmap_range_foreign), atomic_load(&n_mremap_refused));
   return statbuf;
 }
 __attribute__((constructor)) static void ctor(void){ init_home(); }

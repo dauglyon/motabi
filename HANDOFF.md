@@ -138,9 +138,14 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
    root corrupts the heap, because its `shared_ptr`s into pre-fork C++ objects were counted in
    the worker's discarded pages (the native form of the refcount problem `foldalloc` solves for
    Python objects); numpy's dims come from its own cache of pre-fork buffers, which no allocator
-   sees; Arrow's default pool and polars allocate through libc `mmap`. The follow-up tests the
-   two fixes these imply (never run destructors of imported native objects, reclaim by range;
-   intercept `mmap` in the shim) and measures how often workers reuse the same pre-fork block. The shim lives in
+   sees; Arrow's default pool and polars allocate through libc `mmap`. The follow-up, same day,
+   tested both fixes: never running the destructor makes the Arrow drop safe (30 of 30 through
+   drop and reclaim; 3 unexplained crashes at interpreter exit with two defines under mimalloc),
+   and `mmap` interposition places new mappings but not allocations served from address space
+   reserved before the fork (Arrow's default pool always, polars after a warm-up). Two workers
+   restored from one checkpoint dirty the same pre-fork pages (16,483 of 16,484, in gVisor and on
+   the host alike), so discarding pre-fork pages is the only consistent rule. Per-type knowledge
+   stays the gate; the shim is placement under it. All of it in `docs/scatter-research.md`. The shim lives in
    `experiments/fold/rangemalloc/`; the launcher passes `MOTABI_LD_PRELOAD` into the sandbox.
    `motabi/npdivert.c` stays **disabled** (`MOTABI_NPDIVERT=1`): unnecessary on NumPy 2 and it
    breaks reload.

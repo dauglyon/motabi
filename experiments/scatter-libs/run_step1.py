@@ -3,9 +3,15 @@ usage: run_step1.py [--shim path/to/librangemalloc.so] [libs...]
 A crashing check is reported as FAIL with the signal, never as a missing row."""
 import subprocess, sys, os, signal, re, resource
 here = os.path.dirname(os.path.abspath(__file__)); py = os.path.join(here, ".venv/bin/python")
-args = sys.argv[1:]; shim = None
+args = sys.argv[1:]; shim = None; repeat = 1; flags = []
 if "--shim" in args:
     i = args.index("--shim"); shim = os.path.abspath(args[i + 1]); del args[i:i + 2]
+if "--repeat" in args:
+    i = args.index("--repeat"); repeat = int(args[i + 1]); del args[i:i + 2]
+for f in ("--shadow", "--two"):          # passed through to join.py
+    if f in args: flags.append(f); args.remove(f)
+only_join = "--join-only" in args
+if only_join: args.remove("--join-only")
 targets = args or ["numpy", "torch", "pyarrow", "pyarrow-system", "polars"]
 
 def run(script, lib, env_extra=None, extra=()):
@@ -27,10 +33,11 @@ rows = []
 for t in targets:
     lib, env = (t.split("-")[0], {"ARROW_DEFAULT_MEMORY_POOL": t.split("-")[1]}) if "-" in t else (t, None)
     print(f"=== {t}", flush=True)
-    a = run("allocator.py", lib, env); print(a, flush=True)
-    pl = run("placement.py", lib, env); print(pl, flush=True)
-    j = run("join.py", lib, env); print(j, flush=True)
-    jt = run("join.py", lib, env, ("--thread",)) if shim else ""
+    a = "" if only_join else run("allocator.py", lib, env); print(a, flush=True)
+    pl = "" if only_join else run("placement.py", lib, env); print(pl, flush=True)
+    js = [run("join.py", lib, env, tuple(flags)) for _ in range(repeat)]
+    for j in js: print(j, flush=True)
+    jt = run("join.py", lib, env, ("--thread", *flags)) if shim and not only_join else ""
     if jt: print(jt, flush=True)
     def grab(txt, key):
         m = re.search(rf"^{lib} {key}: (.*)$", txt, re.M); return m.group(1) if m else "-"
@@ -40,7 +47,9 @@ for t in targets:
         fails = [a + b for a, b in ms if a == "FAIL"]
         return (ms[0][0] + ms[0][1] + ("; then " + fails[0] if fails else "")) if ms[0][0] == "PASS" else fails[0]
     where = "; ".join(f"{k}={v.split(' @')[0]}" for k, v in re.findall(rf"^{lib} (\w[\w()]*): (\S+ @\S+)$", pl, re.M))
-    rows.append((t, where, grab(pl, "rss-delta\\(kB\\)"), verdict(j), verdict(jt) if jt else None))
+    vs = [verdict(j) for j in js]
+    summary = vs[0] if repeat == 1 else f"{sum(v.startswith('PASS') and 'FAIL' not in v for v in vs)}/{repeat} PASS; " + "; ".join(sorted(set(v for v in vs if not (v.startswith('PASS') and 'FAIL' not in v))))
+    rows.append((t, where, grab(pl, "rss-delta\\(kB\\)"), summary, verdict(jt) if jt else None))
 print("\n| target | exposed buffers | RSS delta (kB) | join |" + (" join, new thread |" if shim else ""))
 print("|---|---|---|---|" + ("---|" if shim else ""))
 for r in rows:

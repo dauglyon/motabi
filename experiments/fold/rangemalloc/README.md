@@ -20,6 +20,13 @@ Runs:
   The launcher passes `MOTABI_LD_PRELOAD` into the sandbox as `LD_PRELOAD`.
   `../../scatter-libs/bench_home.py` is the allocator-only part of the same question.
 
+Follow-up (2026-10-20, later): the shim also interposes `mmap`, `mmap64`, `munmap`, `mremap`
+(see the header comment). Three more drivers: `run_gv_offsets.sh` (do pages keep their file
+offset in `pages.img` across a restore?), `run_gv_conflict.sh <shim> [SEQUENCE=1]` (two workers
+restored from one checkpoint, each checkpointed after building, page images diffed against the
+root's), and `../../scatter-libs/conflict_host.py` for the same question on the host with
+soft-dirty bits and per-mapping attribution.
+
 The control surface the drivers call through `ctypes`: `rangemalloc_register(base, size)` (every
 process copy must know every range), `rangemalloc_use(idx)` (makes the range writable and current;
 `-2` means the backing could not open it), `rangemalloc_off()`, `rangemalloc_stats()`.

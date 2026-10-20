@@ -118,3 +118,22 @@ def prepare(lib):
 def version(lib):
     import importlib
     return importlib.import_module(lib).__version__
+
+
+def second(lib, obj):
+    """A second Python object over the same native graph as `obj`, made in the worker."""
+    if lib == "pyarrow": return obj.column("x")
+    if lib == "polars": return obj.get_column("x")
+    if lib == "torch": return obj[0]
+    if lib == "numpy": return obj[0]
+    raise KeyError(lib)
+
+
+def check_second(lib, o):
+    if lib == "pyarrow":
+        import pyarrow.compute as pc
+        s = pc.sum(o).as_py(); return s == SUM, f"column sum={'ok' if s == SUM else s}"
+    if lib == "polars":
+        s = int(o.sum()); return s == SUM, f"column sum={'ok' if s == SUM else s}"
+    first = N // 1000 * 0 + sum(range(1000))
+    s = int(o.sum()); return s == first, f"row0 sum={'ok' if s == first else s}"
