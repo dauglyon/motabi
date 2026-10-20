@@ -1,7 +1,9 @@
 # motabi — design
 
-Status: draft 1, 2026-10-19. Supersedes Part 1 of the KFolio October refresh outline.
-Marimo references are to commit a27e12b (2026-10-19).
+Status: draft 2, 2026-10-20. Supersedes Part 1 of the KFolio October refresh outline.
+Marimo references are to commit a27e12b (2026-10-19). The mechanisms in 2.3 and 2.4 were
+exercised on a workstation on 2026-10-20; the scripts and what they showed are in
+`experiments/fold/`.
 
 ## 1. What it is
 
@@ -17,7 +19,9 @@ It is not:
 - a notebook, editor, or file format. Marimo is all three.
 - a tool-call or task system. Tools are installed in the environment image and run as
   subprocesses wherever the kernel currently is.
-- a remote-kernel transport. The editor's server travels with the kernel.
+- a remote-kernel service. The kernel is marimo's own subprocess; the editor's server stays at
+  home (2.3) and the browser on the laptop, and the kernel's connection to the server is
+  re-established after each move.
 
 ## 2. The model
 
@@ -41,16 +45,19 @@ a queue or cost estimate if the site has one.
 **Selection** is manual (the user names the site for a requirement) or automatic (the policy
 below chooses). Independently of mode, a run that reaches cells whose selection has not been
 approved stops at the first of them and shows, for each, the site, resources, walltime, and
-queue estimate; nothing is submitted until the user approves. Approval is recorded on the cell,
-so a later run with the same requirement and selection does not ask again. In the editor the prompt
-is the header cell's output (section 4); for `marimo pair` and batch runners it can later travel
-as a host-protocol *decision* (`protocols/host/spec.md`, "Requests and decisions").
+queue estimate; nothing is submitted until the user approves. The prompt is a blocking
+`input()` inside the requiring cell, which marimo serves in edit mode and renders in the cell's
+console (section 4). The answer is recorded in a sidecar file keyed by cell and requirement, so a
+later run with the same requirement and selection does not ask again, and batch runs read the
+sidecar and never prompt.
 
 The policy takes the sites whose capabilities satisfy the requirement and prefers, in order:
 where the kernel already is; least data movement (sum over declared datasets of size times the
 store's reachability penalty); shortest queue or lowest cost. One hard constraint sits above the
-order: a thawed sandbox needs a CPU feature set covering everything it has used, so a session's
-eligible sites can only narrow as it runs.
+order: the session's **footprint**. A thawed sandbox needs a CPU feature set covering everything
+it has used, memory for everything it holds, and a GPU if it holds a live CUDA context, so a
+session's eligible sites can only narrow as it runs. The feature set is pinned when the session
+starts, to the intersection of its configured sites.
 
 Datasets are named by URI, never by path. A resolver maps a URI to a path inside the sandbox at
 the start of each leg (a bind mount where the store is mounted, a read-through cache otherwise),
@@ -64,33 +71,72 @@ is the same. Selection runs when the first of them comes up; later cells are che
 chosen site rather than re-selected, so a run does not bounce between sites for marginal
 differences.
 
-Moving means moving the kernel. The sandbox holding the Marimo server, app host and kernel is
-checkpointed, the image and the workspace's changed files go to the platform object store, a job
-at the site fetches and restores them, the cells run, and the sandbox is checkpointed back. The
-interpreter never observes a boundary, so files, in-place mutations, process state and imports
-need no carriers; nothing is ever taken out of the process.
+Moving means moving the kernel. The sandbox holding the kernel process is checkpointed, a job at
+the site pulls the image and the workspace's changed files from home and restores them, the
+cells run, and the sandbox is checkpointed and pulled back. The interpreter never observes a
+boundary, so files, in-place mutations, process state and imports need no carriers; nothing is
+ever taken out of the process.
+
+**Home** is a Linux x86 host with user namespaces: the lab workstation, a login or workflow node,
+or a dedicated box. The session starts there and the marimo server runs there; the laptop runs
+only the browser, so its OS and ISA do not matter. Home is a site in the selection above, with
+its own capabilities. The session returns when the run that sent it out ends and home's
+capabilities cover its footprint; otherwise it stays where it is and the user is told what to
+drop or write out. There is no separate return policy.
 
 ### 2.4 Fork and join
 
 Where several cells are mutually independent, their ancestors are complete, and they resolve to
-the same site, the snapshot is restored once per branch, each restore being a **worker**. A branch is a root
-cell plus the descendants that depend only on it and share its requirement.
+the same site, the snapshot is restored once per branch, each restore being a **worker**. A
+branch is a root cell plus the descendants that depend only on it and share its requirement.
+The root runs nothing while workers are out, as it would run nothing during any long cell.
 
-Branches cannot be merged as sandboxes. Join is at the object level, over the shared root:
+Workers cannot be merged as sandboxes. The join brings each worker's **defines** into the root
+by address, and nothing else: not its mutations of pre-fork objects, not its housekeeping, not
+its process state.
 
-- A restored sandbox preserves addresses, so a branch can tell which objects existed at fork
-  time: the same `id()` is the same object in the root.
-- At join, a branch walks the objects reachable from its boundary definitions (the names cells
-  outside the branch read) and emits a delta: new objects in full, pre-fork objects by identity,
-  pre-fork objects it mutated as patches.
-- The root applies each delta: new objects are created, identity references bind to the root's
-  own instances, patches apply. Files a branch changed are an overlay on the root's workspace.
-- Two branches patching the same object or writing the same path is an error naming the object or
-  path and the two cells. Marimo already treats two cells defining one name as an error; this is
-  the runtime form of that rule.
+- **Placement.** At session start the kernel reserves a pool of address ranges, far above the
+  heap and untouched. A thawed worker is told its range and from then on every allocation
+  through Python's three allocator domains lands there. CPython's per-type freelists are drained
+  once right after the switch, so no freed pre-fork block is handed to the worker. Its new
+  objects therefore occupy one contiguous range no other worker and not the root will use, and
+  every pointer from them to a pre-fork object is a root address, because restore preserves
+  addresses.
+- **Export.** When its cells finish, the worker writes the range to a file in the workspace with
+  a manifest: the address of each define; the GC-tracked objects in the range, which it
+  untracks; modules it loaded; weak references it created; strings it interned; and, for each
+  pre-fork object its defines reach, the number of references to it from the range, found by
+  walking the defines, not the heap.
+- **The check.** Before export, each define is walked: every pointer must land in the range or on
+  a pre-fork object. Pure Python objects are walked through their own traversal; extension types
+  need a per-type walker that knows where the type keeps pointers. NumPy arrays are the first,
+  because NumPy's cache of freed shape buffers hands a worker pre-fork memory, which the walker
+  catches. A define that fails the check, or whose type has no walker, is pickled instead, as
+  that one object, and the manifest says so. A define holding an OS resource (file descriptor,
+  socket, thread) is refused naming the cell and the object. A C extension first loaded inside
+  a worker has no code in the root, so a define of such a type is refused with "import it at
+  home first".
+- **Import.** The root maps the range file at its reserved address and replays the manifest:
+  refcounts of the referenced pre-fork objects go up by the counted amount; GC objects are
+  re-tracked; modules are registered in `sys.modules` and on their parent packages; weak
+  references are relinked to their referents; imported strings lose their interned mark; defines
+  are bound into globals, and the reference the worker's own globals held, which lived in a
+  discarded page, is dropped. Files a worker changed are an overlay on the root's workspace.
+- **Conflicts.** Two workers defining one name, or writing the same path, is an error naming
+  both cells. Marimo already treats two cells defining one name as an error; this is the
+  runtime form of that rule. A worker's in-place change to a pre-fork object is not carried,
+  which is the rule marimo applies to cell dependencies; a hash of the pre-fork objects the
+  worker's cells read, before and after, warns when it happened.
+- **Memory.** Nothing is pinned. Pre-fork objects keep ordinary refcounts and die when the root
+  drops them. Only code-like objects (types, modules, functions, code) are made permanent at the
+  snapshot. A large block freed inside an imported range returns its pages to the OS at once,
+  and a range is unmapped when everything in it is dead.
 
-This is the delta scheme of ElasticNotebook and Kishu, with the restore's address preservation
-replacing their identity bookkeeping.
+The worker's pre-fork pages are never diffed; they are discarded. That is what makes the
+interpreter's own writes into pre-fork memory (inline caches in code objects, type method
+caches, RNG state, `lru_cache` dicts, interned-string and `sys.modules` tables) cost nothing:
+the root keeps its own copies, and the three such writes that carry meaning are the replays
+above.
 
 ### 2.5 Scatter and gather
 
@@ -115,8 +161,10 @@ stats = summarize(aligned)
 alignments, all_stats = motabi.gather(aligned, stats)
 ```
 
-The scattered cells are defined by the graph, not by position: every cell that depends on
-`item`, up to the cells `gather` names. Nothing else in the notebook is touched.
+The scattered cells are defined by the graph, not by position: the cells on a path from the
+header to a cell defining a name `gather` names. A cell outside that region that reads a
+scattered name is an error naming the gathered name to read instead. Nothing else in the
+notebook is touched.
 
 **Mechanism.** At the header the executor takes a snapshot and forks one worker per block of
 items. In each worker `item` is bound and the scattered cells run. In the root, as the scheduler
@@ -131,9 +179,9 @@ worker; one or the other. With neither, motabi sizes blocks from the site's capa
 item count. Inside the scattered cells `item` is one element regardless of blocking; the block
 is a scheduling unit the user's code never sees.
 
-**Reduce at the site.** `gather(x, reduce=g)` with an associative `g` runs the reduction as a
-tree inside the workers before the join, so one value comes home instead of N. A non-associative
-reduce is ordinary code in the root after the join.
+**Reduce.** Workers do not talk to each other, so a reduction is ordinary code in the root after
+the join. Per-item results that are large belong in files (next paragraph), not in gathered
+values.
 
 **Large results.** A gathered value over a size threshold is written to the leg's declared output
 store and returned as a reference, with a warning naming the size. Per-worker files go under a
@@ -144,16 +192,19 @@ collide and the join places them under the root workspace by index.
 `gather(..., on_error="skip")` returns the partial list plus an error list. Preemption of a
 worker is not a failure; the worker is resubmitted from its last checkpoint.
 
-**Mutation.** A worker that mutates a root object is the join conflict of 2.4, and with scatter
-it is the common mistake (appending to a global list). The error says so and tells the user to
-define the value instead.
+**Mutation.** A worker that mutates a root object loses the change at the join (2.4), and with
+scatter it is the common mistake (appending to a global list). The warning says so and tells the
+user to define the value instead.
 
-**Nesting.** A scatter inside scattered cells forks from the worker's own snapshot. Depth is
-bounded only by what sites accept.
+**Nesting.** A scatter inside scattered cells forks from the worker's own snapshot and draws
+ranges from the same pool. Depth is bounded by the pool and by what sites accept. Each worker is
+a full copy of the session, so scatter width is bounded by site memory divided by footprint;
+scatter from a lean session.
 
 **Editor.** Each scattered cell keeps its own output, with a selector to view any worker's
 result. A sub-notebook is scattered the same way: a scattered cell calls `app.run(**item)`, which
-is kfolio's sub-analysis fan-out without a file type.
+is kfolio's sub-analysis fan-out without a file type and the shape marimo-team/expd gives a
+trial function.
 
 ### 2.6 Batch
 
@@ -168,8 +219,11 @@ memory. gVisor on its systrap platform does this: the sandbox's kernel (the Sent
 process, so all guest state (processes, threads, file descriptors, mounts, tmpfs, its own
 network stack) is one checkpoint image; restore is N restores of that image; `runsc checkpoint
 --cuda-checkpoint-path` drives cuda-checkpoint across every CUDA process before pausing and
-toggles them back on restore; `runsc --rootless` needs only user namespaces, which Perlmutter's
-compute nodes already provide for podman-hpc.
+toggles them back on restore; running unprivileged needs only user namespaces. `runsc
+--rootless` itself refuses `restore` and `create` (a command whitelist in `runsc/cmd`, from the
+commit that added rootless `runsc do`), so the payload does what the flag does by hand: it runs
+`runsc` inside `unshare -Ur -m` with `--ignore-cgroups`. Checkpoint and double restore of a
+Python process worked that way on a workstation with release-20261012.0.
 
 | | microVM snapshot (Firecracker, Cloud Hypervisor) | CRIU on the process tree | gVisor sandbox checkpoint |
 |---|---|---|---|
@@ -186,18 +240,32 @@ compute nodes already provide for podman-hpc.
 The VM wins on fidelity and branch deltas; it loses on the two things an HPC leg is for, shape
 and GPU, and cannot run where KVM is absent. CRIU is shape-free but a second mechanism with
 per-resource failure modes. gVisor keeps the VM's "one unit, one image" property without KVM.
-Where hardware isolation is required on the platform side, the sandbox runs inside a VM that
-never migrates (Modal's arrangement): the sandbox image moves, the VM does not.
 
-Known costs: host-mode sockets do not survive restore (reconnect required; the host protocol's
-`Last-Event-ID` resume covers the editor); no InfiniBand, Slingshot or RDMA inside the sandbox,
-so no multi-node MPI launched from within; syscall- and small-I/O-heavy code is slower on
-systrap, compute-bound code is not; base/delta page sharing between clones needs KVM, which the
-object-level join does not depend on; GPU restore ties to the host driver version.
+Known costs: `runsc --rootless` uses host networking (sandbox networking needs root), and
+host-mode sockets do not survive restore, so the kernel's ZeroMQ connection to the server is
+re-established by ZeroMQ's own reconnect once the tunnel (section 5, call 9) is up, and
+connections the user's code holds open are lost at every boundary; no InfiniBand, Slingshot or
+RDMA inside the sandbox, so no multi-node MPI launched from within; syscall- and small-I/O-heavy
+code is slower on systrap, compute-bound code is not; base/delta page sharing between clones
+needs KVM, which the join does not depend on; restore requires the sandbox's host file
+descriptors (its stdio) to be of the same kind as at checkpoint, so the payload gives the
+sandbox fixed stdio from birth; GPU restore ties to the host driver version.
 
 ## 4. Inside Marimo
 
-Two pieces live in Marimo; both use what Marimo ships.
+Three pieces live in Marimo; all use what Marimo ships.
+
+- **Kernel placement.** In edit mode the kernel is already a separate process, and for venv and
+  `--sandbox` kernels marimo launches it as a plain subprocess that connects outward to the
+  server over ZeroMQ (`marimo/_session/managers/ipc.py`, address in
+  `marimo/_ipc/connection.py:28`). The sandbox holds that subprocess and nothing else; the
+  server and motabi's orchestrator are ordinary processes at home, the browser is on the laptop.
+  motabi supplies the launcher that starts the kernel subprocess inside the sandbox (how the
+  launcher is substituted, the venv Python setting or a wrapper, is to be checked). Two
+  kernel-side details follow: the ZeroMQ address is loopback at home, so the payload rewrites it
+  or the adapter's tunnel presents it on the compute node; and the kernel's parent-PID poller
+  (`start_parent_poller`) must be disabled or pointed at the payload, or the restored kernel
+  exits on finding no parent.
 
 - **Executor plug-in.** The entry-point group `marimo.cell.executor` lets one installed package
   supply the executor that runs every cell body (`marimo/_runtime/executor/evaluator.py:147-178`).
@@ -215,12 +283,16 @@ Two pieces live in Marimo; both use what Marimo ships.
   element, so no editor change is needed. `CellConfig` carries only `column`, `disabled`,
   `hide_code`, `expand_output` (`marimo/_ast/cell.py:35-53`); a key there would add nothing the
   call does not.
-- **Approval gate.** The executor returns a Marimo UI element as the header cell's output, an
-  approve control showing the proposed site, resources, walltime and queue estimate, and stops
-  the cell's descendants until it is used, the pattern of `mo.ui.run_button` with `mo.stop`. The
-  control's callback records the approval and the run proceeds. The host-protocol *decision*
-  (`protocols/host/spec.md`, "Requests and decisions") can carry the same prompt to `marimo pair`
-  and batch runners later; it is not required.
+- **Approval gate.** The executor calls `input()` inside the requiring cell with the proposed
+  site, resources, walltime and queue estimate, and waits. The kernel serves stdin in edit mode
+  (`ThreadSafeStdin`, `marimo/_runtime/runtime.py:2700`) and the editor renders the prompt in
+  the cell's console, so no UI element and no rerun is involved. A UI element would not work
+  here: marimo reruns cells on a value change only through the element's bound global name
+  (`marimo/_runtime/runtime.py:2161`), and an element the executor creates has none. In script
+  mode stdin is absent and the sidecar (2.2) answers.
+- **Verified.** With released marimo 0.25.2, a package registering `marimo.cell.executor` is
+  picked up by `python notebook.py`, and the executor sees each cell's `refs`, `defs` and the
+  graph through `get_context().graph` (`experiments/fold/mtest/`).
 
 Nothing is required from Marimo. One courtesy item for the team, as a Marimo Enhancement
 Proposal or a conversation: motabi depends on the `marimo.cell.executor` entry point and on the
@@ -243,26 +315,30 @@ An adapter implements nine calls:
    user can already reach and use; the adapter grants nothing.
 2. **stage_bundle(image)** — make the environment image available as an OCI bundle on site,
    idempotent per image; return its location.
-3. **fetch(keys, dest)** — pull object-store keys to site storage, from the site side.
-4. **push(paths)** — push site files to the object store; return their keys.
+3. **fetch(paths, dest)** — pull files from home to site storage, from the site side.
+4. **push(paths, dest)** — push site files back to home.
 5. **submit(payload, resources, walltime, n_tasks)** — run the payload as the user; return a job
    handle. The adapter does not inspect or alter the payload. Per-leg secrets (store
-   credentials, platform token) are injected at launch and never written to the checkpoint image.
+   credentials) are injected at launch and never written to the checkpoint image.
 6. **status(handle)** — queued, running, done, failed, preempted.
 7. **cancel(handle)**.
 8. **warning()** — the signal and lead time the site gives before walltime, or none.
-9. **connect_info(handle)** — the URL and per-job token a process inside the job dials to reach
-   the platform. Outbound only.
+9. **tunnel(handle)** — a reverse connection from inside the job to the server on the user's
+   machine, over the adapter's own channel (ssh for slurm-ssh), re-established after restore.
 
-The payload, written by motabi and the same at every site: fetch the image and workspace;
-`runsc --rootless --platform=systrap restore`; signal the executor; wait for the leg to end or
-the warning; `runsc checkpoint` (with `--cuda-checkpoint-path` where a GPU is present); push;
-exit. A preempted or walltime-ended job is not a failure: the payload checkpointed on the
-warning and the leg is resubmitted from that image. Fork is the same payload with `n_tasks=N`
-and a branch id per task; each task pushes its delta and the root applies them.
+The payload, written by motabi and the same at every site including home: fetch the image and
+workspace; mount declared datasets; `unshare -Ur -m runsc --ignore-cgroups --platform=systrap
+restore` with fixed stdio; bridge the kernel's loopback ZeroMQ link to the server through the
+tunnel; signal the executor; deliver interrupts as a signal into the sandbox; wait for the leg
+to end or the warning; `runsc checkpoint` (with `--cuda-checkpoint-path` where a GPU is
+present); push; exit. The sandbox has no network except loopback to the payload and never holds
+a credential. A preempted or walltime-ended job is not a failure: the payload checkpointed on
+the warning and the leg is resubmitted from that image. Fork is the same payload with
+`n_tasks=N` and a worker id per task; each task writes its range and manifest (2.4) and the
+root imports them.
 
-Byte movement is adapter-side (the site fetches and pushes with the credentials it was given),
-since Perlmutter reaches S3 outbound and Globus sites differ. A leg is one job; a long-lived
+Byte movement is adapter-side: scp over the submitting ssh connection for slurm-ssh, Superfacility
+transfer or Globus for Perlmutter. A leg is one job; a long-lived
 allocation hosting many legs is a later option.
 
 ## 6. First targets
@@ -271,21 +347,24 @@ allocation hosting many legs is a later option.
 - **slurm-ssh** — sbatch over ssh. Lawrencium.
 - **superfacility** — NERSC's REST API. Perlmutter.
 
-Precondition on any site: unprivileged user namespaces on the compute nodes, the same facility
-rootless podman-hpc uses, so a site that runs rootless podman runs `runsc --rootless`. Where a
-site lacks it, the fallback is DMTCP inside Apptainer (section 7), at the cost of sandbox
-fidelity. Perlmutter has it.
+Precondition on any site: unprivileged user namespaces on the compute nodes. Rootless podman at
+a site shows they are enabled and nothing more; runsc is driven as in section 3. Where a site
+lacks them, the fallback is DMTCP inside Apptainer (section 7), at the cost of sandbox fidelity.
+Perlmutter has them (podman-hpc, with a `--userns=keep-id` fix on compute nodes in June 2026);
+Lawrencium is unverified.
+
+Verified on a workstation, 2026-10-20 (`experiments/fold/`): unprivileged checkpoint and double
+restore of a Python process, both copies continuing at the same object address; the fold of 2.4
+across restores, with a restored root copy importing two workers' ranges; the marimo executor
+entry point in script mode.
 
 Two checks to run on Perlmutter before anything else, each unverified today:
 
 1. A sandbox checkpointed on a host without a GPU restores on a GPU node with the GPU usable.
    gVisor creates nvproxy device files on restore regardless of the checkpoint's metadata
    (google/gvisor#14525), which suggests yes.
-2. Which networking mode `runsc --rootless` gets inside a Slurm allocation, and that an outbound
-   connection from the sandbox to the platform works.
-
-Also to read before the batch section is final: marimo-team/expd, which runs a trial notebook
-across varying inputs in parallel and overlaps with `map`.
+2. That a rootless sandbox on a compute node (host networking) reaches the server on the user's
+   machine through the adapter's tunnel, and that the connection comes back after restore.
 
 ## 7. Out of scope and rejected alternatives
 
@@ -300,11 +379,16 @@ Rejected:
 
 - **Ship a cell's inputs, return its outputs.** Loses every side effect (files, in-place
   mutation, process state) and so needs a carrier per kind. Moving the kernel needs none.
-- **Page-level merge of branch snapshots.** Python branches dirty the same pages even when
-  logically independent: shared arenas and free lists, refcount writes on shared objects, the
-  globals dict, GC lists. Instagram needed immortal objects (PEP 683) plus `gc.freeze()` to keep
-  forked pages clean, and that still leaves allocator collisions. Object-level join over the
-  root is sound and cheap because restore preserves addresses.
+- **Merging whole branch snapshots page by page.** Python branches dirty the same pages even
+  when logically independent: shared arenas and freelists, refcount writes on shared objects,
+  the globals dict, GC lists, inline caches. The join of 2.4 avoids all of it by giving each
+  worker its own addresses for new objects and discarding its pre-fork pages.
+- **Pickling defines across the join.** Serializes every result, fails on anything unpicklable,
+  and is the same loss as shipping inputs and outputs, one level down. Kept only as the
+  per-object fallback when the check in 2.4 fails.
+- **Immortalizing the pre-fork heap** so that workers never write refcounts. It pins every
+  object for the session, which defeats a tool whose purpose is memory. Refcount deltas from the
+  manifest replace it.
 - **CRIU as the primary mechanism.** Shape-free and GPU-capable, but a second mechanism with a
   per-resource unsupported list. Fallback only.
 - **microVM as the primary mechanism.** Needs KVM on compute nodes; shape fixed at boot, so an
