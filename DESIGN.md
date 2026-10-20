@@ -17,7 +17,7 @@ computes, is the workflow.
 It is not:
 
 - a notebook, editor, or file format. Marimo is all three.
-- a tool-call or task system. Tools are installed in the environment image and run as
+- a tool-call or task system. Tools are installed in the environment (2.7) and run as
   subprocesses wherever the kernel currently is.
 - a remote-kernel service. The kernel is marimo's own subprocess; the editor's server stays at
   home (2.3) and the browser on the laptop, and the kernel's connection to the server is
@@ -256,6 +256,38 @@ trial function.
 `python notebook.py` under the same orchestration is the batch run. Cells with requirements go
 to sites; the rest run in place. No separate workflow compilation exists.
 
+### 2.7 The environment
+
+The environment is defined in the notebook, as marimo already has it: the PEP 723 metadata
+block that `marimo edit --sandbox` reads. motabi adds nothing to that definition.
+
+What a restore needs from a site is stricter than "the same packages": the process arrives
+with its interpreter, libc and every extension mapped from files, and the site reopens those
+files by path. So the site must hold the same bytes at the same paths. That is met without
+shipping an image, because uv builds identical trees on every machine: its interpreter is a
+prebuilt binary, the same download everywhere, and a locked wheel unpacks to the same files.
+At home motabi resolves the notebook's metadata to a lockfile; at each site the payload runs
+`uv sync` from that lockfile onto a **base**, a small tree holding libc and the system
+libraries, named by content digest and shipped once per motabi release. The one rule this puts
+on users is that packages with native code come as wheels; a package built from source at
+install time differs per machine and is refused with its name.
+
+A checkpoint carries the digest of every file it has mapped. Before restoring, the payload
+checks the site's files against that list and reports the first mismatch by path, so a drift
+between home and site is an error naming the file, never a crash in the restored process.
+Mapped files are the only ones checked: `.pyc` files, package metadata and data files are
+read, not mapped, and need not match.
+
+A session is bound to one base digest, one lockfile and one path layout (the base, the venv,
+the workspace and the shared control directory at fixed paths, recorded in the sandbox's spec).
+Changing the notebook's dependencies mid-session is a kernel restart, as the CPU pin is (2.3).
+GPU driver libraries are the stated exception to path identity: gVisor's nvproxy supplies them
+from the host at restore, so they may differ between sites.
+
+The alternative, an image built from a user-maintained recipe and copied to every site, was
+the prototype's first form and was dropped: it moves the environment definition out of the
+notebook, where marimo users keep it, for no gain in reproducibility.
+
 ## 3. Why gVisor
 
 The migration unit must carry the whole kernel process tree with its side effects, fork cheaply,
@@ -273,7 +305,7 @@ Python process worked that way on a workstation with release-20261012.0.
 | | microVM snapshot (Firecracker, Cloud Hypervisor) | CRIU on the process tree | gVisor sandbox checkpoint |
 |---|---|---|---|
 | Fidelity | whole guest | per-resource support list; new libraries find new gaps | whole sandbox (gVisor's kernel, not Linux: syscall coverage gaps) |
-| Workspace | disk snapshotted with memory | filesystem reproduced separately | workspace mounted; files move with the image |
+| Workspace | disk snapshotted with memory | filesystem reproduced separately | workspace mounted; files move with the kernel |
 | Fork | diff snapshots native | iterative dumps, not default | N restores of one image |
 | Shape | fixed at boot; grows only by hotplug within a boot-time ceiling (Cloud Hypervisor: CPU, memory, VFIO; Firecracker: memory only since v1.14.0, no vCPU hotplug) | free | free |
 | GPU | no snapshot with a passthrough device | cuda-checkpoint plus CRIU plugin | cuda-checkpoint driven by runsc |
@@ -359,8 +391,9 @@ An adapter implements nine calls:
 
 1. **capabilities(user)** — what this user can get here (section 2.2). Reports only what the
    user can already reach and use; the adapter grants nothing.
-2. **stage_bundle(image)** — make the environment image available as an OCI bundle on site,
-   idempotent per image; return its location.
+2. **stage(base, lockfile)** — make the environment present on site (2.7): the base tree by
+   digest, kept across sessions and users of the same base, and the venv synced from the
+   lockfile; idempotent per (base, lockfile); return the bundle's location.
 3. **fetch(paths, dest)** — pull files from home to site storage, from the site side.
 4. **push(paths, dest)** — push site files back to home.
 5. **submit(payload, resources, walltime, n_tasks)** — run the payload as the user; return a job
@@ -373,7 +406,7 @@ An adapter implements nine calls:
    machine, over the adapter's own channel (ssh for slurm-ssh), re-established after restore.
 
 The payload, written by motabi and the same at every site including home: fetch the image and
-workspace; mount declared datasets; `unshare -Ur -m runsc --ignore-cgroups --platform=systrap
+workspace; check the mapped files against the image's digests (2.7); mount declared datasets; `unshare -Ur -m runsc --ignore-cgroups --platform=systrap
 restore` with fixed stdio; bridge the kernel's loopback ZeroMQ link to the server through the
 tunnel; signal the executor; deliver interrupts as a signal into the sandbox; wait for the leg
 to end or the warning; `runsc checkpoint` (with `--cuda-checkpoint-path` where a GPU is

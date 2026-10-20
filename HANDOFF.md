@@ -136,12 +136,12 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
    #1) has the kernel stay at the site until `motabi.home()` or the end of the run. Changing
    the executor to stay halves the transfers per leg.
 
-7. **The environment image is an exported tree, not marimo's inline metadata.** A restore maps
-   the interpreter, libc and every extension by path and needs identical bytes at the site,
-   so the prototype ships `rootfs/`. Marimo's norm is PEP 723 metadata resolved by uv per
-   machine; the reconciliation under discussion is a small digest-named base plus `uv sync`
-   from a lockfile at each site (wheels only for native code), with the checkpoint carrying
-   digests of its mapped files for the payload to verify before restoring. Not decided.
+7. **The prototype's environment is an exported tree; the design (2.7, decided 2026-10-20) is
+   the notebook's PEP 723 metadata.** A restore maps the interpreter, libc and every extension
+   by path and needs identical bytes at the site, so the prototype ships `rootfs/`. The design
+   gets the same bytes from uv: a small digest-named base, the notebook's metadata resolved to
+   a lockfile at home, `uv sync` at each site, wheels only for native code, and the checkpoint
+   carrying digests of its mapped files for the payload to verify before restoring. Not built.
 
 8. **The site path is not safe on a shared login node.** Two things the guest hides: the
    reverse tunnel binds the server's five ports on the site's loopback, where any user of that
@@ -156,8 +156,8 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
 
 In order:
 
-1. **Decide the environment question** (issue 7), then make the executor stay out until
-   `motabi.home()` (issue 6).
+1. **Build the environment as designed** (issue 7) and make the executor stay out until
+   `motabi.home()` (issue 6), in either order.
 
 2. **A real site**: the slurm-ssh adapter against Lawrencium, with the pin computed from
    capabilities. The guest recipe in `prototype/site/` is the test bed until then.
