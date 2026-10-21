@@ -25,6 +25,7 @@ static PyObject **stk = NULL; static size_t stk_n = 0, stk_cap = 0; static size_
 static PyMemAllocatorEx orig[3]; static int installed = 0;
 static size_t n_divert = 0, n_free_inrange = 0, n_realloc_foreign = 0;
 static void mark_freed(const char *p);
+static int is_mapped(const void *p);
 #define GC_HEAD (2 * sizeof(uintptr_t))   /* PyGC_Head on 3.12: two words before the object */
 
 static int in_range(const void *p){ const char *c = p; for (int i = 0; i < NR; i++) if (c >= R[i].base && c < R[i].base + R[i].size) return i; return -1; }
@@ -243,6 +244,187 @@ static PyObject *deltas_list(void){
   return out;
 }
 static PyObject *py_export_deltas(PyObject *s, PyObject *a){ return deltas_list(); }
+
+/* A dict whose key table is a pre-fork block: a combined table the worker got from CPython's
+   key-table freelist (a pre-fork dict's resize or clear put its old table there, a free the
+   allocator never sees), which is a page the join discards, so the root would read another dict's
+   keys through it; or a split table sharing a pre-fork type's cached keys, on which the worker's
+   dict holds a count written in a discarded page, so the root's copy of the keys object would be
+   freed under the type when the dict dies. The shared empty table is static and excepted. */
+static int keys_foreign(PyObject *d){
+  PyDictObject *mp = (PyDictObject *)d;
+  static PyDictKeysObject *empty = NULL; if (!empty) { PyObject *e = PyDict_New(); empty = ((PyDictObject *)e)->ma_keys; Py_DECREF(e); }
+  return (mp->ma_values || mp->ma_keys != empty) && in_range(mp->ma_keys) < 0;
+}
+
+/* ---- the walk: what the join counts (DESIGN.md 2.4) ----
+   The root's count on a pre-fork object rises by the number of references to it from the objects
+   the join imports: everything reachable from the defines through the worker's range. Nothing is
+   subtracted: a reference the worker dropped from a pre-fork container is a mutation of that
+   container, which the join does not carry, so the root's container still holds it. (The earlier
+   rule, worker refcount minus snapshot refcount, freed an object the worker had popped from a
+   pre-fork list and stored in a define: the drop and the store cancelled.)
+   References are found by each object's own traversal, plus the pointers a traversal does not
+   visit and a dealloc drops: a dict's unicode keys, a heap type's name, qualname, slots, subclass
+   table and the keys of its shared attribute table, a code object's constants and names (code is
+   not a GC type in 3.12), a NumPy array's base, dtype and memory handler, and, for an object of
+   any other type without a traversal, every word of its inline body that is a tabled address or a
+   plausible object in the range. A referent in the range is walked; a tabled live one is counted;
+   a tabled dead one refuses the export (the worker built an object in a page the join discards);
+   an untabled pre-fork one is reported with its type (apply_extra) unless it is immortal and not
+   an interned string; an untabled dict, list or tuple outside every range that holds range objects
+   refuses the export. An object in the range the worker made immortal is reported with its count
+   so the root can make it mortal (apply_demote). */
+typedef struct { uintptr_t *k; Py_ssize_t *v; uintptr_t *t; size_t cap, n; } AMap;   /* address -> count, type */
+static void amap_free(AMap *m){ free(m->k); free(m->v); free(m->t); memset(m, 0, sizeof *m); }
+static void amap_init(AMap *m, size_t cap){ amap_free(m); m->cap = cap; m->k = calloc(cap, sizeof *m->k); m->v = calloc(cap, sizeof *m->v); m->t = calloc(cap, sizeof *m->t); }
+static size_t amap_find(const AMap *m, uintptr_t key){ size_t mask = m->cap - 1, i = (key >> 4) & mask; while (m->k[i] && m->k[i] != key) i = (i + 1) & mask; return i; }
+static Py_ssize_t amap_get(const AMap *m, uintptr_t key){ if (!m->cap) return -1; size_t i = amap_find(m, key); return m->k[i] ? m->v[i] : -1; }
+static size_t amap_slot(AMap *m, uintptr_t key, int *added){
+  if ((m->n + 1) * 2 > m->cap) { AMap o = *m; m->cap = o.cap * 2; m->k = calloc(m->cap, sizeof *m->k); m->v = calloc(m->cap, sizeof *m->v); m->t = calloc(m->cap, sizeof *m->t);
+    for (size_t i = 0; i < o.cap; i++) if (o.k[i]) { size_t j = amap_find(m, o.k[i]); m->k[j] = o.k[i]; m->v[j] = o.v[i]; m->t[j] = o.t[i]; }
+    free(o.k); free(o.v); free(o.t); }
+  size_t i = amap_find(m, key); *added = !m->k[i]; if (*added) { m->k[i] = key; m->n++; } return i;
+}
+static struct { int rng; AMap seen, extra, demote; Py_ssize_t *cnt; PyObject **stk, **reached; size_t n, cap, nreached; const char *refuse; PyObject *foreign; } W;
+static void w_push(PyObject *o){
+  int added; amap_slot(&W.seen, (uintptr_t)o, &added); if (!added) return;
+  if (W.n == W.cap) { W.cap = W.cap ? W.cap * 2 : 1 << 16; W.stk = realloc(W.stk, W.cap * sizeof *W.stk); W.reached = realloc(W.reached, W.cap * sizeof *W.reached); }
+  W.stk[W.n++] = o; W.reached[W.nreached++] = o;
+}
+static int holds_range_objects(PyObject *r){
+  if (PyTuple_CheckExact(r)) { for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(r); i++) if (in_range(PyTuple_GET_ITEM(r, i)) >= 0) return 1; }
+  else if (PyList_CheckExact(r)) { for (Py_ssize_t i = 0; i < PyList_GET_SIZE(r); i++) if (in_range(PyList_GET_ITEM(r, i)) >= 0) return 1; }
+  else if (PyDict_CheckExact(r)) { Py_ssize_t pos = 0; PyObject *k, *v; while (PyDict_Next(r, &pos, &k, &v)) if (in_range(k) >= 0 || in_range(v) >= 0) return 1; }
+  return 0;
+}
+static int w_visit(PyObject *r, void *arg){
+  (void)arg; if (!r || W.refuse) return 0;
+  long j = hmap_get((uintptr_t)r);
+  if (j >= 0) {
+    if (tab[j].dead) { W.refuse = "an exported object references a pre-fork object freed before the checkpoint: it was built in a page the join discards (a pre-fork block from a freelist); rerun the scatter"; return 0; }
+    if (!_Py_IsImmortal(r)) W.cnt[j]++;   /* immortal: replayed as "immortalise" from the table */
+    return 0;
+  }
+  int ri = in_range(r);
+  if (ri == W.rng) { if (_Py_IsImmortal(r)) { int a; size_t i = amap_slot(&W.demote, (uintptr_t)r, &a); W.demote.v[i]++; } w_push(r); return 0; }
+  if (ri < 0 && _Py_IsImmortal(r) && !(PyUnicode_Check(r) && ((PyASCIIObject *)r)->state.interned)) return 0;   /* immortal before the fork */
+  if (ri < 0 && holds_range_objects(r)) { W.refuse = "an exported object references a container built in a page the join discards (a pre-fork block from a freelist); rerun the scatter"; return 0; }
+  int a; size_t i = amap_slot(&W.extra, (uintptr_t)r, &a); W.extra.v[i]++; W.extra.t[i] = (uintptr_t)Py_TYPE(r);
+  return 0;
+}
+/* A word of an untraversed object's body that may be a pointer to an object in the range: aligned
+   as the range allocator aligns objects, with a type word that names a type (tabled, in the range,
+   or mapped code) and a positive count. */
+static int plausible(const PyObject *c){
+  uintptr_t t = (uintptr_t)Py_TYPE(c); if (!t || (t & 7)) return 0;
+  if (hmap_get(t) < 0) { if (in_range((void *)t) == W.rng) { if (t & 15) return 0; } else if (!is_mapped((void *)t)) return 0; }
+  PyObject *mt = (PyObject *)Py_TYPE((PyObject *)t); if (!mt || ((uintptr_t)mt & 7)) return 0;
+  if (hmap_get((uintptr_t)mt) < 0 && in_range(mt) < 0 && !is_mapped(mt)) return 0;
+  return PyType_Check((PyObject *)t) && ((PyTypeObject *)t)->tp_basicsize > 0 && Py_REFCNT(c) > 0;
+}
+static void w_scan(const char *from, const char *to){
+  for (const char *p = from; p + 8 <= to; p += 8) {
+    uintptr_t w = *(const uintptr_t *)p; if (!w) continue;
+    if (hmap_get(w) >= 0) { w_visit((PyObject *)w, NULL); continue; }
+    if (in_range((void *)w) == W.rng && !(w & 15) && plausible((PyObject *)w)) w_visit((PyObject *)w, NULL);
+  }
+}
+static void w_keys(Keys *k){   /* the key strings a unicode key table owns */
+  if (!k || k->kind == 0) return;
+  for (Py_ssize_t i = 0; i < k->nentries; i++) w_visit(KEYS_ENTRIES(k)[i].key, NULL);
+}
+static int is_ndarray(PyTypeObject *t){
+  if (!t->tp_mro) return !strcmp(t->tp_name, "numpy.ndarray");
+  for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(t->tp_mro); i++) { PyTypeObject *b = (PyTypeObject *)PyTuple_GET_ITEM(t->tp_mro, i); if (!PyType_HasFeature(b, Py_TPFLAGS_HEAPTYPE) && !strcmp(b->tp_name, "numpy.ndarray")) return 1; }
+  return 0;
+}
+static void w_object(PyObject *o){
+  PyTypeObject *t = Py_TYPE(o);
+  if (PyType_Check(o)) {   /* a type in the range is a heap type; type_traverse skips what type_dealloc drops */
+    PyHeapTypeObject *h = (PyHeapTypeObject *)o; PyTypeObject *ht = (PyTypeObject *)o;
+    w_visit(h->ht_name, NULL); w_visit(h->ht_slots, NULL); w_visit(h->ht_qualname, NULL); w_visit((PyObject *)ht->tp_subclasses, NULL);
+    if ((ht->tp_flags & Py_TPFLAGS_MANAGED_DICT) && in_range(h->ht_cached_keys) == W.rng) w_keys((Keys *)h->ht_cached_keys);
+  }
+  if (PyCode_Check(o)) {
+    PyCodeObject *c = (PyCodeObject *)o;
+    PyObject *f[] = { c->co_consts, c->co_names, c->co_localsplusnames, c->co_localspluskinds, c->co_filename, c->co_name, c->co_qualname, c->co_linetable, c->co_exceptiontable };
+    for (size_t i = 0; i < sizeof f / sizeof *f; i++) w_visit(f[i], NULL);
+    if (c->_co_cached) { w_visit(c->_co_cached->_co_code, NULL); w_visit(c->_co_cached->_co_varnames, NULL); w_visit(c->_co_cached->_co_cellvars, NULL); w_visit(c->_co_cached->_co_freevars, NULL); }
+    return;
+  }
+  if (PyDict_Check(o)) {
+    PyDictObject *mp = (PyDictObject *)o;
+    if (keys_foreign(o)) { PyList_Append(W.foreign, o); return; }
+    if (!mp->ma_values) w_keys((Keys *)mp->ma_keys);   /* a split table's keys belong to the type's table, walked with the type */
+  }
+  if (t->tp_traverse) { t->tp_traverse(o, w_visit, NULL); return; }
+  /* no traversal: a non-GC object. subtype_dealloc drops a heap type; the atomic builtins hold nothing */
+  if (PyType_HasFeature(t, Py_TPFLAGS_HEAPTYPE)) w_visit((PyObject *)t, NULL);
+  if (t == &PyUnicode_Type || t == &PyBytes_Type || t == &PyLong_Type || t == &PyFloat_Type || t == &PyBool_Type || t == &PyComplex_Type || t == &PyByteArray_Type || o == Py_None) return;
+  if (is_ndarray(t)) { const char *b = (const char *)o; w_visit(*(PyObject **)(b + 48), NULL); w_visit(*(PyObject **)(b + 56), NULL); w_visit(*(PyObject **)(b + 88), NULL); return; }   /* base, descr, mem_handler */
+  size_t n = (size_t)t->tp_basicsize; if (t->tp_itemsize) n += (size_t)t->tp_itemsize * (size_t)labs((long)Py_SIZE(o));
+  w_scan((const char *)o + sizeof(PyObject), (const char *)o + n);
+}
+/* Walk the defines; returns NULL with an exception if the export is refused. On return W holds
+   the reached objects and the counts; the caller builds the lists and frees W (w_done). */
+static int w_run(int rng, PyObject *defs){
+  W.rng = rng; W.n = W.nreached = 0; W.refuse = NULL;
+  amap_init(&W.seen, 1 << 16); amap_init(&W.extra, 1 << 10); amap_init(&W.demote, 1 << 10);
+  W.cnt = calloc(tab_n ? tab_n : 1, sizeof *W.cnt); Py_XDECREF(W.foreign); W.foreign = PyList_New(0);
+  /* a define's binding from the worker's globals is not a reference the root keeps: an in-range define is walked, a pre-fork one is bound by the root itself */
+  for (Py_ssize_t i = 0; i < PyList_GET_SIZE(defs); i++) { PyObject *d = (PyObject *)PyLong_AsVoidPtr(PyList_GET_ITEM(defs, i)); if (in_range(d) == rng) w_push(d); }
+  while (W.n && !W.refuse) w_object(W.stk[--W.n]);
+  if (W.refuse) { PyErr_Format(PyExc_RuntimeError, "export refused: %s", W.refuse); return -1; }
+  return 0;
+}
+static void w_done(void){ amap_free(&W.seen); amap_free(&W.extra); amap_free(&W.demote); free(W.cnt); W.cnt = NULL; free(W.stk); free(W.reached); W.stk = W.reached = NULL; W.cap = 0; Py_CLEAR(W.foreign); }
+static PyObject *w_deltas(void){   /* (address, count), or (address, -1) for a tabled object the worker made immortal */
+  PyObject *out = PyList_New(0);
+  for (size_t j = 0; j < tab_n; j++) { if (tab[j].dead) continue;
+    Py_ssize_t d = _Py_IsImmortal(tab[j].o) ? -1 : W.cnt[j]; if (!d) continue;
+    PyObject *t = Py_BuildValue("(Kn)", (unsigned long long)(uintptr_t)tab[j].o, d); PyList_Append(out, t); Py_DECREF(t); }
+  return out;
+}
+static PyObject *w_amap_list(const AMap *m, int with_type){
+  PyObject *out = PyList_New(0);
+  for (size_t i = 0; i < m->cap; i++) { if (!m->k[i]) continue;
+    PyObject *t = with_type ? Py_BuildValue("(KnK)", (unsigned long long)m->k[i], m->v[i], (unsigned long long)m->t[i]) : Py_BuildValue("(Kn)", (unsigned long long)m->k[i], m->v[i]);
+    PyList_Append(out, t); Py_DECREF(t); }
+  return out;
+}
+static PyObject *w_addrs(int tracked_only){   /* reached objects, in walk order */
+  PyObject *out = PyList_New(0);
+  for (size_t i = 0; i < W.nreached; i++) { PyObject *o = W.reached[i]; if (tracked_only && !(PyObject_IS_GC(o) && _PyObject_GC_IS_TRACKED(o))) continue; PyObject *v = PyLong_FromVoidPtr(o); PyList_Append(out, v); Py_DECREF(v); }
+  return out;
+}
+/* The pre-pass of the export: the dicts reached from the defines whose key table is a pre-fork
+   block, for the worker to re-key before the tail. */
+static PyObject *py_walk_foreign(PyObject *s, PyObject *a){
+  int rng; PyObject *defs; if (!PyArg_ParseTuple(a, "iO!", &rng, &PyList_Type, &defs)) return NULL;
+  if (w_run(rng, defs)) { w_done(); return NULL; }
+  PyObject *out = Py_NewRef(W.foreign); w_done(); return out;
+}
+/* Root side: an object in the range the worker made immortal (3.12 interning is mortal; static
+   interning and PyUnicode_InternImmortal are not) becomes mortal with the count the walk found
+   plus one for each define name bound to it (the worker's own globals binding, which bind
+   releases), so it can die with the objects that hold it. */
+static PyObject *py_apply_demote(PyObject *s, PyObject *a){
+  PyObject *lst, *defs; if (!PyArg_ParseTuple(a, "O!O!", &PyList_Type, &lst, &PyList_Type, &defs)) return NULL;
+  Py_ssize_t applied = 0;
+  for (Py_ssize_t k = 0; k < PyList_GET_SIZE(lst); k++) {
+    unsigned long long addr; Py_ssize_t c; if (!PyArg_ParseTuple(PyList_GET_ITEM(lst, k), "Kn", &addr, &c)) return NULL;
+    PyObject *o = (PyObject *)(uintptr_t)addr; if (in_range(o) < 0 || !_Py_IsImmortal(o)) continue;
+    for (Py_ssize_t i = 0; i < PyList_GET_SIZE(defs); i++) if ((uintptr_t)PyLong_AsVoidPtr(PyList_GET_ITEM(defs, i)) == (uintptr_t)addr) c++;
+    if (PyUnicode_Check(o)) ((PyASCIIObject *)o)->state.interned = 0;
+    Py_SET_REFCNT(o, c > 0 ? c : 1); applied++;
+  }
+  return PyLong_FromSsize_t(applied);
+}
+/* Root side: a GC object the worker tracked but the walk did not reach stays untracked: its
+   references were not counted, so the collector must never traverse it, and it never dies (a
+   reference from a discarded page holds it). Its dumped head still carries the worker's links. */
+static PyObject *py_leave(PyObject *s, PyObject *o){ if (PyObject_IS_GC(o)) { uintptr_t *h = (uintptr_t *)o; h[-2] = 0; h[-1] = 0; } Py_RETURN_NONE; }
 static PyObject *py_apply_deltas(PyObject *s, PyObject *lst){
   Py_ssize_t n = PyList_GET_SIZE(lst), total = 0, skipped = 0;
   for (Py_ssize_t k = 0; k < n; k++) {
@@ -276,15 +458,6 @@ static PyObject *py_apply_extra(PyObject *s, PyObject *lst){
     Py_SET_REFCNT(o, Py_REFCNT(o) + c); total += c;
   }
   return Py_BuildValue("(nn)", total, skipped);
-}
-/* A combined-table dict whose key table is outside every range and is not the shared empty table:
-   the worker got it from CPython's key-table freelist, where a pre-fork dict's resize or clear had
-   put its old table (a free the allocator never sees). The block is a pre-fork page the join
-   discards, so the root would read another dict's keys through it. */
-static int keys_foreign(PyObject *d){
-  PyDictObject *mp = (PyDictObject *)d; if (mp->ma_values) return 0;   /* split table: the type's shared keys */
-  static PyDictKeysObject *empty = NULL; if (!empty) { PyObject *e = PyDict_New(); empty = ((PyDictObject *)e)->ma_keys; Py_DECREF(e); }
-  return mp->ma_keys != empty && in_range(mp->ma_keys) < 0;
 }
 static PyObject *py_dict_keys_foreign(PyObject *s, PyObject *d){
   if (!PyDict_Check(d)) { PyErr_SetString(PyExc_TypeError, "dict"); return NULL; }
@@ -499,19 +672,23 @@ static PyObject *py_dump_span(PyObject *s, PyObject *a){
   Py_ssize_t n = dump_span_fd(i, off, len, fd); if (n < 0) return PyErr_SetFromErrno(PyExc_OSError); return PyLong_FromSsize_t(n);
 }
 /* The worker's export tail as one call that executes no Python code, so no other thread of the
-   worker (marimo's completion engine, library pools) runs between the list of its tracked
-   objects, the counts it reports and the bytes it writes: an object made or freed in between
-   would reach the root miscounted. Returns (tracked ids, deltas, keys, python bytes, libc bytes). */
+   worker (marimo's completion engine, library pools) runs between the walk, the lists it yields
+   and the bytes written: an object made or freed in between would reach the root miscounted.
+   Returns (reached, tracked, leftover, deltas, extra, demote, keys, python bytes, libc bytes):
+   reached are the objects the walk found in the range, tracked those of them the worker's
+   collector tracks, leftover the tracked objects in the range the walk did not reach. */
 static PyObject *py_export_tail(PyObject *s, PyObject *a){
-  int i, li; size_t lo, hi; const char *bin, *libc;
-  if (!PyArg_ParseTuple(a, "iinnss", &i, &li, &lo, &hi, &bin, &libc)) return NULL;
-  PyObject *gcm = PyImport_ImportModule("gc"); if (!gcm) return NULL;
-  PyObject *objs = PyObject_CallMethod(gcm, "get_objects", NULL); Py_DECREF(gcm); if (!objs) return NULL;
-  PyObject *tracked = PyList_New(0);
-  /* this worker's range only: earlier scatters' ranges hold objects the root already tracks */
-  for (Py_ssize_t k = 0; k < PyList_GET_SIZE(objs); k++) { PyObject *o = PyList_GET_ITEM(objs, k); if (in_range(o) == i) { PyObject *v = PyLong_FromVoidPtr(o); PyList_Append(tracked, v); Py_DECREF(v); } }
+  int i, li; size_t lo, hi; const char *bin, *libc; PyObject *defs;
+  if (!PyArg_ParseTuple(a, "iinnssO!", &i, &li, &lo, &hi, &bin, &libc, &PyList_Type, &defs)) return NULL;
+  if (w_run(i, defs)) { w_done(); return NULL; }
+  if (PyList_GET_SIZE(W.foreign)) { w_done(); PyErr_SetString(PyExc_RuntimeError, "export refused: a dict's key table is a pre-fork block after the re-key"); return NULL; }
+  PyObject *gcm = PyImport_ImportModule("gc"); if (!gcm) { w_done(); return NULL; }
+  PyObject *objs = PyObject_CallMethod(gcm, "get_objects", NULL); Py_DECREF(gcm); if (!objs) { w_done(); return NULL; }
+  PyObject *leftover = PyList_New(0);
+  for (Py_ssize_t k = 0; k < PyList_GET_SIZE(objs); k++) { PyObject *o = PyList_GET_ITEM(objs, k); if (in_range(o) != i || amap_get(&W.seen, (uintptr_t)o) >= 0) continue; PyObject *v = PyLong_FromVoidPtr(o); PyList_Append(leftover, v); Py_DECREF(v); }
   Py_DECREF(objs);
-  PyObject *deltas = deltas_list(), *keys = keys_list();
+  PyObject *reached = w_addrs(0), *tracked = w_addrs(1), *deltas = w_deltas(), *extra = w_amap_list(&W.extra, 1), *demote = w_amap_list(&W.demote, 0), *keys = keys_list();
+  w_done();
   Py_ssize_t n = dump_range_to(i, bin); if (n < 0) return PyErr_SetFromErrno(PyExc_OSError);
   Py_ssize_t lb = 0;
   if (li >= 0) {
@@ -520,7 +697,7 @@ static PyObject *py_export_tail(PyObject *s, PyObject *a){
     if (b2 < 0) return PyErr_SetFromErrno(PyExc_OSError);
     lb = b1 + b2;
   }
-  return Py_BuildValue("(NNNnn)", tracked, deltas, keys, n, lb);
+  return Py_BuildValue("(NNNNNNNnn)", reached, tracked, leftover, deltas, extra, demote, keys, n, lb);
 }
 static PyObject *py_import_spans(PyObject *s, PyObject *a){
   int i; const char *path; if (!PyArg_ParseTuple(a, "is", &i, &path)) return NULL;
@@ -535,6 +712,29 @@ static PyObject *py_import_spans(PyObject *s, PyObject *a){
   }
   close(fd); return PyLong_FromSize_t(bytes);
 }
+/* The root's replay of one worker's manifest after its ranges are read in: the counts, the key
+   tables, the untabled references, the demotions, then the GC heads (leftovers left untracked,
+   reached objects tracked). The results go into the manifest dict for bind's stats. */
+static int replay_manifest(PyObject *m){
+  PyObject *defs_d = PyDict_GetItemString(m, "defs"), *defs = PyDict_Values(defs_d); if (!defs) return -1;
+  PyObject *r1 = py_apply_deltas(NULL, PyDict_GetItemString(m, "deltas")); if (!r1) return -1;
+  PyObject *r2 = py_apply_keys(NULL, PyDict_GetItemString(m, "keys")); if (!r2) return -1;
+  PyObject *r3 = py_apply_extra(NULL, PyDict_GetItemString(m, "extra")); if (!r3) return -1;
+  PyObject *args = Py_BuildValue("(OO)", PyDict_GetItemString(m, "demote"), defs); Py_DECREF(defs);
+  PyObject *r4 = py_apply_demote(NULL, args); Py_DECREF(args); if (!r4) return -1;
+  PyDict_SetItemString(m, "applied", r1); PyDict_SetItemString(m, "keys_applied", r2); PyDict_SetItemString(m, "extra_applied", r3); PyDict_SetItemString(m, "demoted", r4);
+  Py_DECREF(r1); Py_DECREF(r2); Py_DECREF(r3); Py_DECREF(r4);
+  /* A string the worker interned is mortal in 3.12 with the interned table's two references
+     uncounted; that table is a discarded page, so the dumped count is right for the root, but the
+     mark must go or the string's death tries to delete it from the root's table. */
+  PyObject *reached = PyDict_GetItemString(m, "reached");
+  for (Py_ssize_t k = 0; k < PyList_GET_SIZE(reached); k++) { PyObject *o = (PyObject *)PyLong_AsVoidPtr(PyList_GET_ITEM(reached, k)); if (PyUnicode_Check(o)) ((PyASCIIObject *)o)->state.interned = 0; }
+  PyObject *leftover = PyDict_GetItemString(m, "leftover"), *tracked = PyDict_GetItemString(m, "tracked");
+  for (Py_ssize_t k = 0; k < PyList_GET_SIZE(leftover); k++) { PyObject *r = py_leave(NULL, (PyObject *)PyLong_AsVoidPtr(PyList_GET_ITEM(leftover, k))); Py_DECREF(r); }
+  for (Py_ssize_t k = 0; k < PyList_GET_SIZE(tracked); k++) { PyObject *r = py_track(NULL, (PyObject *)PyLong_AsVoidPtr(PyList_GET_ITEM(tracked, k))); Py_DECREF(r); }
+  return 0;
+}
+static PyObject *py_replay_manifest(PyObject *s, PyObject *m){ if (!PyDict_Check(m)) { PyErr_SetString(PyExc_TypeError, "dict"); return NULL; } if (replay_manifest(m)) return NULL; Py_RETURN_NONE; }
 /* The root's side of a scatter as one call that runs no Python code: wait for the go file, claim
    a worker role (a claimed copy returns its role and becomes a worker), else wait for every
    manifest, read each worker's ranges in, replay its counts and tables, and track its objects.
@@ -658,18 +858,12 @@ static PyObject *py_root_phase(PyObject *s, PyObject *a){
     snprintf(path, sizeof path, "%s.manifest_%d.bin", prefix, i); if (import_range_file(rng, path, used)) return PyErr_SetFromErrno(PyExc_OSError);
     snprintf(path, sizeof path, "%s.manifest_%d.libc", prefix, i);
     if (libc_base >= 0 && file_exists(path)) { PyObject *r = py_import_spans(NULL, Py_BuildValue("(is)", libc_base + base + i, path)); if (!r) return NULL; Py_DECREF(r); }
-    PyObject *r1 = py_apply_deltas(NULL, PyDict_GetItemString(m, "deltas")); if (!r1) return NULL;
-    PyObject *r2 = py_apply_keys(NULL, PyDict_GetItemString(m, "keys")); if (!r2) return NULL;
-    PyObject *r3 = py_apply_extra(NULL, PyDict_GetItemString(m, "extra")); if (!r3) return NULL;
-    PyDict_SetItemString(m, "applied", r1); PyDict_SetItemString(m, "keys_applied", r2); PyDict_SetItemString(m, "extra_applied", r3);
-    Py_DECREF(r1); Py_DECREF(r2); Py_DECREF(r3);
-    PyObject *tracked = PyDict_GetItemString(m, "tracked");
-    for (Py_ssize_t k = 0; k < PyList_GET_SIZE(tracked); k++) { PyObject *o = (PyObject *)PyLong_AsVoidPtr(PyList_GET_ITEM(tracked, k)); PyObject *r = py_track(NULL, o); Py_DECREF(r); }
+    if (replay_manifest(m)) return NULL;
   }
   Py_DECREF(pickle); return Py_BuildValue("(NNnn)", tn, out, n_before, (Py_ssize_t)waited);
 }
 static PyMethodDef M[] = {
-  {"root_phase", py_root_phase, METH_VARARGS, ""},
+  {"root_phase", py_root_phase, METH_VARARGS, ""}, {"walk_foreign", py_walk_foreign, METH_VARARGS, ""}, {"replay_manifest", py_replay_manifest, METH_O, ""}, {"apply_demote", py_apply_demote, METH_VARARGS, ""}, {"leave", py_leave, METH_O, ""},
   {"dict_keys_foreign", py_dict_keys_foreign, METH_O, ""}, {"rekey", py_rekey, METH_O, ""}, {"table_entry", py_table_entry, METH_VARARGS, ""}, {"is_mapped", py_is_mapped, METH_VARARGS, ""}, {"apply_extra", py_apply_extra, METH_O, ""}, {"export_keys", py_export_keys, METH_NOARGS, ""}, {"apply_keys", py_apply_keys, METH_O, ""},
   {"shadow_type", py_shadow_type, METH_O, ""}, {"shadow", py_shadow, METH_VARARGS, ""}, {"shadow_live", py_shadow_live, METH_NOARGS, ""},
   {"dump_span", py_dump_span, METH_VARARGS, ""}, {"export_tail", py_export_tail, METH_VARARGS, ""}, {"import_spans", py_import_spans, METH_VARARGS, ""},

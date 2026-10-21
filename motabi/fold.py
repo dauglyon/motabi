@@ -8,8 +8,9 @@ pre-fork shape buffers, runs, carries each define whose library owns its memory 
 allocator nothing fronts (polars' bundled jemalloc) as an Arrow copy, checks that every buffer
 its defines expose is in a range (rebuilding a result once if a library pool thread placed it
 outside), and exports: the Python range as a file, the touched pages of the libc range as a
-sparse file, the address of each define, the GC-tracked objects in the range (untracked first),
-the refcount it added to each pre-fork object, and the shared attribute-key tables it changed.
+sparse file, the address of each define, the objects reachable from the defines through the range, the
+number of references those objects hold to each pre-fork object (a walk, DESIGN.md 2.4), and the
+shared attribute-key tables it changed.
 The root maps both files at the same addresses, replays the manifest, gives each imported native
 define a type whose destructor never runs (the worker's counts on pre-fork native objects were in
 discarded pages), and rebuilds the carried defines with its own library. Nothing is pickled.
@@ -354,48 +355,6 @@ def check_define(name: str, obj: Any) -> tuple[Any, str]:
     return obj, f"{name}: rebuilt ({bad} were outside)"
 
 
-def _foreign_key_dicts(roots: list[Any], rng: int) -> list[dict]:
-    """Dicts reachable from the defines through the worker's own objects whose key table is a
-    reused pre-fork block (foldalloc.dict_keys_foreign)."""
-    seen: set[int] = set()
-    out: list[dict] = []
-    stack = [r for r in roots if foldalloc.inrange(id(r)) == rng]
-    while stack:
-        o = stack.pop()
-        if id(o) in seen:
-            continue
-        seen.add(id(o))
-        if isinstance(o, dict) and foldalloc.dict_keys_foreign(o):
-            out.append(o)
-        stack.extend(r for r in gc.get_referents(o) if foldalloc.inrange(id(r)) == rng and id(r) not in seen)
-    return out
-
-
-def _untabled_references(rng: int) -> list[tuple[int, int, int]]:
-    """(address, count, type address) for every pre-fork object outside the refcount table that
-    the worker's GC-tracked objects reference (foldalloc.apply_extra). An object the worker
-    itself made immortal (interning a string does) is counted too: the root's copy is mortal."""
-    counts: dict[int, int] = {}
-    types: dict[int, int] = {}
-    for o in gc.get_objects():
-        if foldalloc.inrange(id(o)) != rng:
-            continue
-        for r in gc.get_referents(o):
-            ra = id(r)
-            if foldalloc.inrange(ra) >= 0 or foldalloc.table_entry(ra) is not None:
-                continue
-            if foldalloc.is_prefork(ra) and not (type(r) is str and foldalloc.is_interned(r)):
-                continue  # immortal before the fork (None, small ints, static types and strings)
-            if isinstance(r, (dict, list, tuple)) and any(foldalloc.inrange(id(x)) >= 0 for x in gc.get_referents(r)):
-                # a container outside every range that holds range objects was built by the worker in
-                # a pre-fork block a freelist handed out; the root cannot read it
-                raise RuntimeError(f"export refused: a {type(r).__name__} reached from a {type(o).__name__} was built in a "
-                                   f"page the join discards (a pre-fork block from a freelist); rerun the scatter")
-            counts[ra] = counts.get(ra, 0) + 1
-            types[ra] = id(type(r))
-    return [(a, c, types[a]) for a, c in counts.items()]
-
-
 # -- export and import ---------------------------------------------------------------------------
 
 def worker_export(rng: int, glbls: Any, names: set[str], path: str) -> list[str]:
@@ -408,13 +367,14 @@ def worker_export(rng: int, glbls: Any, names: set[str], path: str) -> list[str]
     if _shim is not None and _shim.rangemalloc_divert_failed():
         raise RuntimeError(f"export refused: the libc range ({LIBC_RANGE >> 30} GiB) filled up and an allocator "
                            f"fell back to memory outside it ({_shim.rangemalloc_stats().decode()})")
-    # containers the worker built in pre-fork blocks (a freelist handed them out): copied into the
-    # range, every in-range pointer to them rewritten, until none is left
-    foreign = _foreign_key_dicts([glbls[k] for k in names if k in glbls], rng)
+    defs = {k: id(glbls[k]) for k in names if k in glbls}
+    # dicts reached from the defines whose key table is a pre-fork block (a freelist handed it out,
+    # or a split table shares a pre-fork type's): given a key table in the range, keeping identity
+    foreign = foldalloc.walk_foreign(rng, list(defs.values()))
     if foreign:
         foldalloc.rekey(foreign)
-        notes.append(f"{len(foreign)} dict(s) re-keyed: their key tables were reused pre-fork blocks")
-    defs = {k: id(glbls[k]) for k in names if k in glbls}
+        notes.append(f"{len(foreign)} dict(s) re-keyed: their key tables were pre-fork blocks")
+    del foreign  # a reference to a define from this frame would be dumped as one the root cannot drop
     if os.environ.get("MOTABI_AUDIT"):
         cls: dict[str, int] = {}
         shown = 0
@@ -434,23 +394,22 @@ def worker_export(rng: int, glbls: Any, names: set[str], path: str) -> list[str]
                         extra_info = f" module {r['__name__']!r} in sys.modules={mod is not None} same dict={mod is not None and vars(mod) is r} module tabled={mod is not None and foldalloc.table_entry(id(mod)) is not None} module inrange={mod is not None and foldalloc.inrange(id(mod))}"
                     notes.append(f"audit: {type(o).__name__} -> untabled {type(r).__name__} @{ra:#x} tracked={gc.is_tracked(r)}{extra_info}")
         notes.append(f"audit: referents of this range's objects {cls}")
-    extra = _untabled_references(rng)
-    # Everything that allocates comes first. The list of the worker's tracked objects, the
-    # counts it reports and the dumps are one C call that runs no Python code, so no other
-    # thread of the worker (marimo's completion engine, a library pool) runs in between: an
-    # object made or freed then would reach the root miscounted. The worker never untracks:
-    # the root drops the list links before tracking (foldalloc.track).
+    # Everything that allocates comes first. The walk from the defines, the lists it yields and
+    # the dumps are one C call that runs no Python code, so no other thread of the worker
+    # (marimo's completion engine, a library pool) runs in between: an object made or freed then
+    # would reach the root miscounted. The worker never untracks: the root drops the list links
+    # before tracking (foldalloc.track) and leaves unreached objects untracked (foldalloc.leave).
     lo, hi = ctypes.c_size_t(), ctypes.c_size_t()
     if _shim is not None:
         _shim.rangemalloc_spans(rng, ctypes.byref(lo), ctypes.byref(hi))
     gc.disable()
-    tracked, deltas, keys, n, libc_bytes = foldalloc.export_tail(
-        rng, RANGES + rng if _shim is not None else -1, lo.value, hi.value, path + ".bin", path + ".libc")
+    reached, tracked, leftover, deltas, extra, demote, keys, n, libc_bytes = foldalloc.export_tail(
+        rng, RANGES + rng if _shim is not None else -1, lo.value, hi.value, path + ".bin", path + ".libc", list(defs.values()))
     if _shim is not None:
         notes.append(f"libc range: {lo.value >> 20} MB of extents, {hi.value >> 20} MB of mappings, {libc_bytes >> 20} MB touched")
     with open(path + ".tmp", "wb") as f:
-        pickle.dump({"bytes": n, "libc_bytes": libc_bytes, "defs": defs, "tracked": tracked, "deltas": deltas,
-                     "keys": keys, "extra": extra, "notes": notes}, f)
+        pickle.dump({"bytes": n, "libc_bytes": libc_bytes, "defs": defs, "reached": reached, "tracked": tracked, "leftover": leftover,
+                     "deltas": deltas, "extra": extra, "demote": demote, "keys": keys, "notes": notes}, f)
     os.rename(path + ".tmp", path)
     return notes
 
@@ -552,16 +511,18 @@ def bind(m: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         shadowed += _shadow(o)
 
     for k, o in ns.items():
-        foldalloc.release(o)  # the worker's own globals binding lived in a discarded page
+        if foldalloc.inrange(id(o)) >= 0:
+            foldalloc.release(o)  # the worker's own globals binding lived in a discarded page
         shadow(o)
         ns[k] = _uncarry(o, shadow)
     applied, skipped = m["applied"]
     extra, extra_skipped = m["extra_applied"]
-    return ns, {"bytes": m["bytes"], "libc_bytes": m["libc_bytes"], "defs": len(ns), "tracked": len(m["tracked"]),
+    return ns, {"bytes": m["bytes"], "libc_bytes": m["libc_bytes"], "defs": len(ns), "reached": len(m["reached"]),
+                "tracked": len(m["tracked"]), "leftover": len(m["leftover"]),
                 "deltas": len(m["deltas"]), "applied": applied, "skipped": skipped, "dead": foldalloc.dead(),
                 "keys": f"{m['keys_applied']} of {len(m['keys'])}",
                 "extra": f"{extra} on {len(m['extra'])} untabled, {extra_skipped} skipped",
-                "shadowed": shadowed, "notes": m["notes"]}
+                "demoted": m["demoted"], "shadowed": shadowed, "notes": m["notes"]}
 
 
 def root_import(rng: int, path: str, log: Callable[[str], None] = lambda s: None) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -573,12 +534,8 @@ def root_import(rng: int, path: str, log: Callable[[str], None] = lambda s: None
     foldalloc.import_file(rng, path + ".bin", m["bytes"])
     if m["libc_bytes"] or os.path.exists(path + ".libc"):
         foldalloc.import_spans(RANGES + rng, path + ".libc")
-    m["applied"] = foldalloc.apply_deltas(m["deltas"])
-    m["keys_applied"] = foldalloc.apply_keys(m["keys"])  # before anything walks an imported object's attributes
-    m["extra_applied"] = foldalloc.apply_extra(m["extra"])
-    for a in m["tracked"]:
-        foldalloc.track(ctypes.cast(a, ctypes.py_object).value)
-    log("re-tracked")
+    foldalloc.replay_manifest(m)  # counts, key tables, untabled references, demotions, GC heads
+    log("replayed")
     return bind(m)
 
 
