@@ -21,7 +21,9 @@ Runs:
   `../../scatter-libs/bench_home.py` is the allocator-only part of the same question.
 
 Follow-up (2026-10-20, later): the shim also interposes `mmap`, `mmap64`, `munmap`, `mremap`
-(see the header comment). Three more drivers: `run_gv_offsets.sh` (do pages keep their file
+(see the header comment); an anonymous private `mmap` with an address but without `MAP_FIXED` is a
+hint and is diverted like any other (mimalloc always passes one). `RANGEMALLOC_ZERO_FREE=1`
+zeroes blocks freed at home. Three more drivers: `run_gv_offsets.sh` (do pages keep their file
 offset in `pages.img` across a restore?), `run_gv_conflict.sh <shim> [SEQUENCE=1]` (two workers
 restored from one checkpoint, each checkpointed after building, page images diffed against the
 root's), and `../../scatter-libs/conflict_host.py` for the same question on the host with

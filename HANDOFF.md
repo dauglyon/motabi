@@ -147,9 +147,14 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
    the host alike), so discarding pre-fork pages is the only consistent rule. A second pass the
    same day: the exit crash was the harness's export order (fixed; `fold.py` had it right), numpy
    joins whole once the worker drains its dims cache, Arrow tables with a second define join
-   10 of 10, polars' data is placed once its jemalloc runs with `retain:false` but two of its type
-   objects come from Rust's allocator and stay broken, and reclamation is a conservative pointer
-   scan that is proven to see a live native view. All of it in `docs/scatter-research.md`. The shim lives in
+   10 of 10, and reclamation is a conservative pointer scan that is proven to see a live
+   native view. A third pass: the polars "Rust types" were pyarrow's static types, loaded in the
+   worker by the harness; switching each bundled allocator to a fresh arena or heap inside the
+   worker (jemalloc `thread.arena`, mimalloc `mi_theap_set_default` with arena allocation
+   disallowed, both called by symbol address) and ignoring `mmap` address hints in the shim makes
+   every measured library join whole: numpy, torch, Arrow on both pools, polars, 30 of 30 runs
+   with drop and reclaim. Open: the switches are per thread, and pool threads alive at a gVisor
+   restore keep their old arenas. All of it in `docs/scatter-research.md`. The shim lives in
    `experiments/fold/rangemalloc/`; the launcher passes `MOTABI_LD_PRELOAD` into the sandbox.
    `motabi/npdivert.c` stays **disabled** (`MOTABI_NPDIVERT=1`): unnecessary on NumPy 2 and it
    breaks reload.

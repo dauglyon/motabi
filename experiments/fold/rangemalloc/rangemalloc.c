@@ -242,14 +242,15 @@ void *pvalloc(size_t n){ return do_malloc((n + 4095) & ~(size_t)4095, 4096); }
    The backing allocators take the bottom of the range upward; diverted mmaps take the top of the
    range downward, so the two never meet until the range is full. */
 static void *(*h_mmap)(void *, size_t, int, int, int, off_t); static int (*h_munmap)(void *, size_t); static void *(*h_mremap)(void *, size_t, size_t, int, ...);
-static void init_mm(void){ if (h_mmap) return; h_mmap = dlsym(RTLD_NEXT, "mmap"); h_munmap = dlsym(RTLD_NEXT, "munmap"); h_mremap = dlsym(RTLD_NEXT, "mremap"); }
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
 #endif
+static void init_mm(void){ if (h_mmap) return; h_mmap = dlsym(RTLD_NEXT, "mmap"); h_munmap = dlsym(RTLD_NEXT, "munmap"); h_mremap = dlsym(RTLD_NEXT, "mremap"); }
 void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off){
   init_mm();
   int c = atomic_load(&cur);
-  if (c < 0 || addr || fd >= 0 || !(flags & MAP_ANONYMOUS) || !(flags & MAP_PRIVATE) || (flags & MAP_FIXED)) { atomic_fetch_add(&n_mmap_pass, 1); return h_mmap(addr, len, prot, flags, fd, off); }
+  /* an address without MAP_FIXED is only a hint (mimalloc always passes one): it is ignored and the mapping diverted */
+  if (c < 0 || fd >= 0 || !(flags & MAP_ANONYMOUS) || !(flags & MAP_PRIVATE) || (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE))) { atomic_fetch_add(&n_mmap_pass, 1); return h_mmap(addr, len, prot, flags, fd, off); }
   Range *r = &R[c]; size_t align = len >= (2u << 20) ? (2u << 20) : 4096;      /* big requests get THP-friendly alignment */
   pthread_mutex_lock(&lk);
   uintptr_t top = (uintptr_t)r->base + r->size - r->mbump;

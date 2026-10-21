@@ -81,6 +81,10 @@ def polars_addrs(df):
 
 
 def polars_check(df):
+    try:
+        inner = object.__getattribute__(df, "_df")
+    except AttributeError as e:
+        return False, f"_df slot unreadable: {e}; type={type(df).__name__} mro={[c.__name__ for c in type(df).__mro__][:3]}"
     n = df.height
     s = int(df.get_column("x").sum()) if n == N else None
     return n == N and s == SUM, f"rows={n} sum={'ok' if s == SUM else s}"
@@ -98,7 +102,9 @@ WARM = {  # a different shape from make(), so a pre-fork cached buffer read in t
     "numpy": lambda: __import__("numpy").arange(12, dtype="int64").reshape(3, 4).sum(),
     "torch": lambda: __import__("torch").arange(12, dtype=__import__("torch").int64).reshape(3, 4).sum(),
     "pyarrow": lambda: __import__("pyarrow.compute").compute.add(__import__("pyarrow").array([1, 2, 3]), 0),
-    "polars": lambda: (__import__("polars").int_range(0, 12, eager=True).sum(), __import__("polars").DataFrame({"x": [1, 2, 3]}).height),
+    # polars_addrs calls to_arrow(), which imports pyarrow: do that at home, or the worker loads a C
+    # extension the root never has (its static types live in the .so's data pages)
+    "polars": lambda: (__import__("polars").int_range(0, 12, eager=True).sum(), __import__("polars").DataFrame({"x": [1, 2, 3]}).get_column("x").to_arrow()),
 }
 
 

@@ -338,6 +338,65 @@ too, which `_RJEM_MALLOC_CONF` cannot do.
 - Reclamation: a conservative scan with known exclusions; the scan is proven to see a live native
   view and to lose it when the view dies.
 
+### Third follow-up: every measured library joins whole
+
+Same day. Two findings closed the two libraries that were still failing, and one shim fix
+underlies both.
+
+**The polars "Rust-allocated type" was pyarrow, loaded by the harness.** The two type objects
+were `pyarrow.lib._PandasAPIShim` and `pyarrow.lib.__pyx_defaults`, static types in pyarrow's
+shared object. The worker had loaded that library because the harness calls `to_arrow()` on the
+frame to learn its buffer address; the root never had it, so those addresses held other data. This
+is the known hole, a C extension first imported inside a worker, and it was found by reading the
+type's `tp_name` through the type slot inside the worker. With pyarrow imported at home the two
+stale objects are gone.
+
+**Allocators that keep pre-fork space are switched, per thread, after the restore.** The remaining
+polars and Arrow failures were reuse of pre-fork slabs and pages by their bundled allocators. Both
+allocators can be told, from inside the worker, to stop doing that:
+
+- polars' jemalloc: `mallctl("arenas.create")` then `mallctl("thread.arena", new)` and
+  `thread.tcache.flush`. The symbol is local, not exported, so it is called by address (its offset
+  from `nm` plus the library's load base). A fresh arena has no slabs, so every allocation needs a
+  new extent, which is an `mmap`, which the shim places. `retain:false` is then unnecessary.
+- Arrow's mimalloc (v3, hidden symbols, same method): `mi_option_set(disallow_arena_alloc, 1)`,
+  the three page-reclaim options to 0, then `mi_heap_new`, `mi_heap_theap`,
+  `mi_theap_set_default`. A fresh thread heap has no retained pages; with arena allocation
+  disallowed and reclaim off, every page is a fresh OS mapping.
+
+**The shim was passing those mappings through.** mimalloc always calls `mmap` with an address
+hint; the shim treated any address as a request to honour and passed it to the kernel. A hint
+without `MAP_FIXED` is advisory, so the shim now ignores it and diverts. This is what made the
+mimalloc switch effective; the plain-process test (`/tmp/mi_switch.py`, strace) showed the 8 MB
+pages arriving as `mmap(0x502…, 8388608, …)` with a hint into mimalloc's reserved region.
+
+**The regression matrix**, final shim, `--sequence` (a same-sized object freed at home first, the
+case that defeats placement), `--shadow` (drop without destructor, release by scan), 3 runs each,
+pass = correct values, clean drop, ranges released, clean churn and exit:
+
+| target (worker-side setting) | jemalloc shim | mimalloc shim |
+|---|---|---|
+| numpy (dims cache drained) | 3/3 | 3/3 |
+| torch CPU tensor | 3/3 | 3/3 |
+| Arrow table, system pool | 3/3 | 3/3 |
+| Arrow table, default (mimalloc) pool, mimalloc switched | 3/3 | 3/3 |
+| polars frame, jemalloc arena switched | 3/3 | 3/3 |
+
+**What this says about the mechanism.** The join over native objects is: place new memory (the
+shim, for libc and `mmap`), keep every bundled allocator from reusing pre-fork space (one switch
+per allocator family, jemalloc and mimalloc cover the libraries measured; glibc needs none since
+the shim is in front of it; CPython's own caches need the per-type drain numpy showed), never run
+an imported object's destructor (shadow types), and reclaim by conservative scan. Each piece is
+generic in shape and per-library in its one constant (which allocator, which cache).
+
+**Open after this round.** The switches are per thread. In the gVisor restore every thread
+survives, and a library's own pool threads (rayon, OpenMP) keep their old arenas and heaps; what
+they allocate after the restore is in pre-fork space. Whether that matters depends on whether a
+define's memory is ever allocated on such a thread; it was not measured here. A worker that dies
+with an exception must not run interpreter finalisation (pool threads are gone after `os.fork`;
+the harness now exits hard). The two switches are driven by symbol offsets read from `nm`, which
+an environment image can precompute but which is tied to the exact wheel.
+
 ### Alternatives met on the way
 
 - **Restore worker 0 as the new root.** For a fork with one branch (2.4 with a single worker) the
@@ -418,6 +477,6 @@ between that and scatter over real data: allocators that reserved address space 
 and keep serving from it (Arrow's default pool, polars after any warm-up), numpy's cache of
 pre-fork buffers, polars' type objects landing in pre-fork free space, and reclamation of a range
 that home-made native views may still point into. Two workers restored from one checkpoint dirty
-the same pre-fork pages, so discarding them is the only consistent rule. numpy, torch and Arrow
-tables (system pool) now join whole and can be dropped and reclaimed; polars is one Rust-allocated
-type object away. The per-type check is the gate; the shim is the placement mechanism under it.
+the same pre-fork pages, so discarding them is the only consistent rule. numpy, torch, Arrow tables on
+either pool and polars frames now join whole and can be dropped and reclaimed, each with one
+worker-side setting (a cache drain, or a fresh arena or heap in the library's bundled allocator). The per-type check is the gate; the shim is the placement mechanism under it.

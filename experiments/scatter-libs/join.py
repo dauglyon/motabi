@@ -60,6 +60,7 @@ if SHIM:
     idx = shim.rangemalloc_register(bases[1], RANGE); assert idx == 0, idx
 gc.collect()
 prefork_types = {id(t): f"{t.__module__}.{t.__name__}" for t in gc.get_objects() if isinstance(t, type)}   # to name a type that is gone after the join
+PREFORK_TYPES = set(prefork_types)
 glbls = {"__name__": "nb"}
 n = foldalloc.snapshot(gc.get_objects() + [glbls, sys.modules]); gc.freeze(); gc.collect()
 say(f"snapshot: {n} pre-fork objects, shim={'yes' if SHIM else 'no'}")
@@ -67,11 +68,47 @@ say(f"snapshot: {n} pre-fork objects, shim={'yes' if SHIM else 'no'}")
 r, w = os.pipe(); r2, w2 = os.pipe()
 pid = os.fork()
 if pid == 0:
+    import traceback
+    sys.excepthook = lambda *a: (traceback.print_exception(*a), sys.stderr.flush(), os._exit(3))   # a dying worker must not run finalisation (library thread pools are gone after fork)
     os.close(r); os.close(w2)
     foldalloc.use_range(0)
     if SHIM:
         rc = shim.rangemalloc_use(0)
         if rc: print(lib, f"FAIL rangemalloc_use returned {rc} (backing could not open the range)", flush=True); os._exit(3)
+    if "--rust-arena" in sys.argv:
+        # polars' bundled jemalloc keeps mallctl as a local symbol: call it by address (static symbol
+        # offset from nm plus the library's load base) to give this thread a fresh arena, so new Rust
+        # allocations come from new extents (mmap, diverted) instead of pre-fork slabs
+        import _polars_runtime_32, glob, subprocess
+        so = glob.glob(os.path.dirname(_polars_runtime_32.__file__) + "/*.so")[0]
+        off = int(next(l for l in subprocess.run(["nm", so], capture_output=True, text=True).stdout.splitlines() if l.endswith(" t _rjem_mallctl") or l.endswith(" T _rjem_mallctl")).split()[0], 16)
+        base = min(lo for lo, hi, name in maps.mappings() if name == so)
+        MALLCTL = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t)
+        mallctl = MALLCTL(base + off)
+        ind = ctypes.c_uint(0); sz = ctypes.c_size_t(4)
+        rc1 = mallctl(b"arenas.create", ctypes.byref(ind), ctypes.byref(sz), None, 0)
+        rc2 = mallctl(b"thread.arena", None, None, ctypes.byref(ind), 4)
+        rc3 = mallctl(b"thread.tcache.flush", None, None, None, 0)
+        say(f"rust arena: arenas.create -> {rc1} (arena {ind.value}), thread.arena -> {rc2}, tcache.flush -> {rc3}")
+    if "--arrow-mi" in sys.argv:
+        # Arrow's bundled mimalloc (v3, hidden symbols): set disallow_arena_alloc (option 26 in this build)
+        # at runtime so new allocations stop coming from the arena it reserved before the fork and go
+        # to fresh OS mappings, which the shim places in the range
+        import pyarrow, glob, subprocess
+        so = glob.glob(os.path.dirname(pyarrow.__file__) + "/libarrow.so.*")[0]
+        syms = subprocess.run(["nm", so], capture_output=True, text=True).stdout.splitlines()
+        off = lambda name: int(next(l for l in syms if l.endswith(" t " + name) or l.endswith(" T " + name)).split()[0], 16)
+        base = min(lo for lo, hi, name in maps.mappings() if name == so)
+        mi_option_set = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_long)(base + off("mi_option_set"))
+        mi_option_set(26, 1)
+        mi_option_set(41, 0); mi_option_set(42, 0); mi_option_set(35, 0)   # page_max_reclaim, page_cross_thread_max_reclaim, page_reclaim_on_free: never take an abandoned pre-fork page
+        # a fresh heap for this thread: no retained pages from before the fork, so every page it needs
+        # is new, and with arena allocation disallowed, new means a fresh OS mapping
+        mi_heap_new = ctypes.CFUNCTYPE(ctypes.c_void_p)(base + off("mi_heap_new"))
+        mi_heap_theap = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p)(base + off("mi_heap_theap"))
+        mi_theap_set_default = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p)(base + off("mi_theap_set_default"))
+        heap = mi_heap_new(); theap = mi_heap_theap(heap); old = mi_theap_set_default(theap)
+        say(f"arrow mimalloc: disallow_arena_alloc set; new heap {heap:#x}, theap {theap:#x} is the thread default (was {old:#x})")
     if drain:
         import numpy as np
         held = [np.empty((1,) * nd, dtype=np.int8) for nd in range(1, 17) for _ in range(7)]   # 7 cached buffers per dims bucket (alloc.c NCACHE)
@@ -94,6 +131,21 @@ if pid == 0:
     stats = shim.rangemalloc_stats().decode() if SHIM else ""
     fstats = foldalloc.stats()
     big = []; foreign_types = {}
+    def words_at(tag):   # raw words at given range offsets, no object is touched
+        if os.environ.get("STALE_OFFS"):
+            for off in os.environ["STALE_OFFS"].split(","):
+                a = bases[0] + int(off, 16); w = [ctypes.c_uint64.from_address(a + 8 * i).value for i in range(4)]
+                say(f"worker words at +{off} [{tag}]: {[hex(x) for x in w]}; word1 in range {foldalloc.inrange(w[1])}, in prefork types {w[1] in PREFORK_TYPES}")
+                if tag == "after make" and w[1]:
+                    X = w[1]; mp_w2 = maps.mappings(); xw = [ctypes.c_uint64.from_address(X + 8 * i).value for i in range(5)]
+                    name = ctypes.string_at(xw[3], 60).split(b"\0")[0] if xw[3] > 0x10000 else b"?"
+                    say(f"worker: type slot {X:#x} is in {maps.label(X, mp_w2, ranges)}; its words (refcnt, type, size, tp_name ptr, basicsize) {[hex(x) for x in xw]}; tp_name={name!r}; metatype in prefork types {xw[1] in PREFORK_TYPES} ({prefork_types.get(xw[1], '?')})")
+    words_at("after make")
+    if os.environ.get("STALE_OFFS"):   # types that exist in the worker but did not before the fork
+        mp_w = maps.mappings(); new_types = [t for t in gc.get_objects() if isinstance(t, type) and id(t) not in PREFORK_TYPES]
+        for t in [t for t in new_types if not maps.label(id(t), mp_w, ranges).startswith("range")][:12]:
+            say(f"worker new type {t.__module__}.{t.__name__} @{id(t):#x} label={maps.label(id(t), mp_w, ranges)} metatype={type(t).__name__} basicsize={t.__basicsize__} flags_heap={bool(t.__flags__ & (1 << 9))}")
+        say(f"worker: {len(new_types)} new type(s)")
     names = {}
     if "--types" in sys.argv:   # what each range object was in the worker, for the root to name a stale one
         mp_w = maps.mappings()
@@ -102,7 +154,9 @@ if pid == 0:
     tracked = []
     for o in gc.get_objects():
         if foldalloc.inrange(id(o)) >= 0: foldalloc.untrack(o); tracked.append(id(o))
+    words_at("after tracked list")
     deltas = foldalloc.export_deltas()
+    words_at("after deltas, before dump")
     n_dump = foldalloc.dump_range(0, "/tmp/join-range0.bin")
     payload = pickle.dumps((n_dump, defs, tracked, deltas, placed, runs1, stats, fstats, names))
     os.write(w, struct.pack("I", len(payload)) + payload); os.read(r2, 1); os._exit(0)
@@ -119,7 +173,15 @@ def modcheck(tag):
     if "--modscan" in sys.argv:
         bad = foldalloc.dict_check(sys.modules); say(f"modcheck[{tag}]: {len(bad)} bad key(s)" + (f" first value={getattr(ctypes.cast(bad[0][3], ctypes.py_object).value, '__name__', '?')}" if bad and bad[0][4] else ""))
 modcheck("before import")
+def root_words(tag):
+    if os.environ.get("STALE_OFFS"):
+        for off in os.environ["STALE_OFFS"].split(","):
+            a = bases[0] + int(off, 16); w = [ctypes.c_uint64.from_address(a + 8 * i).value for i in range(4)]
+            with open("/tmp/join-range0.bin", "rb") as f:
+                f.seek(int(off, 16)); fw = struct.unpack("<4Q", f.read(32))
+            say(f"root words at +{off} [{tag}]: memory {[hex(x) for x in w]} file {[hex(x) for x in fw]}")
 foldalloc.import_file(0, "/tmp/join-range0.bin", used)
+root_words("after import_file")
 if SHIM:
     foldalloc.import_range(1, pid, 0)  # mprotect only
     fd = os.open(f"/proc/{pid}/mem", os.O_RDONLY); copied = 0
@@ -129,9 +191,9 @@ if SHIM:
     say(f"shim range: {len(runs1)} resident runs, {copied >> 10} kB copied; worker shim stats: {shim_stats}")
 os.write(w2, b"x"); os.waitpid(pid, 0)
 say(f"worker placed: {placed}; python range {used >> 10} kB; foldalloc {fstats}")
-modcheck("after import, before deltas")
+modcheck("after import, before deltas"); root_words("after range1 copy")
 applied, skipped = foldalloc.apply_deltas(deltas)
-modcheck("after deltas")
+modcheck("after deltas"); root_words("after deltas")
 say(f"deltas applied; re-tracking {len(tracked)} objects")
 stale_ids = []
 for a in tracked:
@@ -139,6 +201,7 @@ for a in tracked:
 if stale_ids:
     mp_r = maps.mappings()
     for a in stale_ids[:3]:
+        say(f"re-track: stale id {a:#x} is at offset {a - bases[0]:#x} in range0 (base {bases[0]:#x}); in_range says {foldalloc.inrange(a)}")
         tx = ctypes.c_void_p.from_address(a + 8).value or 0
         alive = any(id(t) == tx for t in gc.get_objects() if isinstance(t, type))
         say(f"re-track: stale {a:#x}: type slot {tx:#x} was pre-fork type {prefork_types.get(tx, 'NOT A TYPE at snapshot')}; a type object at that address is {'still alive' if alive else 'gone'} in the root now; its memory is {maps.label(tx, mp_r, ranges)}")
@@ -159,6 +222,8 @@ def shadow_it(o):
         if t.__module__.startswith("torch"):   # results of ops on the shadow stay plain tensors, so no new instance is ever made at home
             import torch; ns["__torch_function__"] = torch._C._disabled_torch_function_impl
         sub = type(t.__name__ + "Imported", (t,), ns); foldalloc.shadow_type(sub); _shadows[t] = sub
+    if t.__dictoffset__ == -1:   # managed dict: its split values are read through the TYPE's cached keys, so make a real dict first
+        vars(o)
     foldalloc.shadow(o, _shadows[t])
 if shadow:
     for o in bound.values(): shadow_it(o)
