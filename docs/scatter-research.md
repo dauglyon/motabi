@@ -628,3 +628,43 @@ that home-made native views may still point into. Two workers restored from one 
 the same pre-fork pages, so discarding them is the only consistent rule. numpy, torch, Arrow tables on
 either pool and polars frames now join whole and can be dropped and reclaimed, each with one
 worker-side setting (a cache drain, or a fresh arena or heap in the library's bundled allocator). The per-type check is the gate; the shim is the placement mechanism under it.
+
+## GPU note: how the kernel lets go of the GPU and takes it back (2026-10-21)
+
+Measured on a workstation with an RTX 3060, driver 570.86.16, gVisor release-20261012.0 run as
+`runsc --nvproxy-driver-version=570.86.15 --nvproxy-allow-unsupported-driver` (no ABI table for
+the exact driver), torch 2.11.0+cu128. Question: a kernel uses a GPU on a leg, restores on a
+host with no NVIDIA device, keeps working, and uses a GPU again on a later leg, in one process.
+
+What gVisor requires. A checkpoint refuses a process that maps `/dev/nvidia*` ("Can't save pma
+with non-MemoryFile"). A restore reopens every saved device file and refuses when the restore
+sandbox has fewer devices than the checkpoint ("can't remap 1 saved devices to 0 restored
+devices"); its spec validation wants the same device list (`--restore-spec-validation=ignore`
+turns that off) and the gofer binds every spec device from the host at restore, so a GPU-less
+restore needs a spec with no devices plus `--nvproxy` so the driver proxy still registers.
+
+What works: the driver's own process checkpoint, called by the kernel on itself. After
+`cuCheckpointProcessLock` and `cuCheckpointProcessCheckpoint` (the same calls NVIDIA's
+`cuda-checkpoint --toggle` makes) the process holds no device file and no device mapping, a
+plain sandbox checkpoint succeeds, and a device-less restore returns 0; CPU work continues. On a
+later restore with devices, `cuCheckpointProcessRestore` and `Unlock` bring device memory back
+at the same addresses: tensors keep their values, a matrix product matches, cuBLAS continues.
+Three GPU legs and two GPU-less homes in one process. Each direction takes under a second for
+small working sets; the image grows by the resident device memory. A CUDA call made while
+checkpointed blocks, and a blocked device count or synchronize crashes the process when CUDA
+resumes, which is why DESIGN 2.7 guards CUDA off at home.
+
+What does not work. Closing the driver's files and unmapping its mappings by hand lets the
+process restore GPU-less, but on the next GPU leg the driver answers "busy or unavailable"
+from that process while a fresh process in the same sandbox sees the GPU: libcuda's in-process
+state is dead and nothing re-initialises it (a second cuInit, torch's re-init, dlclose, a second
+copy of libcuda all fail). gVisor's `runsc checkpoint --cuda-checkpoint-path` restores GPU to
+GPU with tensors intact but records the device list before the driver checkpoint runs
+(`runsc/boot/restore.go`, the remap metadata is written before the save reaches the CUDA
+pre-save), so its image restores only with a GPU. The legacy `--nvproxy` flag without spec
+devices creates no device nodes at all; hook mode needs nvidia-container-cli on a rootfs other
+than `/`. A helper process that owns the GPU and dies on the leg works but changes what the
+user writes (no `device="cuda"` in the kernel) and is the fallback, not the design.
+
+Untested: restore on a different GPU model (NVIDIA documents a matching chip type), several
+GPUs, NCCL, a long time checkpointed, Triton and torch.compile caches.
