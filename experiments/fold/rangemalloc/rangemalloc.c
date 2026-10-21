@@ -207,10 +207,16 @@ size_t malloc_usable_size(void *p){
   int ri = in_range(p); if (ri >= 0) return hdr(p)->size;
   init_home(); return HOME_USABLE(p);
 }
+/* RANGEMALLOC_ZERO_FREE=1: a block freed at home is zeroed first, so a later conservative scan for
+   pointers into a range does not find stale ones in dead heap memory */
+static int zero_free = -1;
 void free(void *p){
   if (!p || in_boot(p)) return;
   int ri = in_range(p); if (ri >= 0) { range_free(ri, p); return; }
-  init_home(); HOME_FREE(p);
+  init_home();
+  if (zero_free < 0) { const char *e = getenv("RANGEMALLOC_ZERO_FREE"); zero_free = e && *e == '1'; }
+  if (zero_free) memset(p, 0, HOME_USABLE(p));
+  HOME_FREE(p);
 }
 void *realloc(void *p, size_t n){
   if (!p) return malloc(n);

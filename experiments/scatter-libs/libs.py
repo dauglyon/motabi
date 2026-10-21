@@ -98,7 +98,7 @@ WARM = {  # a different shape from make(), so a pre-fork cached buffer read in t
     "numpy": lambda: __import__("numpy").arange(12, dtype="int64").reshape(3, 4).sum(),
     "torch": lambda: __import__("torch").arange(12, dtype=__import__("torch").int64).reshape(3, 4).sum(),
     "pyarrow": lambda: __import__("pyarrow.compute").compute.add(__import__("pyarrow").array([1, 2, 3]), 0),
-    "polars": lambda: __import__("polars").int_range(0, 12, eager=True).sum(),
+    "polars": lambda: (__import__("polars").int_range(0, 12, eager=True).sum(), __import__("polars").DataFrame({"x": [1, 2, 3]}).height),
 }
 
 

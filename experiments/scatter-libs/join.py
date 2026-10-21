@@ -15,6 +15,8 @@ lib = sys.argv[1]; use_thread = "--thread" in sys.argv; keep = "--keep" in sys.a
 shadow = "--shadow" in sys.argv    # step 1: imported native objects never run their destructor
 two = "--two" in sys.argv          # a second define over the same native graph (a column of the table)
 no_release = "--no-release" in sys.argv   # drop the defines but keep the ranges mapped
+view = "--view" in sys.argv          # a home-made native view of the import is alive at the first scan, dropped before the second
+drain = "--drain-numpy" in sys.argv   # the worker empties numpy's dims cache right after the switch
 sequence = "--sequence" in sys.argv       # step 3: a same-sized object is made and freed at home first, so free lists hold its blocks
 make, addrs, check = libs.prepare(lib)
 if sequence:
@@ -57,6 +59,7 @@ ranges = [(b, RANGE) for b in bases]
 if SHIM:
     idx = shim.rangemalloc_register(bases[1], RANGE); assert idx == 0, idx
 gc.collect()
+prefork_types = {id(t): f"{t.__module__}.{t.__name__}" for t in gc.get_objects() if isinstance(t, type)}   # to name a type that is gone after the join
 glbls = {"__name__": "nb"}
 n = foldalloc.snapshot(gc.get_objects() + [glbls, sys.modules]); gc.freeze(); gc.collect()
 say(f"snapshot: {n} pre-fork objects, shim={'yes' if SHIM else 'no'}")
@@ -69,6 +72,9 @@ if pid == 0:
     if SHIM:
         rc = shim.rangemalloc_use(0)
         if rc: print(lib, f"FAIL rangemalloc_use returned {rc} (backing could not open the range)", flush=True); os._exit(3)
+    if drain:
+        import numpy as np
+        held = [np.empty((1,) * nd, dtype=np.int8) for nd in range(1, 17) for _ in range(7)]   # 7 cached buffers per dims bucket (alloc.c NCACHE)
     if use_thread:
         box = {}
         t = threading.Thread(target=lambda: box.__setitem__("obj", make())); t.start(); t.join()
@@ -76,30 +82,29 @@ if pid == 0:
     else:
         glbls["obj"] = make()
     placed = {k: maps.label(a, None, ranges) for k, a in addrs(glbls["obj"]).items()}
-    placed["object"] += f" (worker refcount {sys.getrefcount(glbls["obj"]) - 1})"
+    placed["object"] += f" (worker refcount {sys.getrefcount(glbls['obj']) - 1})"
     defs = {"obj": id(glbls["obj"])}
     if two:
         glbls["obj2"] = libs.second(lib, glbls["obj"]); defs["obj2"] = id(glbls["obj2"])
+    # everything that allocates comes first; the GC list, the deltas and the dump of the Python range
+    # are the last steps and nothing runs between them (an object made after the deltas are taken
+    # and before the memory is read would be freed by the root with references the deltas never
+    # counted: that was this harness's bug, found through a dying sys.modules key)
+    runs1 = resident_runs(bases[1], RANGE) if SHIM else []
+    stats = shim.rangemalloc_stats().decode() if SHIM else ""
+    fstats = foldalloc.stats()
+    big = []; foreign_types = {}
+    names = {}
+    if "--types" in sys.argv:   # what each range object was in the worker, for the root to name a stale one
+        mp_w = maps.mappings()
+        for o in gc.get_objects():
+            if foldalloc.inrange(id(o)) >= 0: t = type(o); names[id(o)] = (t.__module__, t.__name__, id(t), foldalloc.inrange(id(t)), foldalloc.is_prefork(id(t)))
     tracked = []
     for o in gc.get_objects():
         if foldalloc.inrange(id(o)) >= 0: foldalloc.untrack(o); tracked.append(id(o))
     deltas = foldalloc.export_deltas()
-    foreign_types = {}
-    for o in gc.get_objects():
-        if foldalloc.inrange(id(o)) >= 0:
-            t = type(o)
-            if foldalloc.inrange(id(t)) < 0 and not foldalloc.is_prefork(id(t)):
-                foreign_types[f"{t.__module__}.{t.__name__}@{id(t):#x}"] = foreign_types.get(f"{t.__module__}.{t.__name__}@{id(t):#x}", 0) + 1
-    if foreign_types: say(f"worker: range objects whose TYPE is neither in a range nor pre-fork: {foreign_types}")
-    big = sorted(deltas, key=lambda ad: -ad[1])[:3]
-    if big and big[0][1] > 1000:
-        def tn(a):
-            try: return type(ctypes.cast(a, ctypes.py_object).value).__name__
-            except Exception as e: return f"?{e}"
-        say(f"worker: largest deltas {[(hex(a), d, tn(a)) for a, d in big]}")
-    runs1 = resident_runs(bases[1], RANGE) if SHIM else []
-    stats = shim.rangemalloc_stats().decode() if SHIM else ""
-    payload = pickle.dumps((foldalloc.used(0), defs, tracked, deltas, placed, runs1, stats, foldalloc.stats()))
+    n_dump = foldalloc.dump_range(0, "/tmp/join-range0.bin")
+    payload = pickle.dumps((n_dump, defs, tracked, deltas, placed, runs1, stats, fstats, names))
     os.write(w, struct.pack("I", len(payload)) + payload); os.read(r2, 1); os._exit(0)
 
 os.close(w); os.close(r2)
@@ -109,8 +114,12 @@ if len(hdr) < 4:
     say(f"FAIL worker died before export (status {status})"); sys.exit(1)
 n = struct.unpack("I", hdr)[0]; data = b""
 while len(data) < n: data += os.read(r, n - len(data))
-used, defs, tracked, deltas, placed, runs1, shim_stats, fstats = pickle.loads(data)
-foldalloc.import_range(0, pid, used)
+used, defs, tracked, deltas, placed, runs1, shim_stats, fstats, names = pickle.loads(data)
+def modcheck(tag):
+    if "--modscan" in sys.argv:
+        bad = foldalloc.dict_check(sys.modules); say(f"modcheck[{tag}]: {len(bad)} bad key(s)" + (f" first value={getattr(ctypes.cast(bad[0][3], ctypes.py_object).value, '__name__', '?')}" if bad and bad[0][4] else ""))
+modcheck("before import")
+foldalloc.import_file(0, "/tmp/join-range0.bin", used)
 if SHIM:
     foldalloc.import_range(1, pid, 0)  # mprotect only
     fd = os.open(f"/proc/{pid}/mem", os.O_RDONLY); copied = 0
@@ -120,10 +129,20 @@ if SHIM:
     say(f"shim range: {len(runs1)} resident runs, {copied >> 10} kB copied; worker shim stats: {shim_stats}")
 os.write(w2, b"x"); os.waitpid(pid, 0)
 say(f"worker placed: {placed}; python range {used >> 10} kB; foldalloc {fstats}")
+modcheck("after import, before deltas")
 applied, skipped = foldalloc.apply_deltas(deltas)
+modcheck("after deltas")
 say(f"deltas applied; re-tracking {len(tracked)} objects")
-for a in tracked: foldalloc.track(ctypes.cast(a, ctypes.py_object).value)
-if foldalloc.track_stale(): say(f"re-track: {foldalloc.track_stale()} id(s) no longer held an object and were skipped")
+stale_ids = []
+for a in tracked:
+    if not foldalloc.track(ctypes.cast(a, ctypes.py_object).value): stale_ids.append(a)
+if stale_ids:
+    mp_r = maps.mappings()
+    for a in stale_ids[:3]:
+        tx = ctypes.c_void_p.from_address(a + 8).value or 0
+        alive = any(id(t) == tx for t in gc.get_objects() if isinstance(t, type))
+        say(f"re-track: stale {a:#x}: type slot {tx:#x} was pre-fork type {prefork_types.get(tx, 'NOT A TYPE at snapshot')}; a type object at that address is {'still alive' if alive else 'gone'} in the root now; its memory is {maps.label(tx, mp_r, ranges)}")
+modcheck("after re-track")
 bound = {k: ctypes.cast(a, ctypes.py_object).value for k, a in defs.items()}
 rc = lambda tag: say(f"refcount[{tag}] {sys.getrefcount(bound['obj']) - 1} tracked={gc.is_tracked(bound['obj'])}")
 rc("bound")
@@ -151,13 +170,18 @@ try:
     ok, detail = check(obj)
 except Exception as e:
     ok, detail = False, f"read raised {type(e).__name__}: {e}"
-say(f"read: {'ok' if ok else 'BAD'} {detail}"); rc("checked")
+say(f"read: {'ok' if ok else 'BAD'} {detail}"); rc("checked"); modcheck("after read")
+if view: homeview = libs.second(lib, obj)   # shares native memory with the import; made at home, so it is a normal object
 if keep:
     say("kept: the define is not dropped")
 else:
     if two:
+        _imp_key = next(k for k in sys.modules if k == "_imp"); _ka = id(_imp_key)
+        def imp_rc(tag): say(f"'_imp' key @{_ka:#x}: refcount {ctypes.c_ssize_t.from_address(_ka).value} type {ctypes.c_void_p.from_address(_ka + 8).value:#x} [{tag}]")
+        imp_rc("before check_second")
         ok2, d2 = libs.check_second(lib, bound["obj2"]); say(f"read obj2: {'ok' if ok2 else 'BAD'} {d2}"); ok = ok and ok2
-        del bound["obj2"]; gc.collect(); say("del obj2 + collect: survived")
+        imp_rc("after check_second")
+        del bound["obj2"]; imp_rc("after del obj2"); gc.collect(); imp_rc("after collect"); say("del obj2 + collect: survived"); modcheck("after obj2 drop")
     if shadow: say(f"before drop: refcount {sys.getrefcount(obj) - 1}, referrers {[type(r).__name__ for r in gc.get_referrers(obj) if r is not bound]}")
     del obj, bound; gc.collect()
     say("del+collect: survived")
@@ -167,10 +191,36 @@ else:
             say("ranges kept (--no-release)")
         elif live == 0:
             before = int(next(l for l in open('/proc/self/status') if l.startswith('VmRSS')).split()[1])
+            if "--modscan" in sys.argv:
+                bad = foldalloc.dict_check(sys.modules)
+                mp_r = maps.mappings()
+                say(f"sys.modules entries that are not objects: {[(repr(k)[:50], hex(ka), 'key:' + maps.label(ka, mp_r, ranges), 'key prefork=' + str(foldalloc.is_prefork(ka)), hex(va), 'value=' + (getattr(ctypes.cast(va, ctypes.py_object).value, '__name__', '?') if vok else 'bad'), 'val:' + maps.label(va, mp_r, ranges)) for k, ka, kok, va, vok in bad]}")
+                # the dict's own storage and the words around the key
+                if bad: ka = bad[0][1]; say(f"words at the key: {[hex(ctypes.c_uint64.from_address(ka + 8 * i).value) for i in range(4)] if maps.label(ka, mp_r, ranges) != 'unmapped' else 'unmapped'}")
+                if bad: say("stopping the module scan here"); 
+            if "--modscan" in sys.argv and not bad:
+                found = []
+                for name, m in list(sys.modules.items()):
+                    print(lib, "modscan:", name, hex(id(m)), "module-in-range", foldalloc.inrange(id(m)), flush=True)
+                    d = getattr(m, "__dict__", None)
+                    if foldalloc.inrange(id(m)) >= 0: found.append(f"sys.modules[{name!r}] itself"); say(f"module into range: {found[-1]}")
+                    if isinstance(d, dict):
+                        if foldalloc.inrange(id(d)) >= 0: found.append(f"{name}.__dict__"); say(f"module dict into range: {found[-1]}")
+                        for k in list(d.keys()):
+                            print(lib, "modscan key:", name, repr(k)[:60], flush=True)
+                            v = d[k]
+                            if foldalloc.inrange(id(v)) >= 0 or foldalloc.inrange(id(k)) >= 0: found.append(f"{name}.{k} -> @{id(v):#x}"); say(f"module entry into range: {found[-1]}")
+                say(f"module entries referencing range objects: {len(found)}")
+            del tracked, deltas, defs, placed, runs1, data, hdr, shim_stats, fstats, names, stale_ids   # the harness's own lists of range addresses
             gc.collect()   # a full collection also clears CPython's freelists, which may hold range blocks
-            for rng in ((0, 1) if SHIM else (0,)):
-                hits = foldalloc.scan_pointers_into(rng)
-                say(f"words pointing into range{rng} from outside: " + (", ".join(f"{name} x{n} (first {w:#x} -> {tg:#x})" for name, n, w, tg in hits) or "none"))
+            def scan(tag):
+                for rng in ((0, 1) if SHIM else (0,)):
+                    hits = [h for h in foldalloc.scan_pointers_into(rng) if not h[0].endswith("foldalloc.cpython-312-x86_64-linux-gnu.so") and h[0] != "[stack]"]
+                    say(f"scan {tag}: words pointing into range{rng}: " + (", ".join(f"{name} x{n} (first {w:#x} -> {tg:#x})" for name, n, w, tg in hits) or "none"))
+            if view:
+                scan("with a home-made view alive"); del homeview; gc.collect(); scan("after the view died")
+            else:
+                scan("before release")
             try:
                 n_in = foldalloc.release_range(0, gc.get_objects())
                 if SHIM: foldalloc.release_range(1, [])
@@ -181,6 +231,17 @@ else:
 junk = [{"i": i} for i in range(200000)]; gc.collect(); del junk
 say("churn: survived")
 verdict = "PASS" if ok else "FAIL"
+if "--modscan" in sys.argv and False:
+    found = []
+    for name, m in list(sys.modules.items()):
+        if foldalloc.inrange(id(m)) >= 0 or foldalloc.inrange(id(name)) >= 0: found.append(f"sys.modules[{name!r}] itself")
+        d = getattr(m, "__dict__", None)
+        if isinstance(d, dict):
+            if foldalloc.inrange(id(d)) >= 0: found.append(f"{name}.__dict__ (the dict)")
+            for k, v in list(d.items()):
+                if foldalloc.inrange(id(v)) >= 0 or foldalloc.inrange(id(k)) >= 0:
+                    found.append(f"{name}.{k} -> @{id(v):#x} in range{foldalloc.inrange(id(v))}"); say(f"module entry into a range: {found[-1]}")
+    say(f"module entries referencing range objects before exit: {found or 'none'}")
 say(f"{verdict} read={'ok' if ok else 'bad'} outside={outside or 'none'}")
 sys.stdout.flush()
 if "--hard-exit" in sys.argv: os._exit(0 if ok else 1)   # skips interpreter finalisation

@@ -35,7 +35,13 @@ Scripts, each printing one line per check prefixed with the library name:
   scan of every writable mapping and an untrack of the worker's objects) once the defines are
   dead; `--two` adds a second define over the same native graph (a column of the table);
   `--sequence` makes and frees a same-sized object at home before the fork so free lists hold its
-  blocks; `--no-release` keeps the ranges mapped; `--c-backtrace` prints a C backtrace on a crash.
+  blocks; `--no-release` keeps the ranges mapped; `--c-backtrace` prints a C backtrace on a crash;
+  `--view` keeps a home-made view of the import alive across the first pointer scan; `--drain-numpy`
+  empties numpy's dims cache in the worker; `--modscan` checks `sys.modules` for dangling entries at
+  each stage; `--types` records each range object's type in the worker. The worker dumps the Python
+  range to `/tmp/join-range0.bin` right after the deltas, before anything else allocates.
+  Environment: `RANGEMALLOC_ZERO_FREE=1` (shim zeroes blocks freed at home),
+  `_RJEM_MALLOC_CONF=retain:false,...` (polars' jemalloc), `ARROW_DEFAULT_MEMORY_POOL=system`.
 - `conflict_host.py [--sequence] libs...`: two workers forked from one parent, soft-dirty bits
   cleared after the fork, the set of pre-fork pages each dirtied read from `/proc/self/pagemap`
   and attributed to its mapping; reports the pages both dirtied.

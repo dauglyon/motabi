@@ -144,8 +144,12 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
    and `mmap` interposition places new mappings but not allocations served from address space
    reserved before the fork (Arrow's default pool always, polars after a warm-up). Two workers
    restored from one checkpoint dirty the same pre-fork pages (16,483 of 16,484, in gVisor and on
-   the host alike), so discarding pre-fork pages is the only consistent rule. Per-type knowledge
-   stays the gate; the shim is placement under it. All of it in `docs/scatter-research.md`. The shim lives in
+   the host alike), so discarding pre-fork pages is the only consistent rule. A second pass the
+   same day: the exit crash was the harness's export order (fixed; `fold.py` had it right), numpy
+   joins whole once the worker drains its dims cache, Arrow tables with a second define join
+   10 of 10, polars' data is placed once its jemalloc runs with `retain:false` but two of its type
+   objects come from Rust's allocator and stay broken, and reclamation is a conservative pointer
+   scan that is proven to see a live native view. All of it in `docs/scatter-research.md`. The shim lives in
    `experiments/fold/rangemalloc/`; the launcher passes `MOTABI_LD_PRELOAD` into the sandbox.
    `motabi/npdivert.c` stays **disabled** (`MOTABI_NPDIVERT=1`): unnecessary on NumPy 2 and it
    breaks reload.

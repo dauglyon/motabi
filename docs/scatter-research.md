@@ -268,6 +268,76 @@ The identical-bytes column suggests a "consensus import" of pages every worker c
 also carry allocator metadata that describes the worker's heap, not the root's, so it is recorded as
 an idea with a known hazard, not tried.
 
+### Second follow-up: making the pieces work
+
+Same day, after the two "unfixable" statements above were challenged: reclamation is not a Python
+question, and the prior cell matters only because it leaves identically addressed free blocks.
+Scripts: `join.py` flags `--view`, `--drain-numpy`, `--sequence`, `--types`, `--modscan`;
+`RANGEMALLOC_ZERO_FREE=1` in the shim.
+
+**The exit crash was the harness, and it is fixed.** The 3-of-30 (later 5-of-5) crashes at
+interpreter exit with two Arrow defines came from the order of the worker's export: the deltas
+were taken, then the manifest was pickled, then the root read the worker's memory. Pickling
+iterates `sys.modules` and makes tuples in blocks whose ids were already in the re-track list; the
+root re-tracked those tuples, its collector freed them, and their references (one to the module
+name `'_imp'`) were decremented without ever having been counted. Found by walking `sys.modules`
+in C without touching entries and watching that key's refcount step by step. With the Python range
+dumped immediately after the deltas, as `motabi/fold.py` already does: Arrow table plus column,
+10 of 10 clean through read, both drops, release, churn and exit, both shims. The same ordering
+fault explains the "stale ids" the root skipped: objects that died after the list was taken.
+
+**numpy joins whole.** The worker, right after the switch, allocates and holds seven arrays of each
+dimension count 1 to 16 (`alloc.c`: 16 buckets of 7), which empties numpy's cache of pre-fork
+buffers; every later array gets dims and strides from `PyMem_Raw*`, in the range. 5 of 5 PASS,
+drop and release included.
+
+**Reclamation is a conservative scan, and the scan works.** With a column of the imported table
+made at home and kept alive, the scan of every writable mapping finds two more words pointing into
+the shim range (the view's `shared_ptr`); they are gone once the view dies. So the question "does
+anything still point into the range" is answerable without the library's help. What the scan also
+finds, and an implementation has to subtract: the GC generation list heads in `_PyRuntime` (the
+re-tracked worker objects; benign), thousands of tagged words in the glibc heap that are the
+backing allocator's own metadata about its arena (the shim allocated them and can mark them), and
+address values the harness itself held in lists. `RANGEMALLOC_ZERO_FREE=1` zeroes blocks freed at
+home so dead heap memory stops contributing; the pymalloc side has no size at free and is not
+zeroed. Precise reclamation is therefore engineering (exclude what the shim and `foldalloc` know
+they own), not an open question.
+
+**Immortalised strings are replayed.** A pre-fork string the worker interned comes back immortal in
+3.12; the delta list now carries it as "immortalise" instead of a 2^32 count, and the root sets the
+immortal refcount.
+
+**Per-allocator startup settings, measured.**
+
+| allocator | setting tried | effect in the worker |
+|---|---|---|
+| polars' jemalloc (tikv, env `_RJEM_MALLOC_CONF`) | `retain:false,dirty_decay_ms:0,muzzy_decay_ms:0` | freed extents are unmapped instead of kept, so after a same-sized frame was freed at home the new frame's data is **in the range** (was outside without it) |
+| Arrow's bundled mimalloc (env `MIMALLOC_*`, confirmed read) | `DISALLOW_ARENA_ALLOC=1` | the worker aborts (SIGABRT) |
+| | `ARENA_RESERVE=1024` (1 MiB) with `PURGE_DELAY=0` | data still outside: the arena is reserved at the first use at home and served from after |
+| | `ARROW_DEFAULT_MEMORY_POOL=system` | the only working setting; it is a startup variable for the environment image |
+
+**polars still fails, for one remaining reason.** With its data placed and its strings replayed, two
+of its 9,290 range objects have type slots pointing at an address that at the snapshot held a
+different, tabled object, that in the worker held a type object (the worker's objects used it), and
+that in the root holds an integer buffer. The type was allocated through a path the free hook and
+the shim never saw, so the old object's death was not recorded and the new type's memory was
+never placed: polars' Rust allocator. Pre-creating the frame class at home did not remove it (the
+same two addresses recur run after run). Not fixed; the direction is to find which pyo3 objects are
+allocated by Rust and either build them all at home before the snapshot or divert Rust's allocator
+too, which `_RJEM_MALLOC_CONF` cannot do.
+
+### Where this leaves the join, revised
+
+- Carried, by evidence, with drop and reclamation: plain Python values; numpy arrays (cache
+  drained in the worker); torch CPU tensors; Arrow tables on the system pool, including a second
+  define over the same table.
+- Needs a startup setting in the environment image: Arrow on the system pool; polars' jemalloc with
+  `retain:false`.
+- Not carried yet: polars (two Rust-allocated type objects); Arrow's default pool (no setting
+  makes its mimalloc give up its pre-fork arena).
+- Reclamation: a conservative scan with known exclusions; the scan is proven to see a live native
+  view and to lose it when the view dies.
+
 ### Alternatives met on the way
 
 - **Restore worker 0 as the new root.** For a fork with one branch (2.4 with a single worker) the
@@ -284,17 +354,16 @@ an idea with a known hazard, not tried.
 
 ### Where this leaves the join
 
-- Carried today, by evidence: plain Python values; torch CPU tensors (placement by the shim, drop
-  by the shadow rule, from any thread, with the range reclaimable).
-- Carried with a condition: Arrow tables on the system pool (values right, drop safe, exit crash in
-  3 of 30 runs with two defines, cause not isolated); any type whose home-made views share native
-  memory with the import cannot have its range reclaimed by Python-level evidence alone.
-- Not carried, by construction: anything served from address space an allocator reserved before
-  the fork (Arrow's default pool, polars after warm-up), unless that allocator can be made to
-  abandon pre-fork space after the restore (Arrow: start with the system pool; mimalloc and
-  jemalloc inside a library: no runtime switch found); numpy until its dims cache is drained or
-  the two buffers are copied at export; polars until its type objects stop landing in pre-fork
-  free space.
+Superseded by "Where this leaves the join, revised" below; kept for the record of what the first
+pass concluded:
+
+- Carried today, by evidence: plain Python values; torch CPU tensors.
+- Carried with a condition: Arrow tables on the system pool (exit crash in 3 of 30 runs with two
+  defines; later traced to the harness's export order and fixed).
+- Not carried: anything served from address space an allocator reserved before the fork unless
+  the allocator can be made to abandon it (polars' jemalloc can, with `retain:false`; Arrow's
+  mimalloc cannot); numpy until its dims cache is drained (done below); polars until its type
+  objects stop landing in pre-fork free space (still open).
 - Not an option: merging pre-fork pages by "only one worker touched it".
 
 A note on what was tried earlier: `motabi/npdivert.c` installed a NumPy data-memory handler that
@@ -349,5 +418,6 @@ between that and scatter over real data: allocators that reserved address space 
 and keep serving from it (Arrow's default pool, polars after any warm-up), numpy's cache of
 pre-fork buffers, polars' type objects landing in pre-fork free space, and reclamation of a range
 that home-made native views may still point into. Two workers restored from one checkpoint dirty
-the same pre-fork pages, so discarding them is the only consistent rule. The per-type check is
-the gate; the shim is the placement mechanism under it.
+the same pre-fork pages, so discarding them is the only consistent rule. numpy, torch and Arrow
+tables (system pool) now join whole and can be dropped and reclaimed; polars is one Rust-allocated
+type object away. The per-type check is the gate; the shim is the placement mechanism under it.

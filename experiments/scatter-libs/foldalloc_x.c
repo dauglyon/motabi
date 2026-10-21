@@ -161,7 +161,10 @@ static PyObject *py_snapshot(PyObject *s, PyObject *seeds){
 /* branch side: (address, delta) for every pre-fork object whose refcount rose */
 static PyObject *py_export_deltas(PyObject *s, PyObject *a){
   PyObject *out = PyList_New(0);
-  for (size_t k = 0; k < tab_n; k++) { if (tab[k].dead) continue; Py_ssize_t d = Py_REFCNT(tab[k].o) - tab[k].rc; if (d > 0) { PyObject *t = Py_BuildValue("(Kn)", (unsigned long long)(uintptr_t)tab[k].o, d); PyList_Append(out, t); Py_DECREF(t); } }
+  for (size_t k = 0; k < tab_n; k++) { if (tab[k].dead) continue;
+    /* experiment: a pre-fork object the worker immortalised (interning does that in 3.12) is replayed as "immortalise", delta -1 */
+    if (_Py_IsImmortal(tab[k].o)) { PyObject *t = Py_BuildValue("(Kn)", (unsigned long long)(uintptr_t)tab[k].o, (Py_ssize_t)-1); PyList_Append(out, t); Py_DECREF(t); continue; }
+    Py_ssize_t d = Py_REFCNT(tab[k].o) - tab[k].rc; if (d > 0) { PyObject *t = Py_BuildValue("(Kn)", (unsigned long long)(uintptr_t)tab[k].o, d); PyList_Append(out, t); Py_DECREF(t); } }
   return out;
 }
 static PyObject *py_apply_deltas(PyObject *s, PyObject *lst){
@@ -170,7 +173,9 @@ static PyObject *py_apply_deltas(PyObject *s, PyObject *lst){
     unsigned long long addr; Py_ssize_t d; if (!PyArg_ParseTuple(PyList_GET_ITEM(lst, k), "Kn", &addr, &d)) return NULL;
     long j = hmap_get((uintptr_t)addr);
     if (j < 0 || tab[j].dead) { skipped++; continue; }   /* not a live snapshotted object in this copy */
-    PyObject *o = (PyObject *)(uintptr_t)addr; if (!_Py_IsImmortal(o)) { Py_SET_REFCNT(o, Py_REFCNT(o) + d); total += d; }
+    PyObject *o = (PyObject *)(uintptr_t)addr;
+    if (d == -1) { if (!_Py_IsImmortal(o)) { Py_SET_REFCNT(o, _Py_IMMORTAL_REFCNT); total++; } continue; }
+    if (!_Py_IsImmortal(o)) { Py_SET_REFCNT(o, Py_REFCNT(o) + d); total += d; }
   }
   return Py_BuildValue("(nn)", total, skipped);
 }
@@ -340,15 +345,34 @@ static PyObject *py_scan_pointers_into(PyObject *s, PyObject *a){
     for (uintptr_t *w = (uintptr_t *)(uintptr_t)a0; (uintptr_t)w < a1; w++) {
       uintptr_t v = *w; if (v >= lo && v < hi) { if (!hits) { first = (uintptr_t)w; target = v; } hits++; }
     }
-    if (hits) { PyObject *t = Py_BuildValue("(sKKK)", n >= 7 ? name : "[anon]", (unsigned long long)hits, (unsigned long long)first, (unsigned long long)target); PyList_Append(out, t); Py_DECREF(t); }
+    if (hits) { PyObject *t = Py_BuildValue("(sKKK)", n >= 7 ? name : "[anon]", (unsigned long long)hits, (unsigned long long)first, (unsigned long long)target); PyList_Append(out, t); Py_DECREF(t);
+      if (hits > 20) { /* a big cluster: show a few targets as offsets into the range, and the span of the words */
+        size_t shown = 0; uintptr_t lastw = 0; fprintf(stderr, "  cluster in %s: offsets", n >= 7 ? name : "[anon]");
+        for (uintptr_t *w = (uintptr_t *)(uintptr_t)a0; (uintptr_t)w < a1; w++) { uintptr_t v = *w; if (v >= lo && v < hi) { if (shown < 6) fprintf(stderr, " %#lx", (unsigned long)(v - lo)); shown++; lastw = (uintptr_t)w; } }
+        fprintf(stderr, " ... words span %#lx-%#lx (%lu KB)\n", (unsigned long)first, (unsigned long)lastw, (unsigned long)((lastw - first) >> 10)); } }
   }
   fclose(f); return out;
+}
+
+/* Walk a dict's entries as borrowed pointers (no INCREF) and report keys/values that are not
+   mapped or whose type slot is not a type: finds a dangling entry without touching it. */
+static int looks_like_object(PyObject *o){ if (((uintptr_t)o & 7) || !is_mapped(o)) return 0; PyTypeObject *t = Py_TYPE(o); if (((uintptr_t)t & 7) || !is_mapped(t) || ((uintptr_t)Py_TYPE(t) & 7) || !is_mapped(Py_TYPE(t))) return 0; return PyType_Check((PyObject *)t); }
+static PyObject *py_dict_check(PyObject *s, PyObject *d){
+  if (!PyDict_Check(d)) { PyErr_SetString(PyExc_TypeError, "dict"); return NULL; }
+  PyObject *out = PyList_New(0); Py_ssize_t pos = 0; PyObject *k, *v;
+  while (PyDict_Next(d, &pos, &k, &v)) {
+    int kok = looks_like_object(k), vok = looks_like_object(v);
+    if (kok && vok) continue;
+    PyObject *t = Py_BuildValue("(OKiKi)", kok ? k : Py_None, (unsigned long long)(uintptr_t)k, kok, (unsigned long long)(uintptr_t)v, vok);
+    PyList_Append(out, t); Py_DECREF(t);
+  }
+  return out;
 }
 /* a C backtrace on SIGSEGV/SIGABRT (no gdb on this machine); Python's faulthandler shows only Python frames */
 static void segv_bt(int sig){ void *buf[64]; int n = backtrace(buf, 64); const char m[] = "\n--- C backtrace ---\n"; write(2, m, sizeof m - 1); backtrace_symbols_fd(buf, n, 2); signal(sig, SIG_DFL); raise(sig); }
 static PyObject *py_c_backtrace(PyObject *s, PyObject *a){ signal(SIGSEGV, segv_bt); signal(SIGABRT, segv_bt); signal(SIGBUS, segv_bt); Py_RETURN_NONE; }
 static PyMethodDef M[] = {
-  {"c_backtrace", py_c_backtrace, METH_NOARGS, ""}, {"track_stale", py_track_stale, METH_NOARGS, ""}, {"scan_pointers_into", py_scan_pointers_into, METH_VARARGS, ""},
+  {"c_backtrace", py_c_backtrace, METH_NOARGS, ""}, {"dict_check", py_dict_check, METH_O, ""}, {"track_stale", py_track_stale, METH_NOARGS, ""}, {"scan_pointers_into", py_scan_pointers_into, METH_VARARGS, ""},
   {"shadow_type", py_shadow_type, METH_O, ""}, {"shadow", py_shadow, METH_VARARGS, ""}, {"shadow_live", py_shadow_live, METH_NOARGS, ""}, {"release_range", py_release_range, METH_VARARGS, ""},
   {"dump_range", py_dump_range, METH_VARARGS, ""}, {"import_file", py_import_file, METH_VARARGS, ""},
   {"release", py_release, METH_O, ""},
