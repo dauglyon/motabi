@@ -181,16 +181,28 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
    got "worker 2 exited without exporting" from the launcher's `runsc state` poll while that
    worker's export landed in the same second (see "noticed" below). Not checked: whether jedi's
    compiled-inference subprocess survives the restore. The relocation pass (copy such containers
-   into the range and rewrite pointers) was not built. (b) The reference
-   walk covers GC-tracked worker objects only. (c) The per-type buffer list has four entries and an
+   into the range and rewrite pointers) was not built. (b) The join's counts on pre-fork objects come from
+   a walk of the exported object graph, not from refcount diffs (2026-10-21, commit 8b58a11; the
+   popped-element case and the walkers' cases are `experiments/scatter-libs/checks/refs.py` and
+   `walk.py`, run as the harness below). (c) The per-type buffer list has four entries and an
    unknown type is carried unchecked. (d) A kernel exit after a scatter still finalises imported
-   objects. (e) The ranges are 4 GiB (Python) and 8 GiB (libc) of address space per worker, 48
-   pairs, not recycled. `motabi/npdivert.c` stays **disabled**.
+   objects. (e) The worker's Python range is a jemalloc arena in the shim, so frees are reused
+   and the dump is sparse (commit 523d9eb; `checks/alloc.py`: a loop allocating and freeing 10 GiB
+   of small objects stays in the range and exports a 14 MB dump). The ranges are 4 GiB (Python)
+   and 8 GiB (libc) of address space per worker, 48 pairs, not recycled (issue 2). `motabi/npdivert.c` stays **disabled**.
 
 2. **Ranges are not recycled.** Each scatter permanently consumes one address range per worker
    from a fixed pool (`RANGES` in `motabi/fold.py`, currently 48). A long session with many
    scatters will exhaust it. The design's intent is that a range is released when everything
-   merged into it has been dropped; that bookkeeping is not built.
+   merged into it has been dropped. An attempt on 2026-10-21 (`experiments/scatter-libs/checks/recycle-attempt.patch`, its test `checks/recycle.py`) counted
+   live imported objects per range and found the blocker: after every gathered value is dropped
+   and collected, pre-fork objects still hold pointers into the range (a 60-scatter run ended
+   "0 free, 48 with no live imported object but still pointed into", 88 pointers into the first
+   range), so a release keyed on imported objects frees memory that the kernel's own objects
+   reference. The bookkeeping needs the walk of 1(b) in reverse: the references the import
+   installed from pre-fork objects into the range (the key-table replays, the dict re-keys,
+   the untabled references) recorded per range and undone, or counted to zero, before release.
+   The attempt's test is a 60-scatter loop of one worker each with the gather dropped between.
 
 3. **No scheduler, no real site.** The guest stands in for a login node: ssh, rsync, and runsc
    invoked directly. A Slurm or Superfacility adapter (submit, status, cancel, walltime

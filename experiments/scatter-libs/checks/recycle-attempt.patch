@@ -1,0 +1,546 @@
+diff --git a/motabi/executor.py b/motabi/executor.py
+index a0866c8..663f7fb 100644
+--- a/motabi/executor.py
++++ b/motabi/executor.py
+@@ -197,9 +197,10 @@ class MotabiExecutor:
+         order, footer = _region(graph, cell.cell_id)
+         names = {target} | set().union(*(graph.cells[c].defs for c in order))
+         n = next(_SCATTERS)
+-        base = fold.allot(workers)
++        base, reclaimed = fold.allot(workers)
+         prefix = os.path.join(SHARE, f"scatter-{n}")
+         print(f"[motabi] scatter {n}: {workers} workers over {len(order)} cell(s); forking")
++        _log(f"scatter {n}: ranges {base}..{base + workers - 1}; reclaim {reclaimed}; live {fold.foldalloc.live_ranges()}")
+         _log(f"scatter {n}: forking {workers} workers, region {order}, names {sorted(names)}")
+         t0 = time.monotonic()
+         if os.environ.get("MOTABI_TYPES"):  # diagnostic: what the kernel's heap is made of
+@@ -232,6 +233,7 @@ class MotabiExecutor:
+                         values[k].append(ns[k])
+             gc.unfreeze()
+             _REGION = {"cells": set(order), "values": values, "workers": workers}
++            motabi._GATHERED.clear()  # the previous scatter's values die with their names, so their ranges can be released
+             for k, vals in values.items():
+                 if vals:
+                     glbls[k] = vals[0]
+diff --git a/motabi/fold.py b/motabi/fold.py
+index 33a28c5..a7abe34 100644
+--- a/motabi/fold.py
++++ b/motabi/fold.py
+@@ -31,7 +31,7 @@ from . import foldalloc
+ RANGES = 48
+ PY_RANGE = 4 << 30    # Python's allocators: objects, and NumPy data (PyMem_Raw)
+ LIBC_RANGE = 8 << 30  # libc and mmap: address space only; polars' jemalloc reserves GBs of it eagerly
+-_next_range = 0
++_free: list[bool] = []  # per range: not allotted since the last release (install fills it)
+ _shim: ctypes.CDLL | None = None
+ _held: list[Any] = []  # the worker's cache-draining arrays, alive for its life
+ HOLD_S = 30.0  # bound on waiting for the completion thread's in-flight request before the snapshot
+@@ -42,6 +42,7 @@ def install() -> None:
+     """At kernel start: wrappers on, ranges reserved, the shim told about its ranges."""
+     global _shim
+     foldalloc.install()
++    _free[:] = [True] * RANGES
+     py = foldalloc.reserve(RANGES, PY_RANGE)
+     libc = foldalloc.reserve(RANGES, LIBC_RANGE)
+     try:
+@@ -60,14 +61,28 @@ def install() -> None:
+     _shim = shim
+ 
+ 
+-def allot(workers: int) -> int:
+-    """First of `workers` consecutive unused ranges."""
+-    global _next_range
+-    base = _next_range
+-    _next_range += workers
+-    if _next_range > RANGES:
+-        raise RuntimeError(f"out of ranges: {RANGES} reserved at kernel start")
+-    return base
++def reclaim() -> list[tuple[int, int, int, int]]:
++    """Release every imported range whose imported objects are all dead and whose libc range
++    nothing points into (foldalloc.reclaim); returns (range, words pointing into its libc range,
++    address of the first, words pointing into its Python range) for each range with no live
++    imported object, the libc words 0 when it was released."""
++    out = foldalloc.reclaim(RANGES if _shim is not None else -1)
++    for i, held, _, _ in out:
++        if not held:
++            _free[i] = True
++    return out
++
++
++def allot(workers: int) -> tuple[int, list[tuple[int, int, int, int]]]:
++    """First of `workers` consecutive free ranges, after a reclaim; with what the reclaim found."""
++    found = reclaim()
++    for base in range(RANGES - workers + 1):
++        if all(_free[base:base + workers]):
++            _free[base:base + workers] = [False] * workers
++            return base, found
++    held = [(i, n) for i, n, _, _ in found if n]
++    raise RuntimeError(f"out of ranges: {RANGES} reserved at kernel start, {sum(_free)} free, "
++                       f"{len(held)} with no live imported object but still pointed into {held[:4]}")
+ 
+ 
+ def _drain_numpy() -> None:
+@@ -369,12 +384,16 @@ def worker_export(rng: int, glbls: Any, names: set[str], path: str) -> list[str]
+                            f"fell back to memory outside it ({_shim.rangemalloc_stats().decode()})")
+     defs = {k: id(glbls[k]) for k in names if k in glbls}
+     # dicts reached from the defines whose key table is a pre-fork block (a freelist handed it out,
+-    # or a split table shares a pre-fork type's): given a key table in the range, keeping identity
+-    foreign = foldalloc.walk_foreign(rng, list(defs.values()))
++    # or a split table shares a pre-fork type's): given a key table in the range, keeping identity;
++    # and those whose table is small enough for the root's keys freelist: grown past it
++    foreign, small = foldalloc.walk_foreign(rng, list(defs.values()))
+     if foreign:
+         foldalloc.rekey(foreign)
+         notes.append(f"{len(foreign)} dict(s) re-keyed: their key tables were pre-fork blocks")
+-    del foreign  # a reference to a define from this frame would be dumped as one the root cannot drop
++    grown = foldalloc.grow_tables(small + foreign)
++    if grown:
++        notes.append(f"{grown} small key table(s) grown past the freelist size")
++    del foreign, small  # a reference to a define from this frame would be dumped as one the root cannot drop
+     if os.environ.get("MOTABI_AUDIT"):
+         cls: dict[str, int] = {}
+         shown = 0
+@@ -506,7 +525,7 @@ def bind(m: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+     """After root_phase: the defines as the root's objects, with their stats."""
+     if "error" in m:
+         raise RuntimeError(m["error"])
+-    ns = {k: ctypes.cast(a, ctypes.py_object).value for k, a in m["defs"].items()}
++    ns = {k: foldalloc.object_at(a) for k, a in m["defs"].items()}
+     shadowed = 0
+ 
+     def shadow(o: Any) -> None:
+@@ -530,8 +549,7 @@ def bind(m: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+ 
+ def root_import(rng: int, path: str, log: Callable[[str], None] = lambda s: None) -> tuple[dict[str, Any], dict[str, Any]]:
+     """The single-threaded form of root_phase plus bind, for the fork harness."""
+-    with open(path, "rb") as f:
+-        m = pickle.load(f)
++    m = foldalloc.read_manifest(path)
+     if "error" in m:
+         raise RuntimeError(m["error"])
+     foldalloc.import_spans(rng, path + ".bin")
+diff --git a/motabi/foldalloc.c b/motabi/foldalloc.c
+index 9f8cb46..02158a7 100644
+--- a/motabi/foldalloc.c
++++ b/motabi/foldalloc.c
+@@ -4,6 +4,8 @@
+ #include <Python.h>
+ #include "internal/pycore_frame.h"
+ #include "internal/pycore_interp.h"
++#include "internal/pycore_list.h"
++#include "internal/pycore_dict_state.h"
+ #undef Py_BUILD_CORE
+ #include <sys/mman.h>
+ #include <string.h>
+@@ -14,6 +16,8 @@
+ #include <pthread.h>
+ #include <errno.h>
+ #include <dlfcn.h>
++#include <stdio.h>
++#include <stdlib.h>
+ 
+ /* Ranges: reserved address ranges, one per branch. cur = range all new
+    allocations are diverted into (-1 = passthrough to the original allocators).
+@@ -23,9 +27,10 @@
+    at install. Without the shim the range is a bump cursor (used) that ignores frees. Either way a
+    block carries its size in the 16 bytes before it. */
+ #define MAXR 128
+-typedef struct { char *base; size_t size; size_t used; } Range;
++typedef struct { char *base; size_t size; size_t used; size_t top; } Range;   /* used: bytes in use from the bottom; top: offset of the first mapping handed out from the top (libc), 0 = none */
+ static Range R[MAXR]; static int NR = 0; static int cur = -1;
+-static void *(*shim_alloc)(int, size_t); static void (*shim_free)(void *); static int (*shim_open)(int); static int (*shim_spans)(int, size_t *, size_t *); static void (*shim_discard)(int);
++static void *(*shim_alloc)(int, size_t); static void (*shim_free)(void *); static int (*shim_open)(int); static int (*shim_spans)(int, size_t *, size_t *); static void (*shim_discard)(int); static void (*shim_self)(void **, void **);
++static void live_drop_block(int ri, const char *p);
+ static PyObject **stk = NULL; static size_t stk_n = 0, stk_cap = 0; static size_t n_imm = 0;
+ 
+ static PyMemAllocatorEx orig[3]; static int installed = 0;
+@@ -50,6 +55,7 @@ static void *ralloc(size_t n){ if (!n) n = 1; if (shim_alloc) { void *p = shim_a
+    otherwise (giving a large block's pages back); without the shim, large blocks' pages go back here */
+ static void rfree(int ri, void *p){
+   n_free_inrange++; size_t n = bsize(p); freed_bytes[ri] += n + 16;
++  if (ri != cur) live_drop_block(ri, p);   /* a copy's own range holds nothing imported */
+   if (shim_free) { shim_free(p); return; }
+   if (n >= 65536) { uintptr_t a = ((uintptr_t)p + 4095) & ~(uintptr_t)4095, e = ((uintptr_t)p + n) & ~(uintptr_t)4095; if (e > a) madvise((void *)a, e - a, MADV_DONTNEED); }
+ }
+@@ -76,8 +82,8 @@ static void m_free(void *ctx, void *p){
+ static PyObject *py_install(PyObject *s, PyObject *a){
+   if (installed) Py_RETURN_NONE;
+   shim_alloc = dlsym(RTLD_DEFAULT, "rangemalloc_alloc"); shim_free = dlsym(RTLD_DEFAULT, "rangemalloc_free"); shim_open = dlsym(RTLD_DEFAULT, "rangemalloc_open");
+-  shim_spans = dlsym(RTLD_DEFAULT, "rangemalloc_spans"); shim_discard = dlsym(RTLD_DEFAULT, "rangemalloc_discard");
+-  if (!shim_alloc || !shim_free || !shim_open || !shim_spans || !shim_discard) shim_alloc = NULL;
++  shim_spans = dlsym(RTLD_DEFAULT, "rangemalloc_spans"); shim_discard = dlsym(RTLD_DEFAULT, "rangemalloc_discard"); shim_self = dlsym(RTLD_DEFAULT, "rangemalloc_self");
++  if (!shim_alloc || !shim_free || !shim_open || !shim_spans || !shim_discard || !shim_self) shim_alloc = NULL;
+   for (int d = 0; d < 3; d++) {
+     PyMem_GetAllocator((PyMemAllocatorDomain)d, &orig[d]);
+     PyMemAllocatorEx me = { (void *)(intptr_t)d, m_malloc, m_calloc, m_realloc, m_free };
+@@ -127,10 +133,14 @@ typedef struct { PyObject *o; Py_ssize_t rc; uint8_t pre; uint8_t dead; } Ent;
+ static Ent *tab = NULL; static size_t tab_n = 0, tab_cap = 0; static size_t n_dead = 0;
+ /* open-addressing map: object address -> index into tab (+1; 0 = empty) */
+ static uintptr_t *hkey = NULL; static uint32_t *hval = NULL; static size_t hcap = 0;
++/* A table that holds object addresses moves through here: the old copy is zeroed before it is
++   freed, so no stale copy in the heap points into a range the reclaim scan would then keep. */
++static void *grow(void *old, size_t oldsz, size_t newsz){ void *p = calloc(1, newsz); if (old) { memcpy(p, old, oldsz < newsz ? oldsz : newsz); memset(old, 0, oldsz); free(old); } return p; }
++static void zfree(void *p, size_t sz){ if (p) { memset(p, 0, sz); free(p); } }
+ static int hmap_add(uintptr_t k, uint32_t v){ size_t m = hcap - 1, i = (k >> 4) & m; while (hkey[i]) { if (hkey[i] == k) return 0; i = (i + 1) & m; } hkey[i] = k; hval[i] = v + 1; return 1; }
+ static long hmap_get(uintptr_t k){ if (!hkey) return -1; size_t m = hcap - 1, i = (k >> 4) & m; while (hkey[i]) { if (hkey[i] == k) return (long)hval[i] - 1; i = (i + 1) & m; } return -1; }
+ static int hset_has(uintptr_t k){ long j = hmap_get(k); return j >= 0 && !tab[j].dead; }
+-static void hmap_alloc(size_t cap){ free(hkey); free(hval); hcap = cap; hkey = calloc(hcap, sizeof *hkey); hval = calloc(hcap, sizeof *hval); }
++static void hmap_alloc(size_t cap){ zfree(hkey, hcap * sizeof *hkey); zfree(hval, hcap * sizeof *hval); hcap = cap; hkey = calloc(hcap, sizeof *hkey); hval = calloc(hcap, sizeof *hval); }
+ /* A table entry whose block is freed (or moved by realloc) is dead from then on: the
+    address no longer names the snapshotted object, so no delta is read from or written
+    to it. Frees between the snapshot and the checkpoint are seen by every copy; frees in
+@@ -149,12 +159,12 @@ static void mark_freed(const char *p){
+ static void tpush(PyObject *o){
+   if (!o || _Py_IsImmortal(o)) return;
+   if (!hmap_add((uintptr_t)o, (uint32_t)tab_n)) return;
+-  if (tab_n == tab_cap) { tab_cap = tab_cap ? tab_cap * 2 : 1 << 16; tab = realloc(tab, tab_cap * sizeof *tab); }
++  if (tab_n == tab_cap) { size_t nc = tab_cap ? tab_cap * 2 : 1 << 16; tab = grow(tab, tab_cap * sizeof *tab, nc * sizeof *tab); tab_cap = nc; }
+   PyTypeObject *t = Py_TYPE(o);
+   tab[tab_n].o = o; tab[tab_n].rc = Py_REFCNT(o); tab[tab_n].dead = 0;
+   tab[tab_n].pre = (uint8_t)((PyType_IS_GC(t) ? GC_HEAD : 0) + (PyType_HasFeature(t, Py_TPFLAGS_PREHEADER) ? 2 * sizeof(PyObject *) : 0));
+   tab_n++;
+-  if (stk_n == stk_cap) { stk_cap = stk_cap ? stk_cap * 2 : 1 << 16; stk = realloc(stk, stk_cap * sizeof *stk); }
++  if (stk_n == stk_cap) { size_t nc = stk_cap ? stk_cap * 2 : 1 << 16; stk = grow(stk, stk_cap * sizeof *stk, nc * sizeof *stk); stk_cap = nc; }
+   stk[stk_n++] = o;
+ }
+ static int visit_tpush(PyObject *o, void *arg){ tpush(o); return 0; }
+@@ -185,7 +195,7 @@ static KEnt *ktab = NULL; static size_t ktab_n = 0, ktab_cap = 0; static PyObjec
+ static void kpush(PyTypeObject *t){
+   if (!PyType_HasFeature(t, Py_TPFLAGS_HEAPTYPE) || !(t->tp_flags & Py_TPFLAGS_MANAGED_DICT)) return;
+   Keys *k = (Keys *)((PyHeapTypeObject *)t)->ht_cached_keys; if (!k || k->kind == 0) return;   /* 0 = general keys, not unicode entries */
+-  if (ktab_n == ktab_cap) { ktab_cap = ktab_cap ? ktab_cap * 2 : 1024; ktab = realloc(ktab, ktab_cap * sizeof *ktab); }
++  if (ktab_n == ktab_cap) { size_t nc = ktab_cap ? ktab_cap * 2 : 1024; ktab = grow(ktab, ktab_cap * sizeof *ktab, nc * sizeof *ktab); ktab_cap = nc; }
+   ktab[ktab_n].k = k; ktab[ktab_n].t = t; ktab[ktab_n].usable = k->usable; ktab[ktab_n].nentries = k->nentries; ktab_n++;
+ }
+ static PyObject *keys_list(void){   /* worker: [(keys, type name, usable, nentries, [appended names])] for tables that changed */
+@@ -287,20 +297,25 @@ static int keys_foreign(PyObject *d){
+    refuses the export. An object in the range the worker made immortal is reported with its count
+    so the root can make it mortal (apply_demote). */
+ typedef struct { uintptr_t *k; Py_ssize_t *v; uintptr_t *t; size_t cap, n; } AMap;   /* address -> count, type */
+-static void amap_free(AMap *m){ free(m->k); free(m->v); free(m->t); memset(m, 0, sizeof *m); }
++static void amap_free(AMap *m){ zfree(m->k, m->cap * sizeof *m->k); zfree(m->v, m->cap * sizeof *m->v); zfree(m->t, m->cap * sizeof *m->t); memset(m, 0, sizeof *m); }
+ static void amap_init(AMap *m, size_t cap){ amap_free(m); m->cap = cap; m->k = calloc(cap, sizeof *m->k); m->v = calloc(cap, sizeof *m->v); m->t = calloc(cap, sizeof *m->t); }
+ static size_t amap_find(const AMap *m, uintptr_t key){ size_t mask = m->cap - 1, i = (key >> 4) & mask; while (m->k[i] && m->k[i] != key) i = (i + 1) & mask; return i; }
+ static Py_ssize_t amap_get(const AMap *m, uintptr_t key){ if (!m->cap) return -1; size_t i = amap_find(m, key); return m->k[i] ? m->v[i] : -1; }
+ static size_t amap_slot(AMap *m, uintptr_t key, int *added){
+   if ((m->n + 1) * 2 > m->cap) { AMap o = *m; m->cap = o.cap * 2; m->k = calloc(m->cap, sizeof *m->k); m->v = calloc(m->cap, sizeof *m->v); m->t = calloc(m->cap, sizeof *m->t);
+-    for (size_t i = 0; i < o.cap; i++) if (o.k[i]) { size_t j = amap_find(m, o.k[i]); m->k[j] = o.k[i]; m->v[j] = o.v[i]; m->t[j] = o.t[i]; }
+-    free(o.k); free(o.v); free(o.t); }
++    m->n = 0; for (size_t i = 0; i < o.cap; i++) if (o.k[i] > 1) { size_t j = amap_find(m, o.k[i]); m->k[j] = o.k[i]; m->v[j] = o.v[i]; m->t[j] = o.t[i]; m->n++; }   /* tombstones (1) are dropped */
++    zfree(o.k, o.cap * sizeof *o.k); zfree(o.v, o.cap * sizeof *o.v); zfree(o.t, o.cap * sizeof *o.t); }
+   size_t i = amap_find(m, key); *added = !m->k[i]; if (*added) { m->k[i] = key; m->n++; } return i;
+ }
+-static struct { int rng; AMap seen, extra, demote; Py_ssize_t *cnt; PyObject **stk, **reached; size_t n, cap, nreached; const char *refuse; PyObject *foreign; } W;
++static struct { int rng; AMap seen, extra, demote; Py_ssize_t *cnt; PyObject **stk, **reached; size_t n, cap, nreached; const char *refuse; PyObject *foreign, *small; } W;
++/* A combined unicode table of the smallest size goes to CPython's key-table freelist when its dict
++   dies, a free the allocator never sees; in the root that hands a block of the range to the root's
++   next small dict, which would then live in a range the root can release. The worker grows every
++   such table it exports past that size (grow_tables), so the root frees it through the allocator. */
++static int keys_small(PyObject *d){ PyDictObject *mp = (PyDictObject *)d; Keys *k = (Keys *)mp->ma_keys; return !mp->ma_values && k->kind != 0 && k->log2_size == 3 && in_range(k) >= 0; }
+ static void w_push(PyObject *o){
+   int added; amap_slot(&W.seen, (uintptr_t)o, &added); if (!added) return;
+-  if (W.n == W.cap) { W.cap = W.cap ? W.cap * 2 : 1 << 16; W.stk = realloc(W.stk, W.cap * sizeof *W.stk); W.reached = realloc(W.reached, W.cap * sizeof *W.reached); }
++  if (W.n == W.cap) { size_t nc = W.cap ? W.cap * 2 : 1 << 16; W.stk = grow(W.stk, W.cap * sizeof *W.stk, nc * sizeof *W.stk); W.reached = grow(W.reached, W.cap * sizeof *W.reached, nc * sizeof *W.reached); W.cap = nc; }
+   W.stk[W.n++] = o; W.reached[W.nreached++] = o;
+ }
+ static int holds_range_objects(PyObject *r){
+@@ -367,6 +382,7 @@ static void w_object(PyObject *o){
+   if (PyDict_Check(o)) {
+     PyDictObject *mp = (PyDictObject *)o;
+     if (keys_foreign(o)) { PyList_Append(W.foreign, o); return; }
++    if (keys_small(o)) PyList_Append(W.small, o);
+     if (!mp->ma_values) w_keys((Keys *)mp->ma_keys);   /* a split table's keys belong to the type's table, walked with the type */
+   }
+   if (t->tp_traverse) { t->tp_traverse(o, w_visit, NULL); return; }
+@@ -382,14 +398,14 @@ static void w_object(PyObject *o){
+ static int w_run(int rng, PyObject *defs){
+   W.rng = rng; W.n = W.nreached = 0; W.refuse = NULL;
+   amap_init(&W.seen, 1 << 16); amap_init(&W.extra, 1 << 10); amap_init(&W.demote, 1 << 10);
+-  W.cnt = calloc(tab_n ? tab_n : 1, sizeof *W.cnt); Py_XDECREF(W.foreign); W.foreign = PyList_New(0);
++  W.cnt = calloc(tab_n ? tab_n : 1, sizeof *W.cnt); Py_XDECREF(W.foreign); W.foreign = PyList_New(0); Py_XDECREF(W.small); W.small = PyList_New(0);
+   /* a define's binding from the worker's globals is not a reference the root keeps: an in-range define is walked, a pre-fork one is bound by the root itself */
+   for (Py_ssize_t i = 0; i < PyList_GET_SIZE(defs); i++) { PyObject *d = (PyObject *)PyLong_AsVoidPtr(PyList_GET_ITEM(defs, i)); if (in_range(d) == rng) w_push(d); }
+   while (W.n && !W.refuse) w_object(W.stk[--W.n]);
+   if (W.refuse) { PyErr_Format(PyExc_RuntimeError, "export refused: %s", W.refuse); return -1; }
+   return 0;
+ }
+-static void w_done(void){ amap_free(&W.seen); amap_free(&W.extra); amap_free(&W.demote); free(W.cnt); W.cnt = NULL; free(W.stk); free(W.reached); W.stk = W.reached = NULL; W.cap = 0; Py_CLEAR(W.foreign); }
++static void w_done(void){ amap_free(&W.seen); amap_free(&W.extra); amap_free(&W.demote); free(W.cnt); W.cnt = NULL; zfree(W.stk, W.cap * sizeof *W.stk); zfree(W.reached, W.cap * sizeof *W.reached); W.stk = W.reached = NULL; W.cap = 0; Py_CLEAR(W.foreign); Py_CLEAR(W.small); }
+ static PyObject *w_deltas(void){   /* (address, count), or (address, -1) for a tabled object the worker made immortal */
+   PyObject *out = PyList_New(0);
+   for (size_t j = 0; j < tab_n; j++) { if (tab[j].dead) continue;
+@@ -409,12 +425,27 @@ static PyObject *w_addrs(int tracked_only){   /* reached objects, in walk order
+   for (size_t i = 0; i < W.nreached; i++) { PyObject *o = W.reached[i]; if (tracked_only && !(PyObject_IS_GC(o) && _PyObject_GC_IS_TRACKED(o))) continue; PyObject *v = PyLong_FromVoidPtr(o); PyList_Append(out, v); Py_DECREF(v); }
+   return out;
+ }
+-/* The pre-pass of the export: the dicts reached from the defines whose key table is a pre-fork
+-   block, for the worker to re-key before the tail. */
++/* The pre-pass of the export: (foreign, small), the dicts reached from the defines whose key table
++   is a pre-fork block, for the worker to re-key, and those whose table is freelist-sized, for the
++   worker to grow, both before the tail. */
+ static PyObject *py_walk_foreign(PyObject *s, PyObject *a){
+   int rng; PyObject *defs; if (!PyArg_ParseTuple(a, "iO!", &rng, &PyList_Type, &defs)) return NULL;
+   if (w_run(rng, defs)) { w_done(); return NULL; }
+-  PyObject *out = Py_NewRef(W.foreign); w_done(); return out;
++  PyObject *out = Py_BuildValue("(OO)", W.foreign, W.small); w_done(); return out;
++}
++/* Grow each dict's table past the freelist size: padding keys are set until the table is resized,
++   then deleted (a table never shrinks on deletion). */
++static PyObject *py_grow_tables(PyObject *s, PyObject *dicts){
++  Py_ssize_t n = PyList_GET_SIZE(dicts), grown = 0;
++  for (Py_ssize_t k = 0; k < n; k++) {
++    PyObject *d = PyList_GET_ITEM(dicts, k); if (!PyDict_Check(d) || ((PyDictObject *)d)->ma_values) continue;
++    int i = 0;
++    for (; i < 16 && ((Keys *)((PyDictObject *)d)->ma_keys)->log2_size == 3; i++) { char name[32]; snprintf(name, sizeof name, "\x01motabi pad %d", i); PyObject *key = PyUnicode_FromString(name); if (!key || PyDict_SetItem(d, key, Py_None)) { Py_XDECREF(key); return NULL; } Py_DECREF(key); }
++    for (int j = 0; j < i; j++) { char name[32]; snprintf(name, sizeof name, "\x01motabi pad %d", j); PyObject *key = PyUnicode_FromString(name); if (!key || PyDict_DelItem(d, key)) { Py_XDECREF(key); return NULL; } Py_DECREF(key); }
++    if (keys_small(d)) return PyErr_Format(PyExc_RuntimeError, "a dict's key table stayed freelist-sized after growing it");
++    grown++;
++  }
++  return PyLong_FromSsize_t(grown);
+ }
+ /* Root side: an object in the range the worker made immortal (3.12 interning is mortal; static
+    interning and PyUnicode_InternImmortal are not) becomes mortal with the count the walk found
+@@ -615,6 +646,7 @@ static PyObject *py_dump_range(PyObject *s, PyObject *a){
+    range until the range is reclaimed as a whole. An instance of the shadow type made at home (a
+    library that preserves subclasses on results) is destroyed normally. */
+ static Py_ssize_t n_shadow_live = 0, n_shadow_home = 0;
++static void live_drop_obj(PyObject *o);
+ static void shadow_dealloc(PyObject *o){
+   if (in_range(o) < 0) {
+     /* made at home (a library builds results with the instance's own class): give it back its
+@@ -627,7 +659,7 @@ static void shadow_dealloc(PyObject *o){
+     return;
+   }
+   if (PyObject_IS_GC(o) && PyObject_GC_IsTracked(o)) PyObject_GC_UnTrack(o);
+-  n_shadow_live--;
++  n_shadow_live--; live_drop_obj(o);
+ }
+ static PyObject *py_shadow_type(PyObject *s, PyObject *sub){
+   if (!PyType_Check(sub) || !PyType_HasFeature((PyTypeObject *)sub, Py_TPFLAGS_HEAPTYPE)) { PyErr_SetString(PyExc_TypeError, "heap type"); return NULL; }
+@@ -690,6 +722,7 @@ static PyObject *py_export_tail(PyObject *s, PyObject *a){
+   if (!PyArg_ParseTuple(a, "iinnssO!", &i, &li, &lo, &hi, &bin, &libc, &PyList_Type, &defs)) return NULL;
+   if (w_run(i, defs)) { w_done(); return NULL; }
+   if (PyList_GET_SIZE(W.foreign)) { w_done(); PyErr_SetString(PyExc_RuntimeError, "export refused: a dict's key table is a pre-fork block after the re-key"); return NULL; }
++  if (PyList_GET_SIZE(W.small)) { w_done(); PyErr_SetString(PyExc_RuntimeError, "export refused: a dict's key table is freelist-sized after the growth"); return NULL; }
+   PyObject *gcm = PyImport_ImportModule("gc"); if (!gcm) { w_done(); return NULL; }
+   PyObject *objs = PyObject_CallMethod(gcm, "get_objects", NULL); Py_DECREF(gcm); if (!objs) { w_done(); return NULL; }
+   PyObject *leftover = PyList_New(0);
+@@ -717,9 +750,128 @@ static PyObject *py_import_spans(PyObject *s, PyObject *a){
+     ssize_t r = read(fd, h, 16); if (r == 0) break; if (r != 16 || h[0] + h[1] > R[i].size) { close(fd); PyErr_SetString(PyExc_ValueError, "bad span file"); return NULL; }
+     size_t done = 0; while (done < h[1]) { ssize_t n = read(fd, R[i].base + h[0] + done, h[1] - done); if (n <= 0) { close(fd); return PyErr_SetFromErrno(PyExc_OSError); } done += n; }
+     bytes += h[1];
++    /* the extent of the range in use, for the reclaim scan: from the bottom up to the last span read
++       below the middle, and (the libc range, handed out from the top too) from the first span above it */
++    if (h[0] < R[i].size / 2) { if (h[0] + h[1] > R[i].used) R[i].used = h[0] + h[1]; }
++    else if (!R[i].top || h[0] < R[i].top) R[i].top = h[0];
+   }
+   close(fd); return PyLong_FromSize_t(bytes);
+ }
++/* ---- range recycling (DESIGN.md 2.4: "a range is unmapped when everything in it is dead") ----
++   The root keeps the address of every object a join reached in each range (the live set) and
++   counts them per range. An object leaves the set when its block is freed (rfree: the object sits
++   0, 16 or 32 bytes into the block, after a GC head and a managed-dict pre-header) or when its
++   shadow dealloc runs (the block is kept). Taken under a lock: the raw domain frees without the
++   GIL. A range whose count is zero is released at the next allotment (reclaim) if, after a full
++   collection (which also empties CPython's per-type freelists, where a range's blocks can sit),
++   no word of the process's writable memory points into it or into its libc range: a pointer the
++   count cannot see (a column taken at home from an imported Arrow table, a view of a tensor, a
++   root dict whose key table came off the freelist in the range) keeps the range. The scan skips
++   the ranges themselves (an unreached object of another range may point here and never dies),
++   the stacks, and the tables here and in the shim that hold range addresses by design. */
++static AMap live; static pthread_mutex_t live_lk = PTHREAD_MUTEX_INITIALIZER; static Py_ssize_t live_n[MAXR]; static uint8_t imported[MAXR];
++static void live_add(PyObject *o, int ri){ int a; size_t i = amap_slot(&live, (uintptr_t)o, &a); live.v[i] = ri; if (a) live_n[ri]++; }
++static int live_del(uintptr_t k){ if (!live.cap) return 0; size_t i = amap_find(&live, k); if (live.k[i] != k) return 0; int ri = (int)live.v[i]; live.k[i] = 1; live.v[i] = 0; live_n[ri]--; return 1; }   /* 1 = tombstone: probing continues past it */
++static void live_drop_obj(PyObject *o){ pthread_mutex_lock(&live_lk); live_del((uintptr_t)o); pthread_mutex_unlock(&live_lk); }
++static void live_drop_block(int ri, const char *p){
++  (void)ri; if (!live.n) return;
++  pthread_mutex_lock(&live_lk);
++  if (!live_del((uintptr_t)p)) if (!live_del((uintptr_t)p + GC_HEAD)) live_del((uintptr_t)p + GC_HEAD + 2 * sizeof(PyObject *));
++  pthread_mutex_unlock(&live_lk);
++}
++static PyObject *py_live_ranges(PyObject *s, PyObject *a){   /* {range: live count} for every imported range */
++  PyObject *d = PyDict_New();
++  for (int i = 0; i < NR; i++) if (imported[i]) { PyObject *k = PyLong_FromLong(i), *v = PyLong_FromSsize_t(live_n[i]); PyDict_SetItem(d, k, v); Py_DECREF(k); Py_DECREF(v); }
++  return d;
++}
++typedef struct { uintptr_t lo, hi; int idx; } Span;   /* idx: range index, +MAXR for its libc range */
++static int span_cmp(const void *a, const void *b){ uintptr_t x = ((const Span *)a)->lo, y = ((const Span *)b)->lo; return x < y ? -1 : x > y; }
++/* One pass over the writable private mappings outside the skips: for each word that falls in a
++   candidate span (sorted; found by bisection after a cheap bounds test), the candidate's hit
++   count rises and the first such word's address is kept. */
++static void words_into(Span *cand, int nc, Span *skip, int nskip, size_t *hits, uintptr_t *first){
++  FILE *f = fopen("/proc/self/maps", "r"); if (!f) return;
++  uintptr_t cmin = cand[0].lo, cmax = cand[nc - 1].hi; char line[512];
++  while (fgets(line, sizeof line, f)) {
++    uintptr_t a, b; char perms[8] = ""; int n = 0;
++    if (sscanf(line, "%lx-%lx %7s %*s %*s %*s %n", &a, &b, perms, &n) < 3 || perms[1] != 'w' || perms[3] == 's') continue;
++    const char *name = line + n; if (!strncmp(name, "[stack", 6) || !strncmp(name, "[vvar", 5) || !strncmp(name, "[vdso", 5) || !strncmp(name, "[vsyscall", 9)) continue;
++    int k = 0;
++    for (uintptr_t p = a; p < b; ) {
++      while (k < nskip && skip[k].hi <= p) k++;
++      uintptr_t stop = b; if (k < nskip && skip[k].lo < b) { if (skip[k].lo <= p) { p = skip[k].hi; continue; } stop = skip[k].lo; }
++      for (const uintptr_t *w = (const uintptr_t *)p; (uintptr_t)w + 8 <= stop; w++) {
++        uintptr_t v = *w; if (v < cmin || v >= cmax) continue;
++        int lo = 0, hi = nc - 1; while (lo < hi) { int mid = (lo + hi + 1) / 2; if (cand[mid].lo <= v) lo = mid; else hi = mid - 1; }
++        if (v < cand[lo].hi) { int c = cand[lo].idx; if (!hits[c]) first[c] = (uintptr_t)w; hits[c]++; }
++      }
++      p = stop;
++    }
++  }
++  fclose(f);
++}
++/* Release every imported range whose live set is empty and whose libc range nothing in the
++   process points into; returns [(range, words_into_libc, address_of_first, words_into_python)]
++   for each range with an empty set, words_into_libc 0 when it was released. libc_base is the
++   index of the first libc range, or -1 without the shim.
++   The scan guards the libc range only: a pointer the live set cannot see is a native view made
++   at home (a column of an imported Arrow table, a view of a tensor), and those point there. The
++   Python range is governed by counts: every object the join imported is in the live set until
++   its block is freed, including one that passed through a per-type freelist and was reused by
++   the root, and the worker grew every exported small key table past the keys freelist's size.
++   Words pointing into the Python range are counted and reported, since a stale copy of a
++   pointer array (an allocator moves a block and leaves the old bytes) would otherwise keep a
++   range for the life of the process. The known places that hold stale addresses of dead objects
++   are cleared first (the per-type freelist arrays above their counts, the type attribute cache)
++   or skipped (the threads' frame data stacks, this thread's C stack, the tables here and in the
++   shim). */
++static PyObject *py_reclaim(PyObject *s, PyObject *a){
++  int libc_base; if (!PyArg_ParseTuple(a, "i", &libc_base)) return NULL;
++  PyObject *out = PyList_New(0); int any = 0;
++  for (int i = 0; i < NR; i++) if (imported[i] && live_n[i] <= 0) any = 1;
++  if (!any) return out;
++  PyGC_Collect();   /* the highest generation: the per-type freelists are emptied with it */
++  PyInterpreterState *interp = PyInterpreterState_Get();
++  { struct _Py_list_state *ls = &interp->list; for (int i = ls->numfree < 0 ? 0 : ls->numfree; i < PyList_MAXFREELIST; i++) ls->free_list[i] = NULL; }
++  { struct _Py_dict_state *ds = &interp->dict_state; for (int i = ds->numfree < 0 ? 0 : ds->numfree; i < PyDict_MAXFREELIST; i++) ds->free_list[i] = NULL; for (int i = ds->keys_numfree < 0 ? 0 : ds->keys_numfree; i < PyDict_MAXFREELIST; i++) ds->keys_free_list[i] = NULL; }
++  PyType_ClearCache();
++  Span skip[256]; int ns = 0;
++  skip[ns++] = (Span){ (uintptr_t)R, (uintptr_t)(R + MAXR), 0 };
++  if (tab) skip[ns++] = (Span){ (uintptr_t)tab, (uintptr_t)(tab + tab_cap), 0 };
++  if (hkey) skip[ns++] = (Span){ (uintptr_t)hkey, (uintptr_t)(hkey + hcap), 0 };
++  if (stk) skip[ns++] = (Span){ (uintptr_t)stk, (uintptr_t)(stk + stk_cap), 0 };
++  if (ktab) skip[ns++] = (Span){ (uintptr_t)ktab, (uintptr_t)(ktab + ktab_cap), 0 };
++  if (live.k) { skip[ns++] = (Span){ (uintptr_t)live.k, (uintptr_t)(live.k + live.cap), 0 }; skip[ns++] = (Span){ (uintptr_t)live.v, (uintptr_t)(live.v + live.cap), 0 }; }
++  if (shim_self) { void *lo, *hi; shim_self(&lo, &hi); skip[ns++] = (Span){ (uintptr_t)lo, (uintptr_t)hi, 0 }; }
++  { pthread_attr_t at; void *sa; size_t sz; if (!pthread_getattr_np(pthread_self(), &at)) { if (!pthread_attr_getstack(&at, &sa, &sz)) skip[ns++] = (Span){ (uintptr_t)sa, (uintptr_t)sa + sz, 0 }; pthread_attr_destroy(&at); } }
++  for (PyThreadState *ts = PyInterpreterState_ThreadHead(interp); ts && ns < 200; ts = PyThreadState_Next(ts))
++    for (_PyStackChunk *c = ts->datastack_chunk; c && ns < 200; c = c->previous) skip[ns++] = (Span){ (uintptr_t)c, (uintptr_t)c + c->size, 0 };
++  for (int i = 0; i < NR && ns < 256; i++) skip[ns++] = (Span){ (uintptr_t)R[i].base, (uintptr_t)R[i].base + R[i].size, 0 };
++  qsort(skip, ns, sizeof *skip, span_cmp);
++  Span cand[3 * MAXR]; int nc = 0; size_t hits[2 * MAXR] = { 0 }; uintptr_t first[2 * MAXR] = { 0 };
++  for (int i = 0; i < NR; i++) {
++    if (!imported[i] || live_n[i] > 0) continue;
++    /* only the parts in use: the reservation is 4 or 8 GiB and a word that is two packed 32-bit values can land in it */
++    cand[nc++] = (Span){ (uintptr_t)R[i].base, (uintptr_t)R[i].base + R[i].used, i };
++    if (libc_base >= 0) { Range *l = &R[libc_base + i]; cand[nc++] = (Span){ (uintptr_t)l->base, (uintptr_t)l->base + l->used, MAXR + i }; if (l->top) cand[nc++] = (Span){ (uintptr_t)l->base + l->top, (uintptr_t)l->base + l->size, MAXR + i }; }
++  }
++  qsort(cand, nc, sizeof *cand, span_cmp);
++  words_into(cand, nc, skip, ns, hits, first);
++  for (int i = 0; i < NR; i++) {
++    if (!imported[i] || live_n[i] > 0) continue;
++    if (!hits[MAXR + i]) {
++      int li = libc_base >= 0 ? libc_base + i : -1;
++      if (shim_alloc) { shim_discard(i); if (li >= 0) shim_discard(li); }
++      else { madvise(R[i].base, R[i].size, MADV_DONTNEED); mprotect(R[i].base, R[i].size, PROT_NONE); }
++      R[i].used = R[i].top = 0; if (li >= 0) R[li].used = R[li].top = 0; freed_bytes[i] = 0; imported[i] = 0; live_n[i] = 0;
++    }
++    PyObject *t = Py_BuildValue("(inKn)", i, (Py_ssize_t)hits[MAXR + i], (unsigned long long)first[MAXR + i], (Py_ssize_t)hits[i]); PyList_Append(out, t); Py_DECREF(t);
++  }
++  return out;
++}
++/* The object at an address, as a new reference, for the root to bind an imported define without a
++   ctypes object whose buffer would hold the raw address after it is freed (a scan would see it). */
++static PyObject *py_object_at(PyObject *s, PyObject *a){ unsigned long long p; if (!PyArg_ParseTuple(a, "K", &p)) return NULL; return Py_NewRef((PyObject *)(uintptr_t)p); }
+ /* The root's replay of one worker's manifest after its ranges are read in: the counts, the key
+    tables, the untabled references, the demotions, then the GC heads (leftovers left untracked,
+    reached objects tracked). The results go into the manifest dict for bind's stats. */
+@@ -740,6 +892,10 @@ static int replay_manifest(PyObject *m){
+   PyObject *leftover = PyDict_GetItemString(m, "leftover"), *tracked = PyDict_GetItemString(m, "tracked");
+   for (Py_ssize_t k = 0; k < PyList_GET_SIZE(leftover); k++) { PyObject *r = py_leave(NULL, (PyObject *)PyLong_AsVoidPtr(PyList_GET_ITEM(leftover, k))); Py_DECREF(r); }
+   for (Py_ssize_t k = 0; k < PyList_GET_SIZE(tracked); k++) { PyObject *r = py_track(NULL, (PyObject *)PyLong_AsVoidPtr(PyList_GET_ITEM(tracked, k))); Py_DECREF(r); }
++  if (!live.cap) amap_init(&live, 1 << 16);
++  pthread_mutex_lock(&live_lk);
++  for (Py_ssize_t k = 0; k < PyList_GET_SIZE(reached); k++) { PyObject *o = (PyObject *)PyLong_AsVoidPtr(PyList_GET_ITEM(reached, k)); int ri = in_range(o); if (ri >= 0) { live_add(o, ri); imported[ri] = 1; } }
++  pthread_mutex_unlock(&live_lk);
+   return 0;
+ }
+ static PyObject *py_replay_manifest(PyObject *s, PyObject *m){ if (!PyDict_Check(m)) { PyErr_SetString(PyExc_TypeError, "dict"); return NULL; } if (replay_manifest(m)) return NULL; Py_RETURN_NONE; }
+@@ -752,12 +908,19 @@ static PyObject *py_replay_manifest(PyObject *s, PyObject *m){ if (!PyDict_Check
+    list of manifest dicts (an error manifest is returned as is). */
+ static int file_exists(const char *p){ return access(p, F_OK) == 0; }
+ static int wait_for(const char *p, int poll_ms){ struct timespec ts = { poll_ms / 1000, (poll_ms % 1000) * 1000000L }; while (!file_exists(p)) { nanosleep(&ts, NULL); if (PyErr_CheckSignals()) return -1; } return 0; }
+-static PyObject *read_file(const char *p){
++/* A worker's manifest, unpickled from a buffer that is zeroed before it is freed: its lists are
++   addresses in the range, and a stale copy of the pickle in the heap would keep the range from
++   being reclaimed. */
++static PyObject *read_manifest(const char *p){
+   int fd = open(p, O_RDONLY); if (fd < 0) return PyErr_SetFromErrno(PyExc_OSError);
+   size_t cap = 1 << 16, n = 0; char *buf = malloc(cap);
+-  for (;;) { if (n == cap) { cap *= 2; buf = realloc(buf, cap); } ssize_t r = read(fd, buf + n, cap - n); if (r < 0) { close(fd); free(buf); return PyErr_SetFromErrno(PyExc_OSError); } if (!r) break; n += r; }
+-  close(fd); PyObject *b = PyBytes_FromStringAndSize(buf, n); free(buf); return b;
++  for (;;) { if (n == cap) { buf = grow(buf, cap, cap * 2); cap *= 2; } ssize_t r = read(fd, buf + n, cap - n); if (r < 0) { close(fd); zfree(buf, cap); return PyErr_SetFromErrno(PyExc_OSError); } if (!r) break; n += r; }
++  close(fd);
++  PyObject *m = NULL, *mv = PyMemoryView_FromMemory(buf, (Py_ssize_t)n, PyBUF_READ), *pickle = mv ? PyImport_ImportModule("pickle") : NULL;
++  if (pickle) m = PyObject_CallMethod(pickle, "loads", "O", mv);
++  Py_XDECREF(pickle); Py_XDECREF(mv); zfree(buf, cap); return m;
+ }
++static PyObject *py_read_manifest(PyObject *s, PyObject *a){ const char *p; if (!PyArg_ParseTuple(a, "s", &p)) return NULL; return read_manifest(p); }
+ /* The locals and evaluation stacks of every thread's live frames: pre-fork objects the collector's
+    lists do not hold (a frame is not an object until something asks for it), which the completion
+    engine's in-flight import holds and a worker's objects then reference. Read from the interpreter
+@@ -849,12 +1012,10 @@ static PyObject *py_root_phase(PyObject *s, PyObject *a){
+     PyGC_Collect(); settle_freelists(); 
+     return Py_BuildValue("(NNnn)", tn, PyLong_FromLong(i), n_before, (Py_ssize_t)waited);
+   }
+-  PyObject *pickle = PyImport_ImportModule("pickle"); if (!pickle) return NULL;
+   PyObject *out = PyList_New(0);
+   for (int i = 0; i < workers; i++) {
+     snprintf(path, sizeof path, "%s.manifest_%d", prefix, i); if (wait_for(path, poll_ms)) return NULL;
+-    PyObject *raw = read_file(path); if (!raw) return NULL;
+-    PyObject *m = PyObject_CallMethod(pickle, "loads", "O", raw); Py_DECREF(raw); if (!m) return NULL;
++    PyObject *m = read_manifest(path); if (!m) return NULL;
+     PyList_Append(out, m); Py_DECREF(m); 
+     if (!PyDict_Check(m) || PyDict_GetItemString(m, "error")) continue;
+     int rng = base + i;
+@@ -864,10 +1025,10 @@ static PyObject *py_root_phase(PyObject *s, PyObject *a){
+     if (libc_base >= 0 && file_exists(path)) { PyObject *args = Py_BuildValue("(is)", libc_base + rng, path), *r = py_import_spans(NULL, args); Py_DECREF(args); if (!r) return NULL; Py_DECREF(r); }
+     if (replay_manifest(m)) return NULL;
+   }
+-  Py_DECREF(pickle); return Py_BuildValue("(NNnn)", tn, out, n_before, (Py_ssize_t)waited);
++  return Py_BuildValue("(NNnn)", tn, out, n_before, (Py_ssize_t)waited);
+ }
+ static PyMethodDef M[] = {
+-  {"root_phase", py_root_phase, METH_VARARGS, ""}, {"walk_foreign", py_walk_foreign, METH_VARARGS, ""}, {"replay_manifest", py_replay_manifest, METH_O, ""}, {"apply_demote", py_apply_demote, METH_VARARGS, ""}, {"leave", py_leave, METH_O, ""},
++  {"root_phase", py_root_phase, METH_VARARGS, ""}, {"walk_foreign", py_walk_foreign, METH_VARARGS, ""}, {"replay_manifest", py_replay_manifest, METH_O, ""}, {"apply_demote", py_apply_demote, METH_VARARGS, ""}, {"leave", py_leave, METH_O, ""}, {"reclaim", py_reclaim, METH_VARARGS, ""}, {"grow_tables", py_grow_tables, METH_O, ""}, {"live_ranges", py_live_ranges, METH_NOARGS, ""}, {"object_at", py_object_at, METH_VARARGS, ""}, {"read_manifest", py_read_manifest, METH_VARARGS, ""},
+   {"dict_keys_foreign", py_dict_keys_foreign, METH_O, ""}, {"rekey", py_rekey, METH_O, ""}, {"table_entry", py_table_entry, METH_VARARGS, ""}, {"is_mapped", py_is_mapped, METH_VARARGS, ""}, {"apply_extra", py_apply_extra, METH_O, ""}, {"export_keys", py_export_keys, METH_NOARGS, ""}, {"apply_keys", py_apply_keys, METH_O, ""},
+   {"shadow_type", py_shadow_type, METH_O, ""}, {"shadow", py_shadow, METH_VARARGS, ""}, {"shadow_live", py_shadow_live, METH_NOARGS, ""},
+   {"dump_span", py_dump_span, METH_VARARGS, ""}, {"export_tail", py_export_tail, METH_VARARGS, ""}, {"import_spans", py_import_spans, METH_VARARGS, ""},
+diff --git a/motabi/rangemalloc.c b/motabi/rangemalloc.c
+index 58117c0..df1bc02 100644
+--- a/motabi/rangemalloc.c
++++ b/motabi/rangemalloc.c
+@@ -28,6 +28,7 @@
+                                                               handed to jemalloc
+      void rangemalloc_discard(int idx)                    -> the range's pages dropped and the
+                                                               reservation made inaccessible again
++     void rangemalloc_self(void **lo, void **hi)          -> the shim's table of range bases
+      int rangemalloc_spans(int idx, size_t *lo, size_t *hi) -> bytes handed out from the bottom
+                                                               (jemalloc) and from the top (mmap)
+      size_t rangemalloc_divert_failed(void)               -> mmaps refused because the range was
+@@ -263,6 +264,8 @@ int rangemalloc_spans(int i, size_t *lo, size_t *hi){
+   pthread_mutex_lock(&lk); *lo = R[i].bump; *hi = R[i].mbump; pthread_mutex_unlock(&lk); return 0;
+ }
+ size_t rangemalloc_divert_failed(void){ return atomic_load(&n_mmap_divert_failed); }
++/* The shim's own table of range bases, for a scan of the process's memory to skip. */
++void rangemalloc_self(void **lo, void **hi){ *lo = R; *hi = R + MAXR; }
+ static char statbuf[768];
+ const char *rangemalloc_stats(void){
+   size_t fb = 0, fk = 0; for (int i = 0; i < NR; i++) { fb += atomic_load(&R[i].foreign_freed_blocks); fk += atomic_load(&R[i].foreign_freed_bytes); }
+diff --git a/motabi/rangemalloc.map b/motabi/rangemalloc.map
+index 127d490..626597a 100644
+--- a/motabi/rangemalloc.map
++++ b/motabi/rangemalloc.map
+@@ -1,2 +1,2 @@
+ { global: malloc; free; calloc; realloc; posix_memalign; aligned_alloc; memalign; valloc; pvalloc; malloc_usable_size; mmap; mmap64; munmap; mremap;
+-          rangemalloc_register; rangemalloc_use; rangemalloc_off; rangemalloc_open; rangemalloc_alloc; rangemalloc_free; rangemalloc_discard; rangemalloc_spans; rangemalloc_divert_failed; rangemalloc_stats; local: *; };
++          rangemalloc_register; rangemalloc_use; rangemalloc_off; rangemalloc_open; rangemalloc_alloc; rangemalloc_free; rangemalloc_discard; rangemalloc_self; rangemalloc_spans; rangemalloc_divert_failed; rangemalloc_stats; local: *; };
