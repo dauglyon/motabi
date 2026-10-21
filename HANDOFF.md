@@ -153,8 +153,13 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
    worker (jemalloc `thread.arena`, mimalloc `mi_theap_set_default` with arena allocation
    disallowed, both called by symbol address) and ignoring `mmap` address hints in the shim makes
    every measured library join whole: numpy, torch, Arrow on both pools, polars, 30 of 30 runs
-   with drop and reclaim. Open: the switches are per thread, and pool threads alive at a gVisor
-   restore keep their old arenas. All of it in `docs/scatter-research.md`. The shim lives in
+   with drop and reclaim. Pool threads alive at a gVisor restore were then measured (68 threads):
+   every large result lands in the range from any thread, since fresh mappings are diverted
+   wherever they come from; the one miss is a small polars `group_by` result allocated by a pool
+   thread out of a pre-fork slab. The export check covers it: every exposed buffer must be in the
+   range, else the result is rebuilt once on the exporting thread (through numpy per column) and
+   rechecked, else the export is refused by name. Worker ranges need several GB of address space
+   for polars' jemalloc reservations. All of it in `docs/scatter-research.md`. The shim lives in
    `experiments/fold/rangemalloc/`; the launcher passes `MOTABI_LD_PRELOAD` into the sandbox.
    `motabi/npdivert.c` stays **disabled** (`MOTABI_NPDIVERT=1`): unnecessary on NumPy 2 and it
    breaks reload.

@@ -119,6 +119,16 @@ if pid == 0:
     else:
         glbls["obj"] = make()
     placed = {k: maps.label(a, None, ranges) for k, a in addrs(glbls["obj"]).items()}
+    # the export check: every exposed buffer must be in a range; if not, rebuild the result on this
+    # thread once and check again; a second miss is an error naming the define and the buffer
+    bad = [k for k, v in placed.items() if not v.startswith("range")] if "--relocate" in sys.argv or "--force-relocate" in sys.argv else []
+    if bad or "--force-relocate" in sys.argv:
+        glbls["obj"] = libs.relocate(lib, glbls["obj"]); gc.collect()
+        placed2 = {k: maps.label(a, None, ranges) for k, a in addrs(glbls["obj"]).items()}
+        still = [k for k, v in placed2.items() if not v.startswith("range")]
+        say(f"relocate: buffers outside before {bad or 'none'}, after {still or 'none'}")
+        if still: print(lib, f"FAIL export refused: define 'obj' keeps buffer(s) {still} outside the range after a rebuild", flush=True); os._exit(4)
+        placed = placed2
     placed["object"] += f" (worker refcount {sys.getrefcount(glbls['obj']) - 1})"
     defs = {"obj": id(glbls["obj"])}
     if two:

@@ -397,6 +397,59 @@ with an exception must not run interpreter finalisation (pool threads are gone a
 the harness now exits hard). The two switches are driven by symbol offsets read from `nm`, which
 an environment image can precompute but which is tied to the exact wheel.
 
+### Fourth follow-up: pool threads alive after a restore, measured, and the export check
+
+The per-thread allocator switches leave one question: a library's pool threads survive a gVisor
+restore with their old arenas. Measured in `run_gv_pool.sh`: a root with polars (20 pool threads),
+torch (8 threads) and pyarrow warm, 68 threads in the process; checkpoint; the restored worker
+switches its own thread's arenas, then runs work the pools execute, and reads where every result
+buffer lands.
+
+| work in the worker | where the result's buffers are |
+|---|---|
+| polars `int_range`, 4M rows (main thread) | range |
+| polars `with_columns`, three expressions over 4M rows (pool) | range, all four buffers |
+| polars lazy `collect` with a filter (pool) | range |
+| polars tiny and medium `with_columns` (50 and 50k rows) | range |
+| polars `group_by` / `agg`, 7 result rows (pool) | **outside**, all three buffers, in every run |
+| torch matmul 2000x2000 and elementwise, 8 OpenMP threads | range |
+
+Why the split: large outputs are fresh mappings, and the shim diverts a mapping from any thread,
+so pool threads' big allocations land in the range without being told anything; torch allocates
+through libc, which the shim fronts on every thread. The miss is a small result allocated by a
+jemalloc pool thread out of a pre-fork slab: no system call, nothing for the shim to see, and the
+thread's arena is the old one. It is specific: small, on a pool thread, in a library with its own
+jemalloc.
+
+**The export check (the rule settled in conversation: what matters is live memory outside the
+range at export, not who allocated).** Every exposed buffer of a define is checked against the
+ranges at export. If any is outside, the result is rebuilt once on the exporting thread and
+checked again; a second miss refuses the export with the define's name and the buffer. Rebuilds
+that work and do not: for the `group_by` result, `clone()`, `rechunk()`, `select(all*1)` and
+`from_arrow(to_arrow())` keep the old buffers (shallow, or zero-copy, or run on the pool again);
+`from_numpy(to_numpy())` relocates it; `pl.DataFrame(to_dict())` relocated it in two runs and left
+one of three columns outside in a third, so the per-type rebuild goes through numpy per column.
+numpy `copy()`, torch `clone()` and an Arrow rebuild through numpy are the other three. In the
+fork harness `--force-relocate` exercises the path for numpy, torch and Arrow (polars' rebuild
+needs its pool, which `os.fork` kills; it ran in gVisor).
+
+**Live-byte counters, the cheaper check, are not available where they are needed.** polars' wheel
+builds jemalloc without statistics (`config.stats` false; `stats.allocated` returns ENOENT), so
+per-arena live counts cannot be read; `thread.allocated` works but only for the calling thread.
+Arrow's mimalloc exposes `mi_stats_get`, `mi_heap_visit_blocks` and `mi_process_info`, so a
+process-wide live count minus the new heap's live blocks is possible there. The exposed-buffer
+check is therefore the one that applies to every library.
+
+**Capacity.** polars' jemalloc reserves address space eagerly: 1.5 GB of mappings in this run. With
+a 1 GiB worker range (half for mappings) the shim ran out, refused, and jemalloc fell back to
+`brk`, putting a result in the glibc heap, outside. The shim now counts refused diversions
+(`mmap_divert_failed`, to fail the export) and the test uses an 8 GiB range; ranges are address
+space only, so this costs nothing.
+
+**What remains open after this.** The rebuild is per type (four written). A define of a type with no
+exposed-buffer accessor and no rebuild gets neither check nor fix, which is approach C's refusal
+by name. The by-address allocator switches are tied to the installed wheel's symbol offsets.
+
 ### Alternatives met on the way
 
 - **Restore worker 0 as the new root.** For a fork with one branch (2.4 with a single worker) the

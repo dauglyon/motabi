@@ -40,7 +40,9 @@ Scripts, each printing one line per check prefixed with the library name:
   empties numpy's dims cache in the worker; `--modscan` checks `sys.modules` for dangling entries at
   each stage; `--types` records each range object's type in the worker; `--rust-arena` moves the worker thread to a
   fresh arena in polars' bundled jemalloc (mallctl by address); `--arrow-mi` gives the worker thread a
-  fresh heap in Arrow's bundled mimalloc with arena allocation and page reclaim off (by address). The worker dumps the Python
+  fresh heap in Arrow's bundled mimalloc with arena allocation and page reclaim off (by address);
+  `--relocate` enables the export check (exposed buffers outside the range: rebuild once on this
+  thread, recheck, refuse); `--force-relocate` always rebuilds, to exercise it. The worker dumps the Python
   range to `/tmp/join-range0.bin` right after the deltas, before anything else allocates.
   Environment: `RANGEMALLOC_ZERO_FREE=1` (shim zeroes blocks freed at home),
   `_RJEM_MALLOC_CONF=retain:false,...` (polars' jemalloc), `ARROW_DEFAULT_MEMORY_POOL=system`.

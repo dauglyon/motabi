@@ -27,7 +27,8 @@ zeroes blocks freed at home. Three more drivers: `run_gv_offsets.sh` (do pages k
 offset in `pages.img` across a restore?), `run_gv_conflict.sh <shim> [SEQUENCE=1]` (two workers
 restored from one checkpoint, each checkpointed after building, page images diffed against the
 root's), and `../../scatter-libs/conflict_host.py` for the same question on the host with
-soft-dirty bits and per-mapping attribution.
+soft-dirty bits and per-mapping attribution. `run_gv_pool.sh <shim>`: where polars and torch put
+results their surviving pool threads compute after a restore, and which rebuilds relocate a result.
 
 The control surface the drivers call through `ctypes`: `rangemalloc_register(base, size)` (every
 process copy must know every range), `rangemalloc_use(idx)` (makes the range writable and current;

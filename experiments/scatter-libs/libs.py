@@ -143,3 +143,20 @@ def check_second(lib, o):
         s = int(o.sum()); return s == SUM, f"column sum={'ok' if s == SUM else s}"
     first = N // 1000 * 0 + sum(range(1000))
     s = int(o.sum()); return s == first, f"row0 sum={'ok' if s == first else s}"
+
+
+def relocate(lib, obj):
+    """Rebuild `obj` so its memory is allocated by the calling thread, for a result whose buffers a
+    library pool thread allocated outside the range. Each rebuild goes through memory the calling
+    thread owns; a shallow clone or a zero-copy export would keep the old buffers."""
+    if lib == "numpy": return obj.copy()
+    if lib == "torch": return obj.clone()
+    if lib == "pyarrow":
+        import pyarrow as pa
+        return pa.table({n: pa.array(obj.column(n).to_numpy()) for n in obj.column_names})
+    if lib == "polars":
+        # per column through numpy: polars' own frame constructors may hand column building to its
+        # thread pool (seen in gVisor: one of three columns rebuilt outside the range)
+        import polars as pl
+        return pl.DataFrame({c: obj.get_column(c).to_numpy() for c in obj.columns})
+    raise KeyError(lib)

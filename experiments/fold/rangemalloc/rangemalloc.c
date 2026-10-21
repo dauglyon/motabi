@@ -64,7 +64,7 @@ typedef struct {
 static Range R[MAXR]; static int NR = 0; static atomic_int cur = -1;
 static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
 static atomic_size_t n_home, n_divert, n_divert_bytes, n_realloc_home_to_range, n_free_range_current;
-static atomic_size_t n_mmap_divert, n_mmap_divert_bytes, n_mmap_pass, n_munmap_range_foreign, n_mremap_refused;
+static atomic_size_t n_mmap_divert, n_mmap_divert_bytes, n_mmap_pass, n_munmap_range_foreign, n_mremap_refused, n_mmap_divert_failed;
 
 static inline int in_range(const void *p){ const char *c = p; for (int i = 0; i < NR; i++) if (c >= R[i].base && c < R[i].base + R[i].size) return i; return -1; }
 
@@ -255,7 +255,8 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off){
   pthread_mutex_lock(&lk);
   uintptr_t top = (uintptr_t)r->base + r->size - r->mbump;
   uintptr_t p = (top - len) & ~(uintptr_t)(align - 1);
-  if (p < (uintptr_t)r->base + r->bump + (r->size / 2)) { pthread_mutex_unlock(&lk); errno = ENOMEM; return MAP_FAILED; }   /* keep the bottom half for the backing */
+  if (p < (uintptr_t)r->base + r->bump + (r->size / 2)) {   /* the mmap half of the range is spent: an allocator falling back to brk would land outside, so this is counted and must fail the export */
+    pthread_mutex_unlock(&lk); atomic_fetch_add(&n_mmap_divert_failed, 1); errno = ENOMEM; return MAP_FAILED; }
   r->mbump = (uintptr_t)r->base + r->size - p;
   pthread_mutex_unlock(&lk);
   /* the range is already mapped PROT_NONE|RW; remap this piece so its flags and the kernel's accounting are what the caller asked for */
@@ -300,10 +301,10 @@ const char *rangemalloc_stats(void){
   size_t fb = 0, fk = 0; for (int i = 0; i < NR; i++) { fb += atomic_load(&R[i].foreign_freed_blocks); fk += atomic_load(&R[i].foreign_freed_bytes); }
   snprintf(statbuf, sizeof statbuf, "backing=%s home=%s ranges=%d cur=%d home_calls=%zu diverted=%zu diverted_bytes=%zu "
            "freed_in_current=%zu realloc_home_to_range=%zu foreign_freed_blocks=%zu foreign_freed_bytes=%zu "
-           "mmap_diverted=%zu mmap_diverted_bytes=%zu mmap_passed=%zu munmap_foreign=%zu mremap_refused=%zu",
+           "mmap_diverted=%zu mmap_diverted_bytes=%zu mmap_passed=%zu munmap_foreign=%zu mremap_refused=%zu mmap_divert_failed=%zu",
            BACKING_NAME, HOME_NAME, NR, atomic_load(&cur), atomic_load(&n_home), atomic_load(&n_divert), atomic_load(&n_divert_bytes),
            atomic_load(&n_free_range_current), atomic_load(&n_realloc_home_to_range), fb, fk,
-           atomic_load(&n_mmap_divert), atomic_load(&n_mmap_divert_bytes), atomic_load(&n_mmap_pass), atomic_load(&n_munmap_range_foreign), atomic_load(&n_mremap_refused));
+           atomic_load(&n_mmap_divert), atomic_load(&n_mmap_divert_bytes), atomic_load(&n_mmap_pass), atomic_load(&n_munmap_range_foreign), atomic_load(&n_mremap_refused), atomic_load(&n_mmap_divert_failed));
   return statbuf;
 }
 __attribute__((constructor)) static void ctor(void){ init_home(); }
