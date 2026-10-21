@@ -186,23 +186,41 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
    popped-element case and the walkers' cases are `experiments/scatter-libs/checks/refs.py` and
    `walk.py`, run as the harness below). (c) The per-type buffer list has four entries and an
    unknown type is carried unchecked. (d) A kernel exit after a scatter still finalises imported
-   objects. (e) The worker's Python range is a jemalloc arena in the shim, so frees are reused
-   and the dump is sparse (commit 523d9eb; `checks/alloc.py`: a loop allocating and freeing 10 GiB
-   of small objects stays in the range and exports a 14 MB dump). The ranges are 4 GiB (Python)
-   and 8 GiB (libc) of address space per worker, 48 pairs, not recycled (issue 2). `motabi/npdivert.c` stays **disabled**.
+   objects. (e) A worker's small objects come from CPython's own pymalloc, whose 1 MiB
+   arenas are carved from the top of the worker's Python range and whose pool lists are emptied
+   at the switch so no pre-fork pool is reused (2026-10-21; `foldalloc.c` arena_alloc,
+   pymalloc_reset). Every other allocation passes through the original allocators to the
+   preloaded shim, whose jemalloc arena takes the bottom of the range and now purges freed
+   extents at once. The first page of a Python range marks which 1 MiB slots hold arenas; the
+   root frees an imported small block by the pool header pymalloc left in its page and gives an
+   empty pool's 16 KiB back (pool_free), and pymalloc itself never sees an imported block (its
+   radix tree of arenas holds none of the worker's). Measured (`checks/speed.py`, 10 M one-item
+   lists in a forked worker): 2.24 s and 120 B per object against plain CPython's 2.02 s and
+   120 B, from 3.87 s and 229 B through the shim's arena alone; `checks/rootfree.py`: 300 k
+   imported strings dropped in the root return their pools, RSS 52 → 31 MB; `checks/frag.py`: a
+   worker that freed a million strings exports a 1 MB dump. In the sandbox the scatter cell's
+   Python dump fell from 18–26 MB to 3 MB per worker. A pre-fork block freed in a worker is
+   dropped, not handed to pymalloc, and one grown in a worker is copied into the range by its
+   pool's size class. The ranges are 4 GiB (Python) and 8 GiB (libc) of address space per
+   worker, 48 pairs, reserved 1 MiB-aligned, never reused (issue 2). `motabi/npdivert.c` stays **disabled**.
 
-2. **Ranges are not recycled.** Each scatter permanently consumes one address range per worker
-   from a fixed pool (`RANGES` in `motabi/fold.py`, currently 48). A long session with many
-   scatters will exhaust it. The design's intent is that a range is released when everything
-   merged into it has been dropped. An attempt on 2026-10-21 (`experiments/scatter-libs/checks/recycle-attempt.patch`, its test `checks/recycle.py`) counted
-   live imported objects per range and found the blocker: after every gathered value is dropped
-   and collected, pre-fork objects still hold pointers into the range (a 60-scatter run ended
-   "0 free, 48 with no live imported object but still pointed into", 88 pointers into the first
-   range), so a release keyed on imported objects frees memory that the kernel's own objects
-   reference. The bookkeeping needs the walk of 1(b) in reverse: the references the import
-   installed from pre-fork objects into the range (the key-table replays, the dict re-keys,
-   the untabled references) recorded per range and undone, or counted to zero, before release.
-   The attempt's test is a 60-scatter loop of one worker each with the gather dropped between.
+2. **Ranges are address space, never reused; memory returns per object.** Each scatter takes one
+   address range per worker from a fixed pool (`RANGES` in `motabi/fold.py`, 48) and the pool is
+   not refilled: an attempt to release a range by counting its live imported objects (2026-10-21,
+   `experiments/scatter-libs/checks/recycle-attempt.patch`, its test `checks/recycle.py`) found
+   permanent kernel objects pointing into every range after all gathers were dropped (appended
+   attribute names in shared key tables, re-keyed dicts, adopted strings), so address reuse would
+   free memory the kernel references. The settled direction: addresses are not scarce (one
+   process inside gVisor reserves 48 TiB; 2048 reservations of 16 GiB cost nothing in images or
+   time), so the pool should be one contiguous reservation sized from the address-space budget,
+   indexed by arithmetic (`MAXR` is 128 and `in_range` is a linear scan on every free, both to
+   go), with the session's bound stated in worker-scatters; what must come back is memory, per
+   object, which 1(e) now does for small objects and the shim's purge does for the worker's
+   freed extents. Still open there: the root returns an imported libc block's pages only for
+   blocks of 64 KiB and up (`rangemalloc.c` range_free); one range per worker sized as a peak
+   working set instead of the 4 + 8 GiB split (NumPy data lands in the Python range); nested
+   scatters, whose allotment counter every worker copy inherits. The adversarial review that
+   produced this list is summarised in `docs/scatter-research.md`.
 
 3. **No scheduler, no real site.** The guest stands in for a login node: ssh, rsync, and runsc
    invoked directly. A Slurm or Superfacility adapter (submit, status, cancel, walltime

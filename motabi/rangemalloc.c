@@ -107,7 +107,8 @@ static bool ext_dalloc(extent_hooks_t *h, void *a, size_t s, bool c, unsigned i)
 static void ext_destroy(extent_hooks_t *h, void *a, size_t s, bool c, unsigned i){ (void)h;(void)a;(void)s;(void)c;(void)i; }
 static bool ext_commit(extent_hooks_t *h, void *a, size_t s, size_t o, size_t l, unsigned i){ (void)h;(void)a;(void)s;(void)o;(void)l;(void)i; return false; }
 static bool ext_decommit(extent_hooks_t *h, void *a, size_t s, size_t o, size_t l, unsigned i){ (void)h;(void)a;(void)s;(void)o;(void)l;(void)i; return true; }
-static bool ext_purge(extent_hooks_t *h, void *a, size_t s, size_t o, size_t l, unsigned i){ (void)h;(void)a;(void)s;(void)o;(void)l;(void)i; return true; }
+/* Pages of freed extents go back to the OS when the arena purges (decay below); a worker's dead temporaries then neither stay resident nor travel in its dump. */
+static bool ext_purge(extent_hooks_t *h, void *a, size_t s, size_t o, size_t l, unsigned i){ (void)h;(void)s;(void)i; return madvise((char *)a + o, l, MADV_DONTNEED) != 0; }
 static bool ext_split(extent_hooks_t *h, void *a, size_t s, size_t sa, size_t sb, bool c, unsigned i){ (void)h;(void)a;(void)s;(void)sa;(void)sb;(void)c;(void)i; return false; }
 static bool ext_merge(extent_hooks_t *h, void *a, size_t sa, void *b, size_t sb, bool c, unsigned i){ (void)h;(void)a;(void)sa;(void)b;(void)sb;(void)c;(void)i; return false; }
 static extent_hooks_t hooks = { ext_alloc, ext_dalloc, ext_destroy, ext_commit, ext_decommit, ext_purge, ext_purge, ext_split, ext_merge };
@@ -115,7 +116,12 @@ static int backing_open(Range *r){
   unsigned ind; size_t sz = sizeof ind; extent_hooks_t *hp = &hooks;
   r->bump = 0; opening = r;
   int err = rj_mallctl("arenas.create", &ind, &sz, &hp, sizeof hp);
-  if (!err) { r->arena = ind; r->ready = true; }
+  if (!err) {
+    r->arena = ind; r->ready = true;
+    char name[64]; ssize_t ms = 0;   /* purge as soon as an extent is free: nothing waits for it */
+    snprintf(name, sizeof name, "arena.%u.dirty_decay_ms", ind); rj_mallctl(name, NULL, NULL, &ms, sizeof ms);
+    snprintf(name, sizeof name, "arena.%u.muzzy_decay_ms", ind); rj_mallctl(name, NULL, NULL, &ms, sizeof ms);
+  }
   opening = NULL; return err ? -1 : 0;
 }
 static void *backing_alloc(Range *r, size_t n){ return rj_mallocx(n ? n : 1, MALLOCX_ARENA(r->arena) | MALLOCX_TCACHE_NONE); }
@@ -249,6 +255,15 @@ int rangemalloc_open(int i){
   return 0;
 }
 void *rangemalloc_alloc(int i, size_t n){ return range_alloc(&R[i], n, 0); }
+/* A block from the top of the range, never given back (pymalloc's arenas, foldalloc.c); the
+   arena's extents from the bottom stop where these begin, as they do for diverted mmaps. */
+void *rangemalloc_top_alloc(int i, size_t len, size_t align){
+  if (i < 0 || i >= NR) return NULL; Range *r = &R[i];
+  pthread_mutex_lock(&lk);
+  uintptr_t top = (uintptr_t)r->base + r->size - r->mbump, p = (top - len) & ~(uintptr_t)(align - 1);
+  if (p < (uintptr_t)r->base + r->bump) { pthread_mutex_unlock(&lk); return NULL; }
+  r->mbump = (uintptr_t)r->base + r->size - p; pthread_mutex_unlock(&lk); return (void *)p;
+}
 void rangemalloc_free(void *p){ int ri = in_range(p); if (ri >= 0) range_free(ri, p); }
 /* Only in a copy that never opened the range's arena (the root): the pages go back to the OS, so
    a later use of the range starts from zero pages (the dumps skip all-zero pages), and the

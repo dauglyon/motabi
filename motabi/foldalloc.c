@@ -4,6 +4,8 @@
 #include <Python.h>
 #include "internal/pycore_frame.h"
 #include "internal/pycore_interp.h"
+#include "internal/pycore_obmalloc.h"
+#include "internal/pycore_pystate.h"
 #undef Py_BUILD_CORE
 #include <sys/mman.h>
 #include <string.h>
@@ -29,7 +31,24 @@ static void *(*shim_alloc)(int, size_t); static void (*shim_free)(void *); stati
 static PyObject **stk = NULL; static size_t stk_n = 0, stk_cap = 0; static size_t n_imm = 0;
 
 static PyMemAllocatorEx orig[3]; static int installed = 0;
+/* Small objects (<= 512 B) in a worker come from CPython's own pymalloc, whose 1 MiB arenas are
+   carved from the top of the worker's Python range (arena_alloc; the shim's extents grow from
+   the bottom) and whose pool lists are emptied at the switch (pymalloc_reset) so no pre-fork
+   pool is reused. Every other allocation passes through the original allocators and is placed
+   by the preloaded shim, which diverts libc's malloc and mmap into the range. The first page of a Python range is
+   metadata the root inherits with the import: bit k set = the 1 MiB slot k holds a pymalloc
+   arena. The root frees an imported small block by the pool header pymalloc left in the page:
+   the pool's count drops and an empty pool's 16 KiB goes back to the OS. Pymalloc itself never
+   sees an imported block (its radix tree of arenas does not hold the worker's). */
+#define META 4096
+static int npy = -1;   /* ranges [0, npy) are Python ranges, the rest libc */
+static PyObjectArenaAllocator orig_arena; static void *(*shim_top_alloc)(int, size_t, size_t);
+static uintptr_t *free_arenas; static size_t n_free_arenas, cap_free_arenas;   /* the worker's emptied arenas, reused */
+static size_t n_dropped_prefork = 0, n_pools_returned = 0, n_arenas = 0;
 static size_t n_divert = 0, n_free_inrange = 0, n_realloc_foreign = 0; static size_t freed_bytes[MAXR];
+static int is_py_range(int ri){ return npy < 0 || ri < npy; }
+static uint64_t *slab_bits(int ri){ return (uint64_t *)R[ri].base; }
+static int pym_block(int ri, const void *p){ if (!is_py_range(ri)) return 0; size_t k = (size_t)((const char *)p - R[ri].base) >> 20; return (int)((slab_bits(ri)[k >> 6] >> (k & 63)) & 1); }
 static void mark_freed(const char *p);
 static int is_mapped(const void *p);
 #define GC_HEAD (2 * sizeof(uintptr_t))   /* PyGC_Head on 3.12: two words before the object */
@@ -54,30 +73,98 @@ static void rfree(int ri, void *p){
   if (n >= 65536) { uintptr_t a = ((uintptr_t)p + 4095) & ~(uintptr_t)4095, e = ((uintptr_t)p + n) & ~(uintptr_t)4095; if (e > a) madvise((void *)a, e - a, MADV_DONTNEED); }
 }
 
-static void *m_malloc(void *ctx, size_t n){ if (cur >= 0) return ralloc(n); PyMemAllocatorEx *o = &orig[(intptr_t)ctx]; return o->malloc(o->ctx, n); }
-static void *m_calloc(void *ctx, size_t ne, size_t sz){ if (cur >= 0) { size_t n = ne * sz; void *p = ralloc(n); if (p) memset(p, 0, n); return p; } PyMemAllocatorEx *o = &orig[(intptr_t)ctx]; return o->calloc(o->ctx, ne, sz); }
+/* Diverted: the raw domain goes to the range's arena; the object and mem domains go to pymalloc,
+   whose pools are in the range after the switch and whose large requests reach the raw domain. */
+static void *m_malloc(void *ctx, size_t n){ if (cur >= 0 && !ctx && !shim_alloc) return ralloc(n); PyMemAllocatorEx *o = &orig[(intptr_t)ctx]; return o->malloc(o->ctx, n); }
+static void *m_calloc(void *ctx, size_t ne, size_t sz){ if (cur >= 0 && !ctx && !shim_alloc) { size_t n = ne * sz; void *p = ralloc(n); if (p) memset(p, 0, n); return p; } PyMemAllocatorEx *o = &orig[(intptr_t)ctx]; return o->calloc(o->ctx, ne, sz); }
+/* An imported small block: the pool header the worker's pymalloc left in the page. */
+static void pool_free(int ri, void *p){
+  poolp pool = POOL_ADDR(p); n_free_inrange++; freed_bytes[ri] += INDEX2SIZE(pool->szidx);
+  if (pool->ref.count && --pool->ref.count == 0) { madvise(pool, POOL_SIZE, MADV_DONTNEED); n_pools_returned++; }
+}
+/* Is a pre-fork block one of pymalloc's? Its radix tree of arenas, read as pymalloc reads it. */
+static int pym_home_block(const void *p){
+  struct _obmalloc_state *st = &PyInterpreterState_Get()->obmalloc;
+  arena_map_mid_t *m = st->usage.arena_map_root.ptrs[MAP_TOP_INDEX(p)]; if (!m) return 0;
+  arena_map_bot_t *n = m->ptrs[MAP_MID_INDEX(p)]; if (!n) return 0;
+  int i3 = (int)MAP_BOT_INDEX(p); int32_t hi = n->arenas[i3].tail_hi, lo = n->arenas[i3].tail_lo, tail = (int32_t)(AS_UINT(p) & ARENA_SIZE_MASK);
+  return (tail < lo) || (tail >= hi && hi != 0);
+}
 static void *m_realloc(void *ctx, void *p, size_t n){
   PyMemAllocatorEx *o = &orig[(intptr_t)ctx];
   if (!p) return m_malloc(ctx, n);
   int ri = in_range(p);
-  if (ri >= 0) { size_t old = bsize(p); void *q = cur >= 0 ? ralloc(n) : o->malloc(o->ctx, n); if (q) { memcpy(q, p, old < n ? old : n); rfree(ri, p); } return q; }
-  if (cur >= 0) n_realloc_foreign++;          /* a pre-fork block grown while diverted: stays foreign */
+  if (ri >= 0) {
+    if (ctx) {
+      if (pym_block(ri, p) && ri != cur) {   /* an imported small block: copied out by its pool's size class, its pool count dropped */
+        size_t old = INDEX2SIZE(POOL_ADDR(p)->szidx); void *q = o->malloc(o->ctx, n);
+        if (q) { memcpy(q, p, old < n ? old : n); pool_free(ri, p); } return q;
+      }
+      return o->realloc(o->ctx, p, n);        /* own pool block, or a large block pymalloc hands to the raw domain */
+    }
+    if (shim_alloc) return o->realloc(o->ctx, p, n);   /* raw: libc's realloc, which the shim copies into the current range or frees as foreign */
+    size_t old = bsize(p); void *q = ralloc(n); if (q) { memcpy(q, p, old < n ? old : n); rfree(ri, p); } return q;
+  }
+  if (cur >= 0 && ctx && pym_home_block(p)) {
+    /* a worker growing a pre-fork small block: copied into the range by its pool's size class;
+       pymalloc would free the old block and put its pool back on a list the switch emptied. A
+       pre-fork large block goes through pymalloc to the raw domain, where the shim copies it. */
+    n_realloc_foreign++; size_t old = INDEX2SIZE(POOL_ADDR(p)->szidx); void *q = o->malloc(o->ctx, n);
+    if (q) { memcpy(q, p, old < n ? old : n); n_dropped_prefork++; } return q;
+  }
   if (ctx) mark_freed(p);                     /* object and mem domains only: raw frees may run without the GIL */
   return o->realloc(o->ctx, p, n);
 }
 static void m_free(void *ctx, void *p){
   if (!p) return;
+  PyMemAllocatorEx *o = &orig[(intptr_t)ctx];
   int ri = in_range(p);
-  if (ri >= 0) { rfree(ri, p); return; }
+  if (ri >= 0) {
+    /* object and mem domains: an imported small block is freed by its pool header; anything
+       else goes back through pymalloc (or the debug layer above it), which frees its own pool
+       block or reaches the raw domain below for a large one. Raw: the shim's block. */
+    if (ctx) { if (pym_block(ri, p) && ri != cur) pool_free(ri, p); else o->free(o->ctx, p); }
+    else if (shim_alloc) o->free(o->ctx, p);   /* raw: libc's free, which the shim serves or counts as foreign */
+    else rfree(ri, p);
+    return;
+  }
+  if (cur >= 0 && ctx) { n_dropped_prefork++; return; }   /* a worker's free of a pre-fork block: its page is discarded at export; pymalloc would reuse its pool */
   if (ctx) mark_freed(p);
-  PyMemAllocatorEx *o = &orig[(intptr_t)ctx]; o->free(o->ctx, p);
+  o->free(o->ctx, p);
 }
-
+/* pymalloc's arenas: 1 MiB slots from the top of the current Python range in a worker, marked in
+   the range's first page; an arena pymalloc empties is zeroed and kept for its next one. */
+static void *arena_alloc(void *ctx, size_t n){
+  if (cur >= 0 && shim_top_alloc && is_py_range(cur) && n == ((size_t)1 << 20)) {
+    void *p = n_free_arenas ? (void *)free_arenas[--n_free_arenas] : shim_top_alloc(cur, n, n); if (!p) return NULL;
+    size_t k = (size_t)((char *)p - R[cur].base) >> 20; slab_bits(cur)[k >> 6] |= (uint64_t)1 << (k & 63); n_arenas++; return p;
+  }
+  return orig_arena.alloc(orig_arena.ctx, n);
+}
+static void arena_free(void *ctx, void *p, size_t n){
+  int ri = in_range(p);
+  if (ri >= 0) {
+    size_t k = (size_t)((char *)p - R[ri].base) >> 20; slab_bits(ri)[k >> 6] &= ~((uint64_t)1 << (k & 63)); madvise(p, n, MADV_DONTNEED);
+    if (n_free_arenas == cap_free_arenas) { cap_free_arenas = cap_free_arenas ? cap_free_arenas * 2 : 64; free_arenas = realloc(free_arenas, cap_free_arenas * sizeof *free_arenas); }
+    free_arenas[n_free_arenas++] = (uintptr_t)p; return;
+  }
+  orig_arena.free(orig_arena.ctx, p, n);
+}
+/* At the switch: pymalloc forgets every partly used pool and every usable arena of the pre-fork
+   heap, so its next allocation of any size class opens a pool in a new arena, in the range. */
+static void pymalloc_reset(void){
+  struct _obmalloc_state *st = &PyInterpreterState_Get()->obmalloc;
+  for (int i = 0; i < NB_SMALL_SIZE_CLASSES; i++) { poolp h = (poolp)((uint8_t *)&st->pools.used[2 * i] - 2 * sizeof(pymem_block *)); st->pools.used[2 * i] = h; st->pools.used[2 * i + 1] = h; }
+  st->mgmt.usable_arenas = NULL; memset(st->mgmt.nfp2lasta, 0, sizeof st->mgmt.nfp2lasta); n_free_arenas = 0;
+}
+static PyObject *py_python_ranges(PyObject *s, PyObject *o){ npy = (int)PyLong_AsLong(o); Py_RETURN_NONE; }
 static PyObject *py_install(PyObject *s, PyObject *a){
   if (installed) Py_RETURN_NONE;
   shim_alloc = dlsym(RTLD_DEFAULT, "rangemalloc_alloc"); shim_free = dlsym(RTLD_DEFAULT, "rangemalloc_free"); shim_open = dlsym(RTLD_DEFAULT, "rangemalloc_open");
   shim_spans = dlsym(RTLD_DEFAULT, "rangemalloc_spans"); shim_discard = dlsym(RTLD_DEFAULT, "rangemalloc_discard");
   if (!shim_alloc || !shim_free || !shim_open || !shim_spans || !shim_discard) shim_alloc = NULL;
+  shim_top_alloc = dlsym(RTLD_DEFAULT, "rangemalloc_top_alloc");
+  PyObject_GetArenaAllocator(&orig_arena); PyObjectArenaAllocator aa = { NULL, arena_alloc, arena_free }; PyObject_SetArenaAllocator(&aa);
   for (int d = 0; d < 3; d++) {
     PyMem_GetAllocator((PyMemAllocatorDomain)d, &orig[d]);
     PyMemAllocatorEx me = { (void *)(intptr_t)d, m_malloc, m_calloc, m_realloc, m_free };
@@ -89,8 +176,14 @@ static PyObject *py_reserve(PyObject *s, PyObject *a){
   int n; size_t size; if (!PyArg_ParseTuple(a, "in", &n, &size)) return NULL;
   PyObject *out = PyList_New(0);
   for (int i = 0; i < n; i++) {
-    void *p = mmap(NULL, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-    if (p == MAP_FAILED) return PyErr_SetFromErrno(PyExc_OSError);
+    /* 1 MiB-aligned, so an arena slot (1 MiB from the base) holds one whole pymalloc arena */
+    if (NR == MAXR) { PyErr_SetString(PyExc_RuntimeError, "range table full"); return NULL; }
+    size_t slack = (size_t)1 << 20;
+    char *raw = mmap(NULL, size + slack, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (raw == MAP_FAILED) return PyErr_SetFromErrno(PyExc_OSError);
+    char *p = (char *)(((uintptr_t)raw + slack - 1) & ~(uintptr_t)(slack - 1));
+    if (p > raw) munmap(raw, (size_t)(p - raw));
+    if (p + size < raw + size + slack) munmap(p + size, (size_t)(raw + size + slack - (p + size)));
     R[NR].base = p; R[NR].size = size; R[NR].used = 0; NR++;
     PyList_Append(out, PyLong_FromVoidPtr(p));
   }
@@ -104,7 +197,7 @@ static PyObject *py_use_range(PyObject *s, PyObject *a){
   int i = (int)PyLong_AsLong(a); if (i < 0 || i >= NR) { PyErr_SetString(PyExc_ValueError, "range"); return NULL; }
   if (mprotect(R[i].base, R[i].size, PROT_READ | PROT_WRITE)) return PyErr_SetFromErrno(PyExc_OSError);
   if (shim_alloc && shim_open(i)) return PyErr_Format(PyExc_RuntimeError, "the shim could not open range %d", i);
-  cur = i; PyGC_Collect(); bias_table(); Py_RETURN_NONE;
+  cur = i; pymalloc_reset(); PyGC_Collect(); bias_table(); Py_RETURN_NONE;
 }
 static PyObject *py_divert_off(PyObject *s, PyObject *a){ cur = -1; Py_RETURN_NONE; }
 static PyObject *py_used(PyObject *s, PyObject *a){ int i; if (!PyArg_ParseTuple(a, "i", &i)) return NULL; return PyLong_FromSize_t(R[i].used); }
@@ -117,7 +210,7 @@ static PyObject *py_track(PyObject *s, PyObject *o){
   if (PyObject_IS_GC(o)) { uintptr_t *h = (uintptr_t *)o; h[-2] = 0; h[-1] &= 1; PyObject_GC_Track(o); }
   Py_RETURN_NONE;
 }
-static PyObject *py_stats(PyObject *s, PyObject *a){ return Py_BuildValue("{s:n,s:n,s:n}", "diverted", (Py_ssize_t)n_divert, "freed_in_range", (Py_ssize_t)n_free_inrange, "realloc_foreign", (Py_ssize_t)n_realloc_foreign); }
+static PyObject *py_stats(PyObject *s, PyObject *a){ return Py_BuildValue("{s:n,s:n,s:n,s:n,s:n,s:n}", "diverted", (Py_ssize_t)n_divert, "freed_in_range", (Py_ssize_t)n_free_inrange, "realloc_foreign", (Py_ssize_t)n_realloc_foreign, "dropped_prefork", (Py_ssize_t)n_dropped_prefork, "pools_returned", (Py_ssize_t)n_pools_returned, "arenas", (Py_ssize_t)n_arenas); }
 static PyObject *py_range_usage(PyObject *s, PyObject *a){ int i; if (!PyArg_ParseTuple(a, "i", &i)) return NULL; return Py_BuildValue("(nn)", (Py_ssize_t)R[i].used, (Py_ssize_t)freed_bytes[i]); }
 
 /* Pre-fork object table: every reachable object with its refcount at snapshot time.
@@ -601,7 +694,10 @@ static Py_ssize_t dump_span_fd(int i, size_t off, size_t len, int fd);
 static Py_ssize_t dump_range_to(int i, const char *path){
   size_t lo = R[i].used, hi = 0; if (shim_alloc) shim_spans(i, &lo, &hi);
   int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd < 0) return -1;
-  Py_ssize_t n = dump_span_fd(i, 0, lo, fd); close(fd); return n;
+  if (shim_alloc && is_py_range(i)) lo += META;   /* the shim's range starts after the metadata page */
+  Py_ssize_t n = dump_span_fd(i, 0, lo, fd);      /* the metadata page and the arena's extents */
+  if (n >= 0 && hi) { Py_ssize_t m = dump_span_fd(i, R[i].size - hi, hi, fd); n = m < 0 ? m : n + m; }   /* pymalloc's arenas, from the top */
+  close(fd); return n;
 }
 static PyObject *py_dump_range(PyObject *s, PyObject *a){
   int i; const char *path; if (!PyArg_ParseTuple(a, "is", &i, &path)) return NULL;
@@ -839,7 +935,7 @@ static PyObject *py_root_phase(PyObject *s, PyObject *a){
     int rng = base + i; if (rng < 0 || rng >= NR) { PyErr_SetString(PyExc_ValueError, "range"); return NULL; }
     if (mprotect(R[rng].base, R[rng].size, PROT_READ | PROT_WRITE)) return PyErr_SetFromErrno(PyExc_OSError);
     if (shim_alloc && shim_open(rng)) return PyErr_Format(PyExc_RuntimeError, "the shim could not open range %d", rng);
-    cur = rng;
+    cur = rng; pymalloc_reset();
     if (libc_base >= 0) { int (*use)(int) = dlsym(RTLD_DEFAULT, "rangemalloc_use"); if (!use || use(libc_base + rng)) return PyErr_Format(PyExc_RuntimeError, "the libc shim could not open range %d", libc_base + rng); }
     /* the bias first: the collection may run finalisers, which can let another thread in, and
        no tabled object may die before it is biased. The caller disabled the collector for the
@@ -876,7 +972,7 @@ static PyMethodDef M[] = {
   {"release", py_release, METH_O, ""},
   {"relink_weakref", py_relink_weakref, METH_O, ""}, {"unintern", py_unintern, METH_O, ""}, {"is_interned", py_is_interned, METH_O, ""},
   {"park", py_park, METH_NOARGS, ""}, {"hold", py_hold, METH_VARARGS, ""}, {"unhold", py_unhold, METH_NOARGS, ""},
-  {"install", py_install, METH_NOARGS, ""}, {"reserve", py_reserve, METH_VARARGS, ""},
+  {"install", py_install, METH_NOARGS, ""}, {"reserve", py_reserve, METH_VARARGS, ""}, {"python_ranges", py_python_ranges, METH_O, ""},
   {"use_range", py_use_range, METH_O, ""}, {"divert_off", py_divert_off, METH_NOARGS, ""},
   {"used", py_used, METH_VARARGS, ""}, {"inrange", py_inrange, METH_VARARGS, ""},
   {"untrack", py_untrack, METH_O, ""}, {"track", py_track, METH_O, ""},

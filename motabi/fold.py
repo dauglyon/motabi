@@ -55,8 +55,13 @@ def install() -> None:
     shim.rangemalloc_spans.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t)]
     shim.rangemalloc_divert_failed.restype = ctypes.c_size_t
     shim.rangemalloc_stats.restype = ctypes.c_char_p
+    foldalloc.python_ranges(RANGES)
     for i, base in enumerate(py + libc):  # the shim's indices are foldalloc's: Python ranges, then libc ranges
-        assert shim.rangemalloc_register(base, PY_RANGE if i < RANGES else LIBC_RANGE) == i
+        # a Python range's first page is foldalloc's metadata (pymalloc arena slots); the shim gets the rest
+        if i < RANGES:
+            assert shim.rangemalloc_register(base + 4096, PY_RANGE - 4096) == i
+        else:
+            assert shim.rangemalloc_register(base, LIBC_RANGE) == i
     _shim = shim
 
 

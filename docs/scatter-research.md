@@ -668,3 +668,28 @@ user writes (no `device="cuda"` in the kernel) and is the fallback, not the desi
 
 Untested: restore on a different GPU model (NVIDIA documents a matching chip type), several
 GPUs, NCCL, a long time checkpointed, Triton and torch.compile caches.
+
+## Allocator note: pymalloc in the range (2026-10-21)
+
+The worker's Python objects were served by the shim's jemalloc arena with a 16-byte header per
+block: 3.87 s and 229 B per object for ten million one-item lists against plain CPython's 2.02 s
+and 120 B, and jemalloc's thread cache recovered 8 percent of that. The fix keeps CPython's
+pymalloc and moves it: its arena allocator is replaced so that, in a worker, 1 MiB arenas are
+carved from the top of the Python range, and at the switch its used-pool lists, usable-arena list
+and per-count index are emptied so no pre-fork pool is reused. Frees of pre-fork blocks in a
+worker are dropped (their pages are discarded at export; pymalloc would relink the pool), and a
+pre-fork small block grown in a worker is copied by its pool's size class, read from the pool
+header. In the root, pymalloc does not recognise an imported block (its radix tree of arenas has
+none of the worker's) and hands it to the raw domain, where the extension reads the pool header
+the worker left in the page, drops its count and madvises an empty pool. Measured: 2.24 s and 120
+B per object; 300 k imported strings dropped return their pools (RSS 52 → 31 MB); a worker that
+freed a million strings exports a 1 MB dump with the shim's purge on.
+
+An adversarial review of the "reserve a large pool, never recycle" design (2026-10-21) measured:
+one gVisor process reserves 48 TiB; 2048 reservations of 16 GiB cost nothing in checkpoint images
+or time; gVisor faults private memory in 2 MiB units; a sandbox madvise costs 14 µs; the restore
+does no address-space check on systrap; a host in strict overcommit refuses the first whole-range
+mprotect (so only gVisor can run the kernel, and the adapter must not pass a job's RLIMIT_AS into
+the spec); `MAXR` 128 and the linear range scan make thousands of separate ranges impossible as
+built; NumPy data lands in the Python range, so the 4 GiB half caps it; nested scatters cannot
+share the pool with an inherited counter.
