@@ -300,7 +300,8 @@ static size_t amap_slot(AMap *m, uintptr_t key, int *added){
 static struct { int rng; AMap seen, extra, demote; Py_ssize_t *cnt; PyObject **stk, **reached; size_t n, cap, nreached; const char *refuse; PyObject *foreign; } W;
 static void w_push(PyObject *o){
   int added; amap_slot(&W.seen, (uintptr_t)o, &added); if (!added) return;
-  if (W.n == W.cap) { W.cap = W.cap ? W.cap * 2 : 1 << 16; W.stk = realloc(W.stk, W.cap * sizeof *W.stk); W.reached = realloc(W.reached, W.cap * sizeof *W.reached); }
+  /* reached only grows while the stack is popped, so it is the one that bounds both arrays */
+  if (W.nreached == W.cap) { W.cap = W.cap ? W.cap * 2 : 1 << 16; W.stk = realloc(W.stk, W.cap * sizeof *W.stk); W.reached = realloc(W.reached, W.cap * sizeof *W.reached); }
   W.stk[W.n++] = o; W.reached[W.nreached++] = o;
 }
 static int holds_range_objects(PyObject *r){
