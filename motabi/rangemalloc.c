@@ -16,10 +16,18 @@
 
    Every diverted block carries a 16-byte header (size, offset to jemalloc's block start) so free,
    realloc and malloc_usable_size work on it in a copy that has no jemalloc metadata.
-   Control, called by motabi.fold through ctypes:
+   Control, called by motabi.fold through ctypes and by foldalloc.c through dlsym:
      int rangemalloc_register(void *base, size_t size)   -> index; every copy must know every range
      int rangemalloc_use(int idx)                         -> 0; makes the range writable and current
      void rangemalloc_off(void)
+     int rangemalloc_open(int idx)                        -> 0; writable with an arena, not current:
+                                                              the backing of a Python range, whose
+                                                              blocks foldalloc.c takes and returns with
+     void *rangemalloc_alloc(int idx, size_t n)              these two; a free of a block whose arena
+     void rangemalloc_free(void *p)                          is in another copy is counted, never
+                                                              handed to jemalloc
+     void rangemalloc_discard(int idx)                    -> the range's pages dropped and the
+                                                              reservation made inaccessible again
      int rangemalloc_spans(int idx, size_t *lo, size_t *hi) -> bytes handed out from the bottom
                                                               (jemalloc) and from the top (mmap)
      size_t rangemalloc_divert_failed(void)               -> mmaps refused because the range was
@@ -125,7 +133,7 @@ static void *range_alloc(Range *r, size_t n, size_t align){
 }
 static void range_free(int ri, void *p){
   Hdr *h = hdr(p);
-  if (ri == atomic_load(&cur)) { atomic_fetch_add(&n_free_range_current, 1); backing_free((char *)p - h->off); return; }
+  if (R[ri].ready) { atomic_fetch_add(&n_free_range_current, 1); backing_free((char *)p - h->off); return; }   /* the arena is in this copy */
   /* another copy's metadata: count, and give large blocks' pages back */
   atomic_fetch_add(&R[ri].foreign_freed_blocks, 1); atomic_fetch_add(&R[ri].foreign_freed_bytes, h->size);
   if (h->size >= 65536) { uintptr_t a = ((uintptr_t)p + 4095) & ~(uintptr_t)4095, e = ((uintptr_t)p + h->size) & ~(uintptr_t)4095; if (e > a) madvise((void *)a, e - a, MADV_DONTNEED); }
@@ -234,6 +242,22 @@ int rangemalloc_use(int i){
   atomic_store(&cur, i); return 0;
 }
 void rangemalloc_off(void){ atomic_store(&cur, -1); }
+int rangemalloc_open(int i){
+  if (i < 0 || i >= NR) return -1;
+  if (mprotect(R[i].base, R[i].size, PROT_READ | PROT_WRITE)) return -1;
+  if (!R[i].ready && backing_open(&R[i])) return -2;
+  return 0;
+}
+void *rangemalloc_alloc(int i, size_t n){ return range_alloc(&R[i], n, 0); }
+void rangemalloc_free(void *p){ int ri = in_range(p); if (ri >= 0) range_free(ri, p); }
+/* Only in a copy that never opened the range's arena (the root): the pages go back to the OS, so
+   a later use of the range starts from zero pages (the dumps skip all-zero pages), and the
+   reservation is inaccessible until it is opened again. */
+void rangemalloc_discard(int i){
+  if (i < 0 || i >= NR || R[i].ready) return;
+  madvise(R[i].base, R[i].size, MADV_DONTNEED); mprotect(R[i].base, R[i].size, PROT_NONE);
+  pthread_mutex_lock(&lk); R[i].bump = R[i].mbump = 0; pthread_mutex_unlock(&lk);
+}
 int rangemalloc_spans(int i, size_t *lo, size_t *hi){
   if (i < 0 || i >= NR) return -1;
   pthread_mutex_lock(&lk); *lo = R[i].bump; *hi = R[i].mbump; pthread_mutex_unlock(&lk); return 0;

@@ -3,12 +3,12 @@ preloaded libc shim (rangemalloc).
 
 The root takes a refcount table of every reachable object and freezes the GC before the
 snapshot. A worker diverts all three Python allocator domains into its Python range and every
-libc allocation and anonymous mapping into its libc range (the shim), drains NumPy's cache of
+libc allocation and anonymous mapping into its libc range (both backed by a jemalloc arena in
+the preloaded shim, so the worker's frees are reused), drains NumPy's cache of
 pre-fork shape buffers, runs, carries each define whose library owns its memory through an
 allocator nothing fronts (polars' bundled jemalloc) as an Arrow copy, checks that every buffer
 its defines expose is in a range (rebuilding a result once if a library pool thread placed it
-outside), and exports: the Python range as a file, the touched pages of the libc range as a
-sparse file, the address of each define, the objects reachable from the defines through the range, the
+outside), and exports: the touched pages of both its ranges as sparse files, the address of each define, the objects reachable from the defines through the range, the
 number of references those objects hold to each pre-fork object (a walk, DESIGN.md 2.4), and the
 shared attribute-key tables it changed.
 The root maps both files at the same addresses, replays the manifest, gives each imported native
@@ -42,7 +42,7 @@ def install() -> None:
     """At kernel start: wrappers on, ranges reserved, the shim told about its ranges."""
     global _shim
     foldalloc.install()
-    foldalloc.reserve(RANGES, PY_RANGE)
+    py = foldalloc.reserve(RANGES, PY_RANGE)
     libc = foldalloc.reserve(RANGES, LIBC_RANGE)
     try:
         shim = ctypes.CDLL(None)
@@ -55,8 +55,8 @@ def install() -> None:
     shim.rangemalloc_spans.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t)]
     shim.rangemalloc_divert_failed.restype = ctypes.c_size_t
     shim.rangemalloc_stats.restype = ctypes.c_char_p
-    for i, base in enumerate(libc):
-        assert shim.rangemalloc_register(base, LIBC_RANGE) == i
+    for i, base in enumerate(py + libc):  # the shim's indices are foldalloc's: Python ranges, then libc ranges
+        assert shim.rangemalloc_register(base, PY_RANGE if i < RANGES else LIBC_RANGE) == i
     _shim = shim
 
 
@@ -178,9 +178,9 @@ def worker_begin(rng: int, switched: bool = False) -> list[str]:
     if not switched:
         foldalloc.use_range(rng)
         if _shim is not None:
-            rc = _shim.rangemalloc_use(rng)
+            rc = _shim.rangemalloc_use(RANGES + rng)
             if rc:
-                raise RuntimeError(f"the libc shim could not open range {rng} (rc {rc})")
+                raise RuntimeError(f"the libc shim could not open range {RANGES + rng} (rc {rc})")
     _drain_numpy()
     return []
 
@@ -401,12 +401,15 @@ def worker_export(rng: int, glbls: Any, names: set[str], path: str) -> list[str]
     # before tracking (foldalloc.track) and leaves unreached objects untracked (foldalloc.leave).
     lo, hi = ctypes.c_size_t(), ctypes.c_size_t()
     if _shim is not None:
-        _shim.rangemalloc_spans(rng, ctypes.byref(lo), ctypes.byref(hi))
+        _shim.rangemalloc_spans(RANGES + rng, ctypes.byref(lo), ctypes.byref(hi))
     gc.disable()
     reached, tracked, leftover, deltas, extra, demote, keys, n, libc_bytes = foldalloc.export_tail(
         rng, RANGES + rng if _shim is not None else -1, lo.value, hi.value, path + ".bin", path + ".libc", list(defs.values()))
     if _shim is not None:
-        notes.append(f"libc range: {lo.value >> 20} MB of extents, {hi.value >> 20} MB of mappings, {libc_bytes >> 20} MB touched")
+        plo, phi = ctypes.c_size_t(), ctypes.c_size_t()
+        _shim.rangemalloc_spans(rng, ctypes.byref(plo), ctypes.byref(phi))
+        notes.append(f"python range: {plo.value >> 20} MB of extents, {n >> 20} MB touched; "
+                     f"libc range: {lo.value >> 20} MB of extents, {hi.value >> 20} MB of mappings, {libc_bytes >> 20} MB touched")
     with open(path + ".tmp", "wb") as f:
         pickle.dump({"bytes": n, "libc_bytes": libc_bytes, "defs": defs, "reached": reached, "tracked": tracked, "leftover": leftover,
                      "deltas": deltas, "extra": extra, "demote": demote, "keys": keys, "notes": notes}, f)
@@ -531,7 +534,7 @@ def root_import(rng: int, path: str, log: Callable[[str], None] = lambda s: None
         m = pickle.load(f)
     if "error" in m:
         raise RuntimeError(m["error"])
-    foldalloc.import_file(rng, path + ".bin", m["bytes"])
+    foldalloc.import_spans(rng, path + ".bin")
     if m["libc_bytes"] or os.path.exists(path + ".libc"):
         foldalloc.import_spans(RANGES + rng, path + ".libc")
     foldalloc.replay_manifest(m)  # counts, key tables, untabled references, demotions, GC heads

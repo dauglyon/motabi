@@ -16,14 +16,20 @@
 #include <dlfcn.h>
 
 /* Ranges: reserved address ranges, one per branch. cur = range all new
-   allocations are diverted into (-1 = passthrough to the original allocators). */
+   allocations are diverted into (-1 = passthrough to the original allocators).
+   A range's blocks come from the preloaded shim (motabi/rangemalloc.c), which backs each range
+   with a jemalloc arena whose extents are taken from the bottom of the range, so a worker's frees
+   are reused and a plain loop does not exhaust the range; the shim's calls are found with dlsym
+   at install. Without the shim the range is a bump cursor (used) that ignores frees. Either way a
+   block carries its size in the 16 bytes before it. */
 #define MAXR 128
 typedef struct { char *base; size_t size; size_t used; } Range;
 static Range R[MAXR]; static int NR = 0; static int cur = -1;
+static void *(*shim_alloc)(int, size_t); static void (*shim_free)(void *); static int (*shim_open)(int); static int (*shim_spans)(int, size_t *, size_t *); static void (*shim_discard)(int);
 static PyObject **stk = NULL; static size_t stk_n = 0, stk_cap = 0; static size_t n_imm = 0;
 
 static PyMemAllocatorEx orig[3]; static int installed = 0;
-static size_t n_divert = 0, n_free_inrange = 0, n_realloc_foreign = 0;
+static size_t n_divert = 0, n_free_inrange = 0, n_realloc_foreign = 0; static size_t freed_bytes[MAXR];
 static void mark_freed(const char *p);
 static int is_mapped(const void *p);
 #define GC_HEAD (2 * sizeof(uintptr_t))   /* PyGC_Head on 3.12: two words before the object */
@@ -39,35 +45,39 @@ static void *bump(size_t n){
   return r->base + off + 16;
 }
 static size_t bsize(void *p){ return *(size_t *)((char *)p - 16); }
+static void *ralloc(size_t n){ if (!n) n = 1; if (shim_alloc) { void *p = shim_alloc(cur, n); if (p) n_divert++; return p; } return bump(n); }
+/* a block in a range: the shim reuses it when the range's arena is in this copy and counts it
+   otherwise (giving a large block's pages back); without the shim, large blocks' pages go back here */
+static void rfree(int ri, void *p){
+  n_free_inrange++; size_t n = bsize(p); freed_bytes[ri] += n + 16;
+  if (shim_free) { shim_free(p); return; }
+  if (n >= 65536) { uintptr_t a = ((uintptr_t)p + 4095) & ~(uintptr_t)4095, e = ((uintptr_t)p + n) & ~(uintptr_t)4095; if (e > a) madvise((void *)a, e - a, MADV_DONTNEED); }
+}
 
-static void *m_malloc(void *ctx, size_t n){ if (cur >= 0) return bump(n ? n : 1); PyMemAllocatorEx *o = &orig[(intptr_t)ctx]; return o->malloc(o->ctx, n); }
-static void *m_calloc(void *ctx, size_t ne, size_t sz){ if (cur >= 0) { size_t n = ne * sz; void *p = bump(n ? n : 1); if (p) memset(p, 0, n); return p; } PyMemAllocatorEx *o = &orig[(intptr_t)ctx]; return o->calloc(o->ctx, ne, sz); }
+static void *m_malloc(void *ctx, size_t n){ if (cur >= 0) return ralloc(n); PyMemAllocatorEx *o = &orig[(intptr_t)ctx]; return o->malloc(o->ctx, n); }
+static void *m_calloc(void *ctx, size_t ne, size_t sz){ if (cur >= 0) { size_t n = ne * sz; void *p = ralloc(n); if (p) memset(p, 0, n); return p; } PyMemAllocatorEx *o = &orig[(intptr_t)ctx]; return o->calloc(o->ctx, ne, sz); }
 static void *m_realloc(void *ctx, void *p, size_t n){
   PyMemAllocatorEx *o = &orig[(intptr_t)ctx];
   if (!p) return m_malloc(ctx, n);
-  if (in_range(p) >= 0) { size_t old = bsize(p); void *q = cur >= 0 ? bump(n ? n : 1) : o->malloc(o->ctx, n); if (q) memcpy(q, p, old < n ? old : n); return q; }
+  int ri = in_range(p);
+  if (ri >= 0) { size_t old = bsize(p); void *q = cur >= 0 ? ralloc(n) : o->malloc(o->ctx, n); if (q) { memcpy(q, p, old < n ? old : n); rfree(ri, p); } return q; }
   if (cur >= 0) n_realloc_foreign++;          /* a pre-fork block grown while diverted: stays foreign */
   if (ctx) mark_freed(p);                     /* object and mem domains only: raw frees may run without the GIL */
   return o->realloc(o->ctx, p, n);
 }
-static size_t freed_bytes[MAXR];
 static void m_free(void *ctx, void *p){
   if (!p) return;
   int ri = in_range(p);
-  if (ri >= 0) {
-    n_free_inrange++; size_t n = bsize(p); freed_bytes[ri] += n + 16;
-    if (n >= 65536) {            /* large block: give its whole pages back to the OS now */
-      uintptr_t a = ((uintptr_t)p + 4095) & ~(uintptr_t)4095, e = ((uintptr_t)p + n) & ~(uintptr_t)4095;
-      if (e > a) madvise((void *)a, e - a, MADV_DONTNEED);
-    }
-    return;
-  }
+  if (ri >= 0) { rfree(ri, p); return; }
   if (ctx) mark_freed(p);
   PyMemAllocatorEx *o = &orig[(intptr_t)ctx]; o->free(o->ctx, p);
 }
 
 static PyObject *py_install(PyObject *s, PyObject *a){
   if (installed) Py_RETURN_NONE;
+  shim_alloc = dlsym(RTLD_DEFAULT, "rangemalloc_alloc"); shim_free = dlsym(RTLD_DEFAULT, "rangemalloc_free"); shim_open = dlsym(RTLD_DEFAULT, "rangemalloc_open");
+  shim_spans = dlsym(RTLD_DEFAULT, "rangemalloc_spans"); shim_discard = dlsym(RTLD_DEFAULT, "rangemalloc_discard");
+  if (!shim_alloc || !shim_free || !shim_open || !shim_spans || !shim_discard) shim_alloc = NULL;
   for (int d = 0; d < 3; d++) {
     PyMem_GetAllocator((PyMemAllocatorDomain)d, &orig[d]);
     PyMemAllocatorEx me = { (void *)(intptr_t)d, m_malloc, m_calloc, m_realloc, m_free };
@@ -93,6 +103,7 @@ static void bias_table(void);
 static PyObject *py_use_range(PyObject *s, PyObject *a){
   int i = (int)PyLong_AsLong(a); if (i < 0 || i >= NR) { PyErr_SetString(PyExc_ValueError, "range"); return NULL; }
   if (mprotect(R[i].base, R[i].size, PROT_READ | PROT_WRITE)) return PyErr_SetFromErrno(PyExc_OSError);
+  if (shim_alloc && shim_open(i)) return PyErr_Format(PyExc_RuntimeError, "the shim could not open range %d", i);
   cur = i; PyGC_Collect(); bias_table(); Py_RETURN_NONE;
 }
 static PyObject *py_divert_off(PyObject *s, PyObject *a){ cur = -1; Py_RETURN_NONE; }
@@ -582,22 +593,18 @@ static PyObject *py_is_interned(PyObject *s, PyObject *u){ return PyBool_FromLon
 /* The worker's own globals binding of a define is a reference that lives in a discarded page;
    after the root binds the name itself, that phantom reference is dropped here. */
 static PyObject *py_release(PyObject *s, PyObject *o){ if (Py_REFCNT(o) > 1 && !_Py_IsImmortal(o)) { Py_SET_REFCNT(o, Py_REFCNT(o) - 1); Py_RETURN_TRUE; } Py_RETURN_FALSE; }
-/* Range as a file: the worker writes its range out, the root reads it in at the same address. */
+/* Range as a file: the worker writes the pages of its range that hold anything, within what the
+   arena took from the bottom (or the bump cursor), as the span file below; the root reads them in
+   at the same addresses (import_spans). */
+static Py_ssize_t dump_span_fd(int i, size_t off, size_t len, int fd);
 static Py_ssize_t dump_range_to(int i, const char *path){
+  size_t lo = R[i].used, hi = 0; if (shim_alloc) shim_spans(i, &lo, &hi);
   int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd < 0) return -1;
-  size_t done = 0; while (done < R[i].used) { ssize_t w = write(fd, R[i].base + done, R[i].used - done); if (w <= 0) { close(fd); return -1; } done += w; }
-  close(fd); return (Py_ssize_t)done;
+  Py_ssize_t n = dump_span_fd(i, 0, lo, fd); close(fd); return n;
 }
 static PyObject *py_dump_range(PyObject *s, PyObject *a){
   int i; const char *path; if (!PyArg_ParseTuple(a, "is", &i, &path)) return NULL;
   Py_ssize_t n = dump_range_to(i, path); if (n < 0) return PyErr_SetFromErrno(PyExc_OSError); return PyLong_FromSsize_t(n);
-}
-static PyObject *py_import_file(PyObject *s, PyObject *a){
-  int i; const char *path; size_t used; if (!PyArg_ParseTuple(a, "isn", &i, &path, &used)) return NULL;
-  if (mprotect(R[i].base, R[i].size, PROT_READ | PROT_WRITE)) return PyErr_SetFromErrno(PyExc_OSError);
-  int fd = open(path, O_RDONLY); if (fd < 0) return PyErr_SetFromErrno(PyExc_OSError);
-  size_t done = 0; while (done < used) { ssize_t r = read(fd, R[i].base + done, used - done); if (r <= 0) { close(fd); return PyErr_SetFromErrno(PyExc_OSError); } done += r; }
-  close(fd); R[i].used = used; return PyLong_FromSize_t(done);
 }
 
 /* ---- drop without destroying ----
@@ -650,10 +657,11 @@ static PyObject *py_shadow(PyObject *s, PyObject *a){
 static PyObject *py_shadow_live(PyObject *s, PyObject *a){ return Py_BuildValue("(nn)", n_shadow_live, n_shadow_home); }
 
 /* ---- a span of a range as a sparse file ----
-   The libc-level range is handed out from both ends (motabi/rangemalloc.c) and touched sparsely;
-   inside gVisor page residency is not reported, so the worker writes the pages of each handed-out
-   span that are not all zero, as (offset, length, bytes) runs, and the root reads them back at the
-   same addresses. Reading an untouched page costs a fault and nothing else. */
+   A range is handed out from the bottom by its arena (and, the libc range, from the top by mmap)
+   and touched sparsely; inside gVisor page residency is not reported, so the worker writes the
+   pages of each handed-out span that are not all zero, as (offset, length, bytes) runs, and the
+   root reads them back at the same addresses. An all-zero page is read as the zero page the
+   root's untouched (or discarded) range already holds. */
 static int all_zero(const uint64_t *w){ for (int k = 0; k < 512; k++) if (w[k]) return 0; return 1; }
 static int write_all(int fd, const char *p, size_t n){ while (n) { ssize_t w = write(fd, p, n); if (w <= 0) return -1; p += w; n -= w; } return 0; }
 static Py_ssize_t dump_span_fd(int i, size_t off, size_t len, int fd){
@@ -750,12 +758,6 @@ static PyObject *read_file(const char *p){
   for (;;) { if (n == cap) { cap *= 2; buf = realloc(buf, cap); } ssize_t r = read(fd, buf + n, cap - n); if (r < 0) { close(fd); free(buf); return PyErr_SetFromErrno(PyExc_OSError); } if (!r) break; n += r; }
   close(fd); PyObject *b = PyBytes_FromStringAndSize(buf, n); free(buf); return b;
 }
-static int import_range_file(int i, const char *path, size_t used){
-  if (mprotect(R[i].base, R[i].size, PROT_READ | PROT_WRITE)) return -1;
-  int fd = open(path, O_RDONLY); if (fd < 0) return -1;
-  size_t done = 0; while (done < used) { ssize_t r = read(fd, R[i].base + done, used - done); if (r <= 0) { close(fd); return -1; } done += r; }
-  close(fd); R[i].used = used; return 0;
-}
 /* The locals and evaluation stacks of every thread's live frames: pre-fork objects the collector's
    lists do not hold (a frame is not an object until something asks for it), which the completion
    engine's in-flight import holds and a worker's objects then reference. Read from the interpreter
@@ -835,8 +837,9 @@ static PyObject *py_root_phase(PyObject *s, PyObject *a){
        its next objects in this copy's pre-fork heap, which the join discards */
     int rng = base + i; if (rng < 0 || rng >= NR) { PyErr_SetString(PyExc_ValueError, "range"); return NULL; }
     if (mprotect(R[rng].base, R[rng].size, PROT_READ | PROT_WRITE)) return PyErr_SetFromErrno(PyExc_OSError);
+    if (shim_alloc && shim_open(rng)) return PyErr_Format(PyExc_RuntimeError, "the shim could not open range %d", rng);
     cur = rng;
-    if (libc_base >= 0) { int (*use)(int) = dlsym(RTLD_DEFAULT, "rangemalloc_use"); if (!use || use(rng)) return PyErr_Format(PyExc_RuntimeError, "the libc shim could not open range %d", rng); }
+    if (libc_base >= 0) { int (*use)(int) = dlsym(RTLD_DEFAULT, "rangemalloc_use"); if (!use || use(libc_base + rng)) return PyErr_Format(PyExc_RuntimeError, "the libc shim could not open range %d", libc_base + rng); }
     /* the bias first: the collection may run finalisers, which can let another thread in, and
        no tabled object may die before it is biased. The caller disabled the collector for the
        root's sake; PyGC_Collect is a no-op while it is disabled, and the freelists must be
@@ -854,10 +857,11 @@ static PyObject *py_root_phase(PyObject *s, PyObject *a){
     PyObject *m = PyObject_CallMethod(pickle, "loads", "O", raw); Py_DECREF(raw); if (!m) return NULL;
     PyList_Append(out, m); Py_DECREF(m); 
     if (!PyDict_Check(m) || PyDict_GetItemString(m, "error")) continue;
-    int rng = base + i; size_t used = PyLong_AsSize_t(PyDict_GetItemString(m, "bytes"));
-    snprintf(path, sizeof path, "%s.manifest_%d.bin", prefix, i); if (import_range_file(rng, path, used)) return PyErr_SetFromErrno(PyExc_OSError);
+    int rng = base + i;
+    snprintf(path, sizeof path, "%s.manifest_%d.bin", prefix, i);
+    { PyObject *args = Py_BuildValue("(is)", rng, path), *r = py_import_spans(NULL, args); Py_DECREF(args); if (!r) return NULL; Py_DECREF(r); }
     snprintf(path, sizeof path, "%s.manifest_%d.libc", prefix, i);
-    if (libc_base >= 0 && file_exists(path)) { PyObject *r = py_import_spans(NULL, Py_BuildValue("(is)", libc_base + base + i, path)); if (!r) return NULL; Py_DECREF(r); }
+    if (libc_base >= 0 && file_exists(path)) { PyObject *args = Py_BuildValue("(is)", libc_base + rng, path), *r = py_import_spans(NULL, args); Py_DECREF(args); if (!r) return NULL; Py_DECREF(r); }
     if (replay_manifest(m)) return NULL;
   }
   Py_DECREF(pickle); return Py_BuildValue("(NNnn)", tn, out, n_before, (Py_ssize_t)waited);
@@ -867,7 +871,7 @@ static PyMethodDef M[] = {
   {"dict_keys_foreign", py_dict_keys_foreign, METH_O, ""}, {"rekey", py_rekey, METH_O, ""}, {"table_entry", py_table_entry, METH_VARARGS, ""}, {"is_mapped", py_is_mapped, METH_VARARGS, ""}, {"apply_extra", py_apply_extra, METH_O, ""}, {"export_keys", py_export_keys, METH_NOARGS, ""}, {"apply_keys", py_apply_keys, METH_O, ""},
   {"shadow_type", py_shadow_type, METH_O, ""}, {"shadow", py_shadow, METH_VARARGS, ""}, {"shadow_live", py_shadow_live, METH_NOARGS, ""},
   {"dump_span", py_dump_span, METH_VARARGS, ""}, {"export_tail", py_export_tail, METH_VARARGS, ""}, {"import_spans", py_import_spans, METH_VARARGS, ""},
-  {"dump_range", py_dump_range, METH_VARARGS, ""}, {"import_file", py_import_file, METH_VARARGS, ""},
+  {"dump_range", py_dump_range, METH_VARARGS, ""},
   {"release", py_release, METH_O, ""},
   {"relink_weakref", py_relink_weakref, METH_O, ""}, {"unintern", py_unintern, METH_O, ""}, {"is_interned", py_is_interned, METH_O, ""},
   {"park", py_park, METH_NOARGS, ""}, {"hold", py_hold, METH_VARARGS, ""}, {"unhold", py_unhold, METH_NOARGS, ""},
