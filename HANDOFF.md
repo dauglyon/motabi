@@ -225,7 +225,9 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
 In order:
 
 1. **A real site**: the slurm-ssh adapter against Lawrencium, with the pin computed from
-   capabilities. The guest recipe in `prototype/site/` is the test bed until then.
+   capabilities. The guest recipe in `prototype/site/` is the test bed until then. After NERSC,
+   Jetstream2 (the NSF cloud) is a likely second adapter target: VM-shaped allocations rather
+   than Slurm jobs, GPUs on request.
 
 2. **Scatter over real data** (issue 1): done for the four libraries in the prototype; next is
    the reference walk through non-GC objects and recycling the ranges (issue 2).
