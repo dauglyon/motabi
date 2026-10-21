@@ -17,13 +17,17 @@ the first move. `run/` holds the share directory, the runsc root, the images and
 Pieces: `kernel-venv/bin/python` is the venv marimo is told to use (`pyproject.toml`); it routes
 the kernel launch to `motabi.launcher`, which starts `motabi.kernel` as process 1 of the
 sandbox, and the kernel as its child. The executor (`motabi.executor`) and the launcher talk
-through files in `run/share`.
+through files in `run/share`. The launcher preloads `motabi/librangemalloc.so` (built by
+`run.sh` through `tools/build-shim.sh`, which needs a jemalloc 5.4.0 checkout under `build/`)
+into the sandbox and sets Arrow's default pool to the system allocator; both are what lets a
+scatter worker's NumPy, torch, Arrow and polars results come back whole (`docs/scatter-research.md`).
+The notebook's last three scatter cells define one of each and the footer prints their sums per item.
 
 ## A second machine
 
     docker build -t motabi-base base && (cid=$(docker create motabi-base); docker export $cid | tar -x -C base/tree --exclude='dev/*' --no-same-owner --no-same-permissions; docker rm $cid)
-    base/tree/usr/local/bin/uv lock --script nb.py && base/tree/usr/local/bin/uv export --script nb.py -o env.requirements.txt
-    base/stage.sh                 # the venv onto the base tree, inside a sandbox (what every site runs)
+    base/tree/usr/local/bin/uv lock --script nb.py && base/tree/usr/local/bin/uv export --script nb.py --emit-index-url -o env.requirements.txt
+    base/stage.sh                 # the venv onto the base tree, inside a sandbox (what every site runs; ~10 min, torch is 200 MB)
     docker build -t motabi-sitehost site
     CPU=Haswell site/run-vm.sh    # Ubuntu cloud-image guest under QEMU/KVM in a container; ssh on :2222
     site/provision.sh             # runsc, rootfs/, the checkout → the guest, same paths
@@ -47,6 +51,19 @@ time is not measured here.
 Carried across the moves without any serialization: a 10M-element array mutated in place, an
 open file handle (writes before and after each move land in the same host file at the right
 offset), the loaded numpy, and the marimo kernel's own threads and ZeroMQ sockets.
+
+## Scatter over data (2026-10-21)
+
+The scatter cell defines, per item, a NumPy array, a torch tensor, an Arrow table, a polars frame
+and a polars `group_by` result (computed by polars' thread pool), sized by the item. Three workers
+restored from one checkpoint join into the root in about 1 s; the footer prints each value's rows
+and sums per item, all right; three scatters in one session with legs between them, `skipped` 0
+in every merge log line (`run/share/kernel.log`, `imported worker`). The kernel image is 570 MB
+with torch imported. A crash inside the kernel writes its Python frames to `run/share/kernel.fault`;
+`MOTABI_AUDIT=1` logs, per worker, every referent the root could not account for. A scatter
+started while the completion engine is importing (a keystroke just before) may refuse a worker's
+export by name; HANDOFF.md issue 1 has the state. `docs/scatter-research.md` has the mechanism
+and what the move found.
 
 ## Found on the way
 

@@ -196,9 +196,16 @@ class Launcher:
             env["PYTHONPATH"] = repo
             for d in ("mnt", repo.lstrip("/")):
                 os.makedirs(os.path.join(ROOTFS, d), exist_ok=True)  # bind targets must exist in the rootfs
-        env.update({k: v for k, v in os.environ.items() if k.startswith(("MARIMO_", "MOTABI_"))})
-        if os.environ.get("MOTABI_LD_PRELOAD"):  # a libc-allocator shim under trial (docs/scatter-research.md)
-            env["LD_PRELOAD"] = os.environ["MOTABI_LD_PRELOAD"]
+        env.update({k: v for k, v in os.environ.items() if k.startswith(("MARIMO_", "MOTABI_", "PYTHONMALLOC"))})
+        # The libc-allocator shim (motabi/rangemalloc.c) is preloaded into the whole sandbox so a
+        # scatter worker's libc allocations and mappings land in its range; MOTABI_LD_PRELOAD
+        # names another build, or "" for none. Arrow's default pool is its bundled mimalloc, which
+        # serves from space it reserved before the fork; the system pool goes through the shim.
+        shim = os.path.join(repo, "motabi", "librangemalloc.so")
+        preload = os.environ.get("MOTABI_LD_PRELOAD", shim if os.path.exists(shim) else "")
+        if preload:
+            env["LD_PRELOAD"] = preload
+        env.setdefault("ARROW_DEFAULT_MEMORY_POOL", "system")
         caps = ["CAP_AUDIT_WRITE", "CAP_KILL", "CAP_NET_BIND_SERVICE"]
         spec: dict[str, Any] = {
             "ociVersion": "1.0.0",
@@ -354,12 +361,17 @@ class Launcher:
                 state = subprocess.run(
                     ["unshare", "-Ur", RUNSC, "--ignore-cgroups", "--root", self.state, "state", f"sc{n}-w{i}"],
                     capture_output=True, text=True)
-                if ('"status": "stopped"' in state.stdout or state.returncode) and not os.path.exists(manifest):
-                    # the second check: the worker may have exported and exited since the first
+                if '"status": "stopped"' in state.stdout or state.returncode:
+                    # the worker may have exported and exited since the first check: the error
+                    # manifest is created only if no manifest exists, never over one
                     import pickle
-                    with open(manifest + ".tmp", "wb") as f:
+                    try:
+                        fd = os.open(manifest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                    except FileExistsError:
+                        pending.discard(i)
+                        continue
+                    with os.fdopen(fd, "wb") as f:
                         pickle.dump({"error": f"worker {i} exited without exporting; see kernel.err"}, f)
-                    os.rename(manifest + ".tmp", manifest)
                     pending.discard(i)
             time.sleep(0.2)
         for i in range(workers):

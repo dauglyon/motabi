@@ -30,6 +30,10 @@ HEARTBEAT_TIMEOUT_MS = 5000
 
 
 def _child() -> None:
+    import faulthandler
+
+    # a crash names its Python frames in the share directory (marimo captures the kernel's own fd 2)
+    faulthandler.enable(file=open(os.path.join(os.environ["MOTABI_SHARE"], "kernel.fault"), "a"), all_threads=True)
     from motabi import fold
 
     fold.install()  # allocator wrappers and the reserved ranges exist before any object does

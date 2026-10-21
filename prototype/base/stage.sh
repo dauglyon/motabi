@@ -17,7 +17,7 @@ set -eu
 export UV_PYTHON_INSTALL_DIR=/opt/python UV_CACHE_DIR=/opt/uv-cache HOME=/root PATH=/usr/local/bin:/usr/bin:/bin
 uv python install 3.12.10
 rm -rf /opt/venv && uv venv -q /opt/venv --python 3.12.10
-uv pip sync -q --python /opt/venv/bin/python --only-binary :all: /mnt/requirements.txt
+uv pip sync -q --python /opt/venv/bin/python --only-binary :all: --index-strategy unsafe-best-match /mnt/requirements.txt   # every version is hash-pinned, so the index a wheel comes from does not matter
 /opt/venv/bin/python -c "import sys, marimo, numpy; print('staged', sys.version.split()[0], marimo.__version__, numpy.__version__)"
 INNER
 python3 - "$TREE" "$WORK" <<'PY'

@@ -1,6 +1,6 @@
 # motabi — handoff
 
-Date: 2026-10-20. Written to let a later session pick up the prototype without re-deriving it.
+Date: 2026-10-21. Written to let a later session pick up the prototype without re-deriving it.
 Read `DESIGN.md` for the model and `prototype/README.md` for how to run what exists.
 
 ## What motabi is
@@ -120,49 +120,64 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
 
 ## Open issues, in the order worth addressing
 
-1. **The join carries only memory that came through Python's allocators.** Everything a
-   native extension allocates on its own path (libc `malloc`, Arrow's pools, PyTorch's
-   allocator, Rust and C++ runtimes) is in the worker's ordinary heap, discarded at the join.
-   NumPy's wrong shape after a merge is the mild case: measured today, the array object and
-   its data buffer land in the range (NumPy 2 allocates data through `PyMem_Raw*`) and only
-   the shape-and-strides buffer does not (NumPy's own cache over libc). Libraries that own
-   their memory would fail whole; none is measured yet. This decides whether scatter works
-   for real data, and it is weeks, not a day. It limits every fork, the independent-branch
-   parallelism of 2.4 as much as scatter; a leg moves the whole kernel and is unaffected.
-   Fork and join are plain-Python values only until then.
-   Measured 2026-10-20 for numpy, torch, pyarrow and polars, and a preloaded libc-allocator
-   shim (jemalloc or mimalloc behind one interface) tried against them: the two tables in
-   `docs/scatter-research.md`. The shim places every libc allocation in the range, from any
-   thread, including threads alive at the checkpoint; a torch tensor comes back whole. It does
-   not settle the join: an Arrow table comes back readable but running its destructor in the
-   root corrupts the heap, because its `shared_ptr`s into pre-fork C++ objects were counted in
-   the worker's discarded pages (the native form of the refcount problem `foldalloc` solves for
-   Python objects); numpy's dims come from its own cache of pre-fork buffers, which no allocator
-   sees; Arrow's default pool and polars allocate through libc `mmap`. The follow-up, same day,
-   tested both fixes: never running the destructor makes the Arrow drop safe (30 of 30 through
-   drop and reclaim; 3 unexplained crashes at interpreter exit with two defines under mimalloc),
-   and `mmap` interposition places new mappings but not allocations served from address space
-   reserved before the fork (Arrow's default pool always, polars after a warm-up). Two workers
-   restored from one checkpoint dirty the same pre-fork pages (16,483 of 16,484, in gVisor and on
-   the host alike), so discarding pre-fork pages is the only consistent rule. A second pass the
-   same day: the exit crash was the harness's export order (fixed; `fold.py` had it right), numpy
-   joins whole once the worker drains its dims cache, Arrow tables with a second define join
-   10 of 10, and reclamation is a conservative pointer scan that is proven to see a live
-   native view. A third pass: the polars "Rust types" were pyarrow's static types, loaded in the
-   worker by the harness; switching each bundled allocator to a fresh arena or heap inside the
-   worker (jemalloc `thread.arena`, mimalloc `mi_theap_set_default` with arena allocation
-   disallowed, both called by symbol address) and ignoring `mmap` address hints in the shim makes
-   every measured library join whole: numpy, torch, Arrow on both pools, polars, 30 of 30 runs
-   with drop and reclaim. Pool threads alive at a gVisor restore were then measured (68 threads):
-   every large result lands in the range from any thread, since fresh mappings are diverted
-   wherever they come from; the one miss is a small polars `group_by` result allocated by a pool
-   thread out of a pre-fork slab. The export check covers it: every exposed buffer must be in the
-   range, else the result is rebuilt once on the exporting thread (through numpy per column) and
-   rechecked, else the export is refused by name. Worker ranges need several GB of address space
-   for polars' jemalloc reservations. All of it in `docs/scatter-research.md`. The shim lives in
-   `experiments/fold/rangemalloc/`; the launcher passes `MOTABI_LD_PRELOAD` into the sandbox.
-   `motabi/npdivert.c` stays **disabled** (`MOTABI_NPDIVERT=1`): unnecessary on NumPy 2 and it
-   breaks reload.
+1. **Scatter over native data works in the prototype (2026-10-21), with limits.** A worker's
+   NumPy arrays, torch CPU tensors, Arrow tables and polars frames come back to the root through
+   real gVisor restores: three workers over the notebook's scatter cell, each defining one of
+   each plus a polars `group_by` result its thread pool computes, gather with the right sizes and
+   sums; three scatters in one session with legs between them; `skipped` 0 throughout. The
+   mechanism, all in `motabi/` now (research in `docs/scatter-research.md`):
+   - `rangemalloc.c`, preloaded: a worker's libc allocations (a jemalloc arena bumped from the
+     bottom of its libc range) and anonymous mappings (the top of the range, downward) land in the
+     range from any thread; a free of another copy's block is counted, never handed to jemalloc.
+     The worker writes the non-zero pages of what it handed out (gVisor reports no residency) and
+     the root reads them back in place. Arrow runs on the system pool (launcher env).
+   - polars is carried as Arrow: its Rust objects live in its bundled jemalloc, which the root's
+     copy cannot free (the worker's arena metadata is in discarded pages; a deferred small free
+     crashed it), so the worker copies each frame into Arrow memory and the root builds a new
+     frame over that memory with its own polars. Types Arrow cannot round-trip come back as
+     Arrow gives them. The by-address arena switch of the research is gone with it.
+   - Four replays of worker writes into pre-fork memory, found by the real run and by
+     `PYTHONMALLOC=debug` in the fork harness (`/tmp/foldtest*.py` were the session's checks):
+     every tabled refcount gets a bias in the worker so no pre-fork object dies there (a death
+     puts the block on a per-type freelist the allocator never sees, and the next object of that
+     type is built in a discarded page); a dict whose key table came off the key-table freelist
+     (a pre-fork dict's resize) is re-keyed in the worker; a type's shared attribute-key table
+     (one reserved slot per instance made, names appended on first use) is replayed so the root
+     reads inline attributes with the right size and names; references from worker objects to
+     pre-fork objects the snapshot never tabled (strings held only by C, which the worker also
+     interned) are counted and added. Immortalised strings are replayed as before.
+   - The export check: every buffer a define exposes (NumPy data, shape and strides; tensor
+     storage; Arrow buffers; carried polars) must be in a range, else the define is rebuilt once
+     and rechecked, else refused by name; a type created in the worker outside its range (a C
+     extension first imported there) is refused; a full libc range is refused.
+   - Imported native defines get a same-layout shadow type whose destructor never runs; a
+     home-made instance of a shadow type is destroyed as its base (polars and torch build results
+     with the instance's class). The shadow shares the base's attribute-key table.
+   - The kernel's other threads (marimo's completion engine, library pools) survive the restore
+     and run in every copy: the worker's export tail (tracked list, deltas, key tables, dumps)
+     and the root's phase from the table through the checkpoint, the claim and the allocator
+     switch to the last replayed count (`fold.root_phase`) are each one C call that runs no
+     Python code; the worker never untracks (the root resets the dumped GC links); the Python-side
+     bump allocation is locked; other threads' frame locals are table seeds; the per-type
+     freelists are filled with in-range objects at the switch. `MOTABI_AUDIT=1` logs, per worker,
+     every referent of its objects that the root could not account for.
+   Open, in order of weight. (a) **A scatter while the kernel's completion engine is busy is not
+   reliable.** marimo's completion thread (jedi) imports and builds parse trees on first use after
+   a keystroke; a scatter taken then has, in every copy, a thread whose state the table cannot
+   fully see (objects only its C stack holds), and when such an object dies in a worker its block
+   goes to a per-type freelist and the worker's next dict, list or tuple of that kind is built in
+   a page the join discards. The phase waits for an in-flight import first, the freelists are
+   filled with in-range objects at the switch, and a worker whose define reaches such a container
+   refuses its export by name ("built in a page the join discards; rerun the scatter"); in the
+   last six fresh sessions driven with a keystroke right before each scatter, every first scatter
+   and most later ones joined, and the rest refused or, twice, a worker died before exporting
+   (`run/share/kernel.fault` names the thread). A scatter with the completion engine idle has not
+   failed. The fix that was not built: copy such containers into the range at export and rewrite
+   every pointer to them (a first version missed pointers inside frame objects). (b) The reference
+   walk covers GC-tracked worker objects only. (c) The per-type buffer list has four entries and an
+   unknown type is carried unchecked. (d) A kernel exit after a scatter still finalises imported
+   objects. (e) The ranges are 4 GiB (Python) and 8 GiB (libc) of address space per worker, 48
+   pairs, not recycled. `motabi/npdivert.c` stays **disabled**.
 
 2. **Ranges are not recycled.** Each scatter permanently consumes one address range per worker
    from a fixed pool (`RANGES` in `motabi/fold.py`, currently 48). A long session with many
@@ -212,8 +227,8 @@ In order:
 1. **A real site**: the slurm-ssh adapter against Lawrencium, with the pin computed from
    capabilities. The guest recipe in `prototype/site/` is the test bed until then.
 
-2. **Scatter over real data** (issue 1): measure the libraries, then an allocator below Python
-   in the fork harness. `docs/scatter-research.md`.
+2. **Scatter over real data** (issue 1): done for the four libraries in the prototype; next is
+   the reference walk through non-GC objects and recycling the ranges (issue 2).
 
 Not needed yet: GPU moves (need the hardware), the batch run, the approval prompt and site
 selection (plain logic, nothing to prove about feasibility).
@@ -236,8 +251,19 @@ selection (plain logic, nothing to prove about feasibility).
   worker's allocations into its range, record what each worker defines and the reference counts
   it added, and replay that into the original kernel by address. No pickling. The table of
   pre-fork objects is an address-keyed map; the free hook marks an entry dead when its block is
-  freed, and `wait_file` blocks for a file without releasing the interpreter lock.
-- `motabi/npdivert.c` — the disabled NumPy-buffer experiment (issue 1); see `docs/scatter-research.md`.
+  freed, and `wait_file` blocks for a file without releasing the interpreter lock. `fold.py` also
+  holds the native-data pieces: the worker's allocator switches (a fresh jemalloc arena per bundled
+  jemalloc, found by reading the library's symbol table), the NumPy cache drain, the export check
+  (every buffer a define exposes must be in a range; rebuilt once, else refused by name), and the
+  shadow types the root gives imported native objects so their destructors never run.
+- `motabi/rangemalloc.c` — the libc-level half of the join, built by `tools/build-shim.sh` into
+  `motabi/librangemalloc.so` and preloaded into the sandbox by the launcher: at home it forwards to
+  glibc; in a worker every malloc-family call from any thread and every anonymous mapping lands in
+  the worker's libc range (a jemalloc arena from the bottom, mappings from the top). The worker
+  dumps the touched pages of that range beside its Python range and the root reads both back.
+- `motabi/npdivert.c` — the disabled NumPy-buffer experiment; see `docs/scatter-research.md`.
+- `tools/build-shim.sh` — builds `motabi/librangemalloc.so` against a static jemalloc 5.4.0 (checkout
+  under `build/`, gitignored; `JEMALLOC_SRC` names another).
 
 The communication between the executor (inside the sandbox) and the launcher (outside) is files
 in a shared directory bind-mounted into the sandbox: request files the executor writes, answer
@@ -246,7 +272,7 @@ files the launcher writes. Nothing else crosses the boundary. Set `MOTABI_TYPES=
 
 ## Running it
 
-`prototype/run.sh` builds the small C extensions, makes the venv, and starts the marimo server;
+`prototype/run.sh` builds the small C extensions and the shim, makes the venv, and starts the marimo server;
 open the printed URL and run the cells. `prototype/README.md` has the details and the gotchas
 (the kernel starts only when a browser session runs a cell; the user config does not auto-run
 cells). One server at a time: a second `run.sh` while one is up collides on the port.

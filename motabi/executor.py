@@ -202,30 +202,26 @@ class MotabiExecutor:
         print(f"[motabi] scatter {n}: {workers} workers over {len(order)} cell(s); forking")
         _log(f"scatter {n}: forking {workers} workers, region {order}, names {sorted(names)}")
         t0 = time.monotonic()
-        # Between the snapshot and the checkpoint the kernel does as little as it can and
-        # waits with the GIL held, so the table of pre-fork refcounts stays true in the image.
         if os.environ.get("MOTABI_TYPES"):  # diagnostic: what the kernel's heap is made of
             import collections
             hist = collections.Counter(type(o).__name__ for o in gc.get_objects())
             _log(f"scatter {n}: gc objects by type {hist.most_common(12)}")
-        table, timing = fold.snapshot(glbls)
-        _log(f"scatter {n}: snapshot {table} objects {timing}")
-        _write(prefix + ".req", {"cell": str(cell.cell_id), "workers": workers})
-        fold.wait_file(prefix + ".go")
-        role = None
-        for i in range(workers):
-            try:
-                os.close(os.open(f"{prefix}.claim_{i}", os.O_CREAT | os.O_EXCL))
-                role = i
-                break
-            except FileExistsError:
-                pass
-        if role is not None:
+        # The table, the request and the checkpoint are inside this call; a worker copy returns
+        # from it with its role, the root copy with every worker's manifest read in (fold.root_phase).
+        table, got, frame_seeds, waited = fold.root_phase(prefix, workers, base, glbls, {"cell": str(cell.cell_id), "workers": workers})
+        if isinstance(got, int):
+            role = got
             self._work(role, base + role, items[role], target, order, names, glbls, graph, f"{prefix}.manifest_{role}")
-        _log(f"scatter {n}: root copy awake ({table} pre-fork objects), waiting for {workers} manifests")
+        if os.environ.get("MOTABI_AUDIT"):  # before the first allocation that could collect
+            gc.disable()
+            for i, m in enumerate(got):
+                fold.audit(m, lambda s, i=i: _log(f"scatter {n}: worker {i}: {s}"))
+            gc.enable()
+        _log(f"scatter {n}: root copy has {len(got)} manifests ({table} pre-fork objects, {frame_seeds} seeds from the threads' frames, "
+             f"waited {waited * 10} ms for an import on another thread)")
         values: dict[str, list[Any]] = {k: [] for k in names}
-        for i in range(workers):
-            ns, stats = fold.root_import(base + i, fold.wait_file(f"{prefix}.manifest_{i}"))
+        for i, m in enumerate(got):
+            ns, stats = fold.bind(m)
             _log(f"scatter {n}: imported worker {i}: {stats}")
             for k in names:
                 if k in ns:
@@ -247,12 +243,12 @@ class MotabiExecutor:
 
         _log(f"worker {role}: range {rng}, item {item!r}")
         try:
-            fold.worker_begin(rng)
+            fold.worker_begin(rng, switched=True)
             glbls[target] = item
             for cid in order:
                 self._default.execute_cell(graph.cells[cid], glbls)
-            fold.worker_export(rng, glbls, names, manifest)
-            _log(f"worker {role}: exported")
+            notes = fold.worker_export(rng, glbls, names, manifest)
+            _log(f"worker {role}: exported {notes}")
         except BaseException as e:  # the root must learn of it; the worker is about to die anyway
             import pickle
             import traceback

@@ -10,6 +10,7 @@ SUF=$(.venv/bin/python -c "import sysconfig;print(sysconfig.get_config_var('EXT_
 gcc -shared -fPIC -O1 -g -I"$INC" ../motabi/foldalloc.c -o "../motabi/foldalloc$SUF"
 NPINC=$(.venv/bin/python -c "import numpy;print(numpy.get_include())")
 gcc -shared -fPIC -O1 -g -I"$INC" -I"$NPINC" ../motabi/npdivert.c -o "../motabi/npdivert$SUF"
+../tools/build-shim.sh   # the libc-allocator shim the launcher preloads into the sandbox (scatter over native data)
 # The environment (DESIGN.md 2.7): the base tree with the venv staged onto it (base/stage.sh).
 [ -d base/tree/opt/venv ] && [ -d base/tree/opt/python ] && export MOTABI_ROOTFS="$PWD/base/tree"
 pkill -f "marimo edit --head" 2>/dev/null || true

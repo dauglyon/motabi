@@ -450,6 +450,97 @@ space only, so this costs nothing.
 exposed-buffer accessor and no rebuild gets neither check nor fix, which is approach C's refusal
 by name. The by-address allocator switches are tied to the installed wheel's symbol offsets.
 
+### Fifth follow-up: in the prototype
+
+2026-10-21. The mechanisms moved into `motabi/` (`fold.py`, `foldalloc.c`, `rangemalloc.c`) and
+the notebook's scatter cell defines a NumPy array, a torch tensor, an Arrow table, a polars frame
+and a polars `group_by` result per item. Three workers restored from one checkpoint join into the
+root, three scatters a session with legs between, every value right (`prototype/README.md`).
+What the move found, in the order it was found; each is a write the worker makes into pre-fork
+memory that the join discards, and each is now replayed or prevented:
+
+- **A type's shared attribute-key table.** 3.12 reserves a slot in the table for every instance
+  created (`dk_usable` falls by one) and appends a name the first time an instance sets it. The
+  table is a pre-fork block; each instance's inline values array is sized by the table at its
+  creation and indexed by entry. The root, with its own table, read past the end of an imported
+  object's array (`vars()`, GC traversal, dealloc), or could not name a value. The worker exports
+  each table that changed with the names it appended, in order; the root appends the same names
+  through a throwaway instance it keeps and adopts the lower usable count. First seen on a polars
+  frame rebuilt in the worker, since the rebuild had made more instances than the first frame.
+- **Pre-fork objects dying in the worker.** A type's dealloc pushes the object onto CPython's
+  per-type freelist before any allocator sees it, and the next object of that type is built in
+  that pre-fork block. Every tabled refcount gets a bias of 2^30 in the worker (mortal, below the
+  32-bit immortality mark), so no tabled object dies; the recorded count carries the same bias and
+  the deltas are unchanged. The key-table freelist has the same shape without an object: a
+  pre-fork dict resized in the worker frees its old table onto it, and the next small dict takes
+  it. The export walks the defines' graph and re-keys such dicts (clear, a full collection that
+  frees the freelist, refill). First seen as a dict define that read as the globals dict.
+- **References to objects the snapshot never tabled.** Dict traversal skips unicode keys, and a
+  Cython module's interned name constants are held only from C; `import numpy.ma` inside a worker
+  (pyarrow does it) built code objects referencing such strings and interned them, which makes
+  them immortal in the worker. Neither the deltas (not tabled) nor an immortality check caught
+  them, and the root's mortal copies died at finalisation under their references. The worker now
+  counts references from its GC objects to untabled pre-fork objects, immortal or not, with the
+  type it saw; the root adds the count where the type still matches. Found with
+  `PYTHONMALLOC=debug`, which poisons freed blocks.
+- **polars cannot be fronted.** With every frame reading right, a `write_json` in the root
+  crashed inside polars' jemalloc: a flush of its thread cache freed small blocks from the
+  worker's arena, whose metadata the root never had. No fronting reaches a bundled allocator's
+  frees, so polars frames and series are carried as Arrow (copied into libc memory in the worker,
+  rebuilt by the root's polars over that memory, zero-copy for numeric columns). The by-address
+  arena switch is unnecessary and gone. Arrow on the system pool, torch and NumPy free through
+  the shim or `foldalloc`, which both count a foreign free and never pass it on.
+- **A shadow type's home-made instance.** polars and torch build results with the instance's
+  class; destroying such a result through the base's `subtype_dealloc` found the shadow dealloc
+  again through the type and recursed. The instance gets its base type back first.
+- **The worker's other threads.** The kernel's completion engine (jedi) and library pools are
+  alive in every restored copy. The export used to untrack every object in the range from Python,
+  and a thread switch let the completion thread, mid-import, dealloc an object already untracked:
+  a crash in `listiter_dealloc` in all three workers whenever a first completion coincided with a
+  scatter. Now the worker never untracks: the list of its tracked objects, the deltas, the key
+  tables and both dumps are one C call that runs no Python code, so no other thread runs between
+  them; the root drops the list links a dumped head carries and tracks the object itself. The
+  root has the same exposure the other way: its completion thread, mid-import at the checkpoint,
+  continued after the restore and freed objects it had made after the snapshot, which the workers'
+  objects referenced. So the whole root side of a scatter, from the table of pre-fork objects
+  through the request file, the wait for the go file (where the checkpoint is taken), the claim
+  of a role with the allocator switch, to the last replayed count, is one C call
+  (`foldalloc.root_phase`) that runs no Python code; a copy that claims a role returns from it
+  already switched, before any Python (a log line's file write used to let the completion thread
+  allocate in the worker's pre-fork heap first). The Python-side bump allocation takes a lock,
+  since the raw domain is called without the GIL. The launcher's span import used the worker
+  index without the range base, so a second scatter overwrote the first's libc pages and read
+  none of its own: found through torch's tensor header reading as zeros.
+- **Objects the table cannot reach.** Three kinds, each found by auditing every referent of the
+  workers' objects in the root (`MOTABI_AUDIT=1`): the locals of other threads' live frames,
+  which are not objects the collector lists (now seeded from the interpreter frames, through the
+  internal frame header the pinned 3.12 ships; the evaluation stack above the locals is kept in
+  a register while a frame runs and is not read); objects only a C stack holds, which die later
+  in the worker and feed a per-type freelist, so the next float, tuple, dict or list the worker
+  makes sits in a discarded page (the freelists are filled with in-range dead objects at the
+  switch, so a pop returns one of those; forcing the float and tuple counters to their limits
+  instead crashed the root on its first allocation after the phase, for a reason not found); and
+  a worker container built in such a page, which references range objects as no pre-fork object
+  does, and refuses the export. A second scatter's workers also listed the first scatter's range
+  as theirs, and the root then reset the links of objects it already tracked: the lists are by
+  the worker's own range now. The phase also waits, releasing the GIL, while another thread's
+  frames are inside importlib, since a half-built module is the largest source of such objects.
+  What remains is probabilistic: with a keystroke right before each scatter (the completion
+  engine importing jedi and parsing), six fresh sessions gave every first scatter and most later
+  ones joined, the rest refused by name, and two workers dead before export. A relocation pass
+  (copy the container into the range, rewrite every in-range pointer to it by scanning referrer
+  bodies, list items, dict entries, set tables and inline values) was written and withdrawn: it
+  missed pointers inside frame objects, and a frame object exported while its frame is still live
+  is itself unreadable in the root. It is the next thing to build, with frames handled. The
+  launcher's "exited without exporting" manifest is created exclusively, never over a real one
+  (a worker that exported and exited between two checks lost its result once).
+
+Measured 2026-10-21 on canopy, in the prototype: a scatter of three workers over the cell
+above joins in 1.1 s as the browser sees it; the kernel image is 570 MB with torch imported
+(296 MB before the scatter cells run); each worker's Python range is 54 to 64 MB and its libc
+range 14 to 44 MB of touched pages. Staging the environment with the four libraries takes
+15 minutes, most of it the torch download.
+
 ### Alternatives met on the way
 
 - **Restore worker 0 as the new root.** For a fork with one branch (2.4 with a single worker) the
@@ -482,6 +573,10 @@ A note on what was tried earlier: `motabi/npdivert.c` installed a NumPy data-mem
 forwards to `PyMem_Raw*`. It is unnecessary on NumPy 2 (data already goes that way) and it broke
 gVisor reload (the sandbox failed to load with a panic in its Unix-socket code, not understood),
 so it is gated off (`MOTABI_NPDIVERT=1`). Do not re-enable it.
+
+## In the prototype, 2026-10-21
+
+The join above is what `motabi/` runs; the fifth follow-up lists what moving it in found.
 
 ## Smaller open items on scatter
 

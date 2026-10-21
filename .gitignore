@@ -8,3 +8,5 @@ __marimo__/
 experiments/fold/rangemalloc/jemalloc-src/
 experiments/fold/rangemalloc/mimalloc-src/
 experiments/fold/rangemalloc/build/
+build/
+motabi/librangemalloc.so

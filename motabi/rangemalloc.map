@@ -1,0 +1,2 @@
+{ global: malloc; free; calloc; realloc; posix_memalign; aligned_alloc; memalign; valloc; pvalloc; malloc_usable_size; mmap; mmap64; munmap; mremap;
+          rangemalloc_register; rangemalloc_use; rangemalloc_off; rangemalloc_spans; rangemalloc_divert_failed; rangemalloc_stats; local: *; };

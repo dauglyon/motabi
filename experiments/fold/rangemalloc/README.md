@@ -1,5 +1,8 @@
 # rangemalloc: a preloaded libc-allocator shim for the join (approach A trial)
 
+The jemalloc-backed, glibc-home build of this shim moved into the package as `motabi/rangemalloc.c`
+(built by `tools/build-shim.sh`); this directory keeps the four-build research version and its drivers.
+
 Step 2 of `docs/scatter-research.md` (2026-10-20). `rangemalloc.c` is one shim with four builds:
 backing {jemalloc 5.4.0, mimalloc v3.5.3} x home {glibc, the backing itself}. The rules are in the
 header comment of `rangemalloc.c`; the results and what they mean are in `docs/scatter-research.md`.
