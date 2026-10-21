@@ -161,19 +161,27 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
      bump allocation is locked; other threads' frame locals are table seeds; the per-type
      freelists are filled with in-range objects at the switch. `MOTABI_AUDIT=1` logs, per worker,
      every referent of its objects that the root could not account for.
-   Open, in order of weight. (a) **A scatter while the kernel's completion engine is busy is not
-   reliable.** marimo's completion thread (jedi) imports and builds parse trees on first use after
-   a keystroke; a scatter taken then has, in every copy, a thread whose state the table cannot
-   fully see (objects only its C stack holds), and when such an object dies in a worker its block
-   goes to a per-type freelist and the worker's next dict, list or tuple of that kind is built in
-   a page the join discards. The phase waits for an in-flight import first, the freelists are
-   filled with in-range objects at the switch, and a worker whose define reaches such a container
-   refuses its export by name ("built in a page the join discards; rerun the scatter"); in the
-   last six fresh sessions driven with a keystroke right before each scatter, every first scatter
-   and most later ones joined, and the rest refused or, twice, a worker died before exporting
-   (`run/share/kernel.fault` names the thread). A scatter with the completion engine idle has not
-   failed. The fix that was not built: copy such containers into the range at export and rewrite
-   every pointer to them (a first version missed pointers inside frame objects). (b) The reference
+   Open, in order of weight. (a) **marimo's completion thread is parked across a scatter**
+   (2026-10-21, `fold.HeldQueue`, `foldalloc.park/hold/unhold`). The thread (jedi) is alive in every
+   copy; mid-request it holds objects only its C stack reaches, which the table cannot see, and
+   when one died in a worker its block fed a per-type freelist and the worker's next dict, list or
+   tuple was built in a page the join discards (an export refused by name, or a copy dead in jedi).
+   The kernel now hands marimo a wrapper of its out-of-band queue whose reader parks in a C wait,
+   GIL released, before every command it takes; `_fork` sets the hold before `root_phase` and
+   waits up to 30 s for the thread to park (a request in flight finishes first; a thread idle in
+   the queue is woken with a token and parks at once), and lifts it after the join in the root
+   only, so a worker's copy of the thread never resumes. Past the bound the snapshot goes ahead
+   with the thread busy (the import wait in `root_phase` is the second line) and the thread parks
+   when its request ends. Commands received during the hold are served after the join. Measured
+   (`/tmp/drive-busy.py` of that day: `np.` typed into a cell and left for 0.5 s, so marimo sends
+   the request and jedi is inside its first numpy completion, then the scatter header rerun):
+   `completion engine parked after 3.43s`, every worker exported within a second, `skipped` 0,
+   joined, and the completion served right after the join. Six further sessions with the
+   completion engine idle at each scatter joined every scatter; one of their eighteen scatters
+   got "worker 2 exited without exporting" from the launcher's `runsc state` poll while that
+   worker's export landed in the same second (see "noticed" below). Not checked: whether jedi's
+   compiled-inference subprocess survives the restore. The relocation pass (copy such containers
+   into the range and rewrite pointers) was not built. (b) The reference
    walk covers GC-tracked worker objects only. (c) The per-type buffer list has four entries and an
    unknown type is carried unchecked. (d) A kernel exit after a scatter still finalises imported
    objects. (e) The ranges are 4 GiB (Python) and 8 GiB (libc) of address space per worker, 48
@@ -219,6 +227,11 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
    socket in a 0700 directory and bridge it to the kernel's loopback inside the payload, or
    authenticate the channel (ZMQ CURVE); install runsc under the user's home and check its
    hash before use; create the run directory with mode 0700.
+
+Noticed on the way (not changed): the launcher's manifest wait (`motabi/launcher.py`, the
+`runsc state` poll) treats a nonzero exit of `runsc state` as the worker having exited and writes
+the "exited without exporting" manifest; it did so once for a worker whose export landed in the
+same second (`kernel.fault` empty). A nonzero exit should be retried.
 
 ## Next
 

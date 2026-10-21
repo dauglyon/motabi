@@ -206,32 +206,38 @@ class MotabiExecutor:
             import collections
             hist = collections.Counter(type(o).__name__ for o in gc.get_objects())
             _log(f"scatter {n}: gc objects by type {hist.most_common(12)}")
-        # The table, the request and the checkpoint are inside this call; a worker copy returns
-        # from it with its role, the root copy with every worker's manifest read in (fold.root_phase).
-        table, got, frame_seeds, waited = fold.root_phase(prefix, workers, base, glbls, {"cell": str(cell.cell_id), "workers": workers})
-        if isinstance(got, int):
-            role = got
-            self._work(role, base + role, items[role], target, order, names, glbls, graph, f"{prefix}.manifest_{role}")
-        if os.environ.get("MOTABI_AUDIT"):  # before the first allocation that could collect
-            gc.disable()
+        # The completion thread is parked from here to the end of the join: alive in every copy,
+        # mid-request it holds objects the table cannot see (HANDOFF.md issue 1a).
+        _log(f"scatter {n}: completion engine {fold.hold_completion()}")
+        try:
+            # The table, the request and the checkpoint are inside this call; a worker copy returns
+            # from it with its role, the root copy with every worker's manifest read in (fold.root_phase).
+            table, got, frame_seeds, waited = fold.root_phase(prefix, workers, base, glbls, {"cell": str(cell.cell_id), "workers": workers})
+            if isinstance(got, int):
+                role = got
+                self._work(role, base + role, items[role], target, order, names, glbls, graph, f"{prefix}.manifest_{role}")
+            if os.environ.get("MOTABI_AUDIT"):  # before the first allocation that could collect
+                gc.disable()
+                for i, m in enumerate(got):
+                    fold.audit(m, lambda s, i=i: _log(f"scatter {n}: worker {i}: {s}"))
+                gc.enable()
+            _log(f"scatter {n}: root copy has {len(got)} manifests ({table} pre-fork objects, {frame_seeds} seeds from the threads' frames, "
+                 f"waited {waited * 10} ms for an import on another thread)")
+            values: dict[str, list[Any]] = {k: [] for k in names}
             for i, m in enumerate(got):
-                fold.audit(m, lambda s, i=i: _log(f"scatter {n}: worker {i}: {s}"))
-            gc.enable()
-        _log(f"scatter {n}: root copy has {len(got)} manifests ({table} pre-fork objects, {frame_seeds} seeds from the threads' frames, "
-             f"waited {waited * 10} ms for an import on another thread)")
-        values: dict[str, list[Any]] = {k: [] for k in names}
-        for i, m in enumerate(got):
-            ns, stats = fold.bind(m)
-            _log(f"scatter {n}: imported worker {i}: {stats}")
-            for k in names:
-                if k in ns:
-                    values[k].append(ns[k])
-        gc.unfreeze()
-        _REGION = {"cells": set(order), "values": values, "workers": workers}
-        for k, vals in values.items():
-            if vals:
-                glbls[k] = vals[0]
-                motabi._GATHERED[id(vals[0])] = vals
+                ns, stats = fold.bind(m)
+                _log(f"scatter {n}: imported worker {i}: {stats}")
+                for k in names:
+                    if k in ns:
+                        values[k].append(ns[k])
+            gc.unfreeze()
+            _REGION = {"cells": set(order), "values": values, "workers": workers}
+            for k, vals in values.items():
+                if vals:
+                    glbls[k] = vals[0]
+                    motabi._GATHERED[id(vals[0])] = vals
+        finally:
+            fold.release_completion()  # the root only: a worker exits inside _work
         dt = time.monotonic() - t0
         print(f"[motabi] scatter {n}: joined {workers} workers after {dt:.1f}s; "
               f"gathered {sorted(k for k, v in values.items() if v)}")

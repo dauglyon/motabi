@@ -312,6 +312,36 @@ static PyObject *py_wait_file(PyObject *s, PyObject *a){
   while (access(path, F_OK)) { nanosleep(&ts, NULL); if (PyErr_CheckSignals()) return NULL; }
   Py_RETURN_NONE;
 }
+/* Parking for marimo's completion thread across a scatter (fold.HeldQueue). park() returns at
+   once unless a hold is on; held, the thread sleeps here in C with the GIL released, holding no
+   Python object, until unhold(). hold(ms) sets the hold and waits, GIL released so the thread
+   can get here, until it is parked or the bound passes: a thread mid-request finishes the
+   request first. The hold outlives a timeout: the thread parks when it next reaches park(), and
+   only the root copy lifts it, after the join; a worker's copy of the thread stays parked. */
+static pthread_mutex_t park_lk = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t park_cv = PTHREAD_COND_INITIALIZER;
+static int park_held = 0, park_parked = 0;
+static PyObject *py_park(PyObject *s, PyObject *a){
+  int slept = 0;
+  Py_BEGIN_ALLOW_THREADS
+  pthread_mutex_lock(&park_lk);
+  if (park_held) { slept = 1; park_parked = 1; pthread_cond_broadcast(&park_cv); while (park_held) pthread_cond_wait(&park_cv, &park_lk); park_parked = 0; }
+  pthread_mutex_unlock(&park_lk);
+  Py_END_ALLOW_THREADS
+  return PyBool_FromLong(slept);
+}
+static PyObject *py_hold(PyObject *s, PyObject *a){
+  int ms; if (!PyArg_ParseTuple(a, "i", &ms)) return NULL;
+  struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl);
+  dl.tv_sec += ms / 1000; dl.tv_nsec += (long)(ms % 1000) * 1000000L; if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
+  int parked;
+  Py_BEGIN_ALLOW_THREADS
+  pthread_mutex_lock(&park_lk); park_held = 1;
+  while (!park_parked && pthread_cond_timedwait(&park_cv, &park_lk, &dl) == 0) ;
+  parked = park_parked; pthread_mutex_unlock(&park_lk);
+  Py_END_ALLOW_THREADS
+  return PyBool_FromLong(parked);
+}
+static PyObject *py_unhold(PyObject *s, PyObject *a){ pthread_mutex_lock(&park_lk); park_held = 0; pthread_cond_broadcast(&park_cv); pthread_mutex_unlock(&park_lk); Py_RETURN_NONE; }
 static PyObject *py_is_prefork(PyObject *s, PyObject *a){ unsigned long long p; if (!PyArg_ParseTuple(a, "K", &p)) return NULL; return PyBool_FromLong(hset_has((uintptr_t)p) || _Py_IsImmortal((PyObject *)(uintptr_t)p)); }
 
 /* Pull a branch's range out of a stopped child by reading its memory. */
@@ -646,6 +676,7 @@ static PyMethodDef M[] = {
   {"dump_range", py_dump_range, METH_VARARGS, ""}, {"import_file", py_import_file, METH_VARARGS, ""},
   {"release", py_release, METH_O, ""},
   {"relink_weakref", py_relink_weakref, METH_O, ""}, {"unintern", py_unintern, METH_O, ""}, {"is_interned", py_is_interned, METH_O, ""},
+  {"park", py_park, METH_NOARGS, ""}, {"hold", py_hold, METH_VARARGS, ""}, {"unhold", py_unhold, METH_NOARGS, ""},
   {"install", py_install, METH_NOARGS, ""}, {"reserve", py_reserve, METH_VARARGS, ""},
   {"use_range", py_use_range, METH_O, ""}, {"divert_off", py_divert_off, METH_NOARGS, ""},
   {"used", py_used, METH_VARARGS, ""}, {"inrange", py_inrange, METH_VARARGS, ""},

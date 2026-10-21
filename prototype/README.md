@@ -60,10 +60,11 @@ restored from one checkpoint join into the root in about 1 s; the footer prints 
 and sums per item, all right; three scatters in one session with legs between them, `skipped` 0
 in every merge log line (`run/share/kernel.log`, `imported worker`). The kernel image is 570 MB
 with torch imported. A crash inside the kernel writes its Python frames to `run/share/kernel.fault`;
-`MOTABI_AUDIT=1` logs, per worker, every referent the root could not account for. A scatter
-started while the completion engine is importing (a keystroke just before) may refuse a worker's
-export by name; HANDOFF.md issue 1 has the state. `docs/scatter-research.md` has the mechanism
-and what the move found.
+`MOTABI_AUDIT=1` logs, per worker, every referent the root could not account for. marimo's
+completion thread is parked from before the checkpoint to the end of the join (`fold.HeldQueue`;
+`kernel.log` has `completion engine parked after ...`), waiting up to 30 s for a request it is
+serving; HANDOFF.md issue 1 has the numbers. `docs/scatter-research.md` has the mechanism and
+what the move found.
 
 ## Found on the way
 

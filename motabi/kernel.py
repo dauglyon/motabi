@@ -7,9 +7,11 @@ what makes a restored kernel not exit on finding the server's pid absent from th
 kernel arguments the launcher saved are fed on stdin, with virtual-file storage switched off:
 the kernel's /dev/shm is not the server's. Signals are forwarded to the kernel's process group.
 
-As the child (`--child`): marimo's own kernel entry point, with two changes made before
+As the child (`--child`): marimo's own kernel entry point, with three changes made before
 anything else: the fold allocator (motabi.fold) is installed and its ranges reserved, so they
-are at the same addresses in every checkpoint; and the ZeroMQ sockets get a heartbeat. gVisor restores a connected host socket with no descriptor: reads fail with
+are at the same addresses in every checkpoint; the queue marimo's completion engine reads is
+wrapped so a scatter can park that thread (fold.HeldQueue); and the ZeroMQ sockets get a
+heartbeat. gVisor restores a connected host socket with no descriptor: reads fail with
 ECONNRESET, writes with EPIPE, and readiness reports hangup to wake pollers. ZeroMQ reconnects
 when it sees any of those, but a poller that misses the wake sits on the dead socket until the
 next send, which for a pull socket is never. A ZMTP heartbeat turns detection into a timer: the
@@ -24,6 +26,7 @@ import os
 import signal
 import subprocess
 import sys
+from typing import Any
 
 HEARTBEAT_IVL_MS = 1000
 HEARTBEAT_TIMEOUT_MS = 5000
@@ -57,11 +60,20 @@ def _child() -> None:
         return s
 
     zmq.Context.socket = socket  # type: ignore[method-assign]
+    from marimo._runtime import runtime
     from marimo._runtime.runner.hooks_on_finish import ON_FINISH_HOOKS
 
-    from motabi.executor import on_finish
+    from motabi.executor import _log, on_finish
 
     ON_FINISH_HOOKS.append(on_finish)  # the kernel comes home when the run that sent it out ends
+    original_launch = runtime.launch_kernel
+
+    def launch_kernel(**kwargs: Any) -> None:
+        # the completion engine reads this queue; a scatter parks its thread there (fold.HeldQueue)
+        kwargs["completion_queue"] = fold.hold_queue(kwargs["completion_queue"], _log)
+        original_launch(**kwargs)
+
+    runtime.launch_kernel = launch_kernel  # type: ignore[assignment]
     from marimo._ipc.launch_kernel import main as launch
 
     launch()

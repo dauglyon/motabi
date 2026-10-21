@@ -22,6 +22,7 @@ import gc
 import os
 import pickle
 import sys
+import time
 from typing import Any, Callable
 
 from . import foldalloc
@@ -32,6 +33,8 @@ LIBC_RANGE = 8 << 30  # libc and mmap: address space only; polars' jemalloc rese
 _next_range = 0
 _shim: ctypes.CDLL | None = None
 _held: list[Any] = []  # the worker's cache-draining arrays, alive for its life
+HOLD_S = 30.0  # bound on waiting for the completion thread's in-flight request before the snapshot
+_queue: HeldQueue | None = None
 
 
 def install() -> None:
@@ -74,6 +77,80 @@ def _drain_numpy() -> None:
     if np is None:
         return
     _held.extend(np.empty((1,) * nd, dtype=np.int8) for nd in range(1, 17) for _ in range(7))
+
+
+# -- the completion engine across a scatter -------------------------------------------------------
+
+class HeldQueue:
+    """marimo's out-of-band queue (completions, breakpoints) with its reader thread parked across
+    a scatter. The thread parks (foldalloc.park) before every command it would take, so during a
+    hold it sleeps in C with no Python object on its stack: a worker's copy of it never resumes,
+    so nothing it holds can die there and hand a pre-fork block to a per-type freelist. A thread
+    idle in get() is woken with a token so it parks at once; one mid-request parks when that
+    request is done. A command received during the hold is served after the join."""
+
+    _WAKE = object()
+
+    def __init__(self, inner: Any, log: Callable[[str], None]) -> None:
+        self._inner = inner
+        self._log = log
+        self.reading = False  # some thread has called get(): there is a thread to park
+        self._resumed = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def get(self, block: bool = True, timeout: float | None = None) -> Any:
+        self.reading = True
+        while True:
+            self._park()
+            item = self._inner.get(block, timeout)
+            if item is self._WAKE:
+                continue
+            self._park()
+            if self._resumed:
+                self._resumed = False
+                self._log(f"completion engine serving the first command after the hold: {type(item).__name__}")
+            return item
+
+    def get_nowait(self) -> Any:
+        while True:
+            item = self._inner.get_nowait()
+            if item is not self._WAKE:
+                return item
+
+    def wake(self) -> None:
+        self._inner.put(self._WAKE)
+
+    def _park(self) -> None:
+        if foldalloc.park():
+            self._resumed = True
+            self._log("completion engine resumed")
+
+
+def hold_queue(inner: Any, log: Callable[[str], None]) -> HeldQueue:
+    """At kernel start: the queue marimo's out-of-band worker will read."""
+    global _queue
+    _queue = HeldQueue(inner, log)
+    return _queue
+
+
+def hold_completion(bound_s: float = HOLD_S) -> str:
+    """Before the snapshot: park the completion thread, waiting up to the bound for a request it
+    is serving. Returns a note for the log. On a timeout the snapshot goes ahead with the thread
+    busy (the import wait in root_phase still applies) and it parks when the request is done."""
+    if _queue is None or not _queue.reading:
+        return "absent"
+    _queue.wake()
+    t0 = time.monotonic()
+    if foldalloc.hold(int(bound_s * 1000)):
+        return f"parked after {time.monotonic() - t0:.2f}s"
+    return f"still busy after {bound_s:.0f}s; snapshotting anyway"
+
+
+def release_completion() -> None:
+    """After the join, in the root only."""
+    foldalloc.unhold()
 
 
 # -- the snapshot and the worker's switch --------------------------------------------------------
