@@ -231,7 +231,7 @@ class MotabiExecutor:
                     if k in ns:
                         values[k].append(ns[k])
             gc.unfreeze()
-            _REGION = {"cells": set(order), "values": values, "workers": workers}
+            _REGION = {"cells": set(order), "pending": set(order), "values": values, "workers": workers}
             for k, vals in values.items():
                 if vals:
                     glbls[k] = vals[0]
@@ -266,8 +266,16 @@ class MotabiExecutor:
         os._exit(0)
 
     def _answer(self, cell: Any, glbls: Any) -> None:
-        """A scattered cell reached by the root's scheduler: bind worker 0's defines, run nothing."""
+        """A scattered cell reached by the root's scheduler in the run that forked: bind worker
+        0's defines, run nothing. Reached again (edited, or rerun by hand), the scatter is stale:
+        its values are dropped and the cell raises, naming the header to rerun."""
+        global _REGION
         assert _REGION is not None
+        if cell.cell_id not in _REGION["pending"]:
+            _REGION = None
+            raise RuntimeError("this cell ran in the workers of an earlier scatter; rerun the cell "
+                               "with motabi.scatter(...) to run it again")
+        _REGION["pending"].discard(cell.cell_id)
         for k in cell.defs:
             vals = _REGION["values"].get(k) or []
             if vals:

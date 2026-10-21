@@ -117,12 +117,21 @@ class Launcher:
                        check=True, stdout=self.log, stderr=self.log)
 
     def fetch(self, *paths: str) -> float:
-        """Copy directories back from the site; files that only grew are appended to."""
+        """Copy directories back from the site. The kernel's stdout is the one file only ever
+        appended to, so it alone is fetched by appending; every other file is compared whole
+        (an appending fetch skips a file that changed without growing and corrupts one that
+        changed and grew)."""
         t0 = time.monotonic()
+        e = " ".join(["ssh", *SITE_SSH])
         for p in paths:
-            ex = [a for e in self.WORKSPACE_EXCLUDES for a in ("--exclude", e)] if p == self.notebook_dir else []
-            subprocess.run(["rsync", "-a", "--inplace", "--append", *ex, "-e", " ".join(["ssh", *SITE_SSH]),
-                            f"{SITE}:{p}/", p + "/"], check=True, stdout=self.log, stderr=self.log)
+            ex = [a for e_ in self.WORKSPACE_EXCLUDES for a in ("--exclude", e_)] if p == self.notebook_dir else []
+            if p == self.share:
+                ex = ex + ["--exclude", os.path.basename(self.out)]
+            subprocess.run(["rsync", "-a", *ex, "-e", e, f"{SITE}:{p}/", p + "/"],
+                           check=True, stdout=self.log, stderr=self.log)
+            if p == self.share:
+                subprocess.run(["rsync", "-a", "--inplace", "--append", "-e", e, f"{SITE}:{self.out}", self.out],
+                               check=True, stdout=self.log, stderr=self.log)
         return time.monotonic() - t0
 
     def site_has(self, path: str) -> bool:
@@ -275,9 +284,14 @@ class Launcher:
         if going_out:  # the list comes from the live process, so before the checkpoint stops it
             os.makedirs(img, exist_ok=True)
             n_mapped = self.write_digests(img)
-        rc, t_ckpt = self.runsc("checkpoint", "--image-path", img, old, remote=self.away)
+        # The kernel keeps running (blocked on this leg's answer) until the new sandbox is up, so
+        # a failed checkpoint or restore leaves it where it was and the cell gets the error.
+        rc, t_ckpt = self.runsc("checkpoint", "--leave-running", "--image-path", img, old, remote=self.away)
         if rc:
-            self.say(f"leg {n} {tag}: checkpoint of {old} failed (rc {rc}); see launcher.log")
+            error = f"checkpoint of {old} failed (rc {rc}); see launcher.log"
+            self.say(f"leg {n} {tag}: {error}")
+            return {"container": old, "checkpoint_s": round(t_ckpt, 1), "image_mb": 0, "restore_s": 0.0,
+                    "transfer_s": 0.0, "where": f"on {SITE}" if self.away else "here", "error": error}
         t_xfer = 0.0
         if going_out:
             if self.tunnel is None:
@@ -304,7 +318,12 @@ class Launcher:
             rc2, t_rest = self.runsc("restore", "--image-path", img, "-bundle", self.bundle, "-detach", new,
                                      sandbox_stdio=True)
         if rc2:
-            self.say(f"leg {n} {tag}: restore as {new} failed (rc {rc2}); see launcher.log")
+            error = f"restore as {new} failed (rc {rc2}); see launcher.log"
+            self.say(f"leg {n} {tag}: {error}; {old} keeps running")
+            self.runsc("delete", "-force", new, remote=going_out)
+            return {"container": old, "checkpoint_s": round(t_ckpt, 1), "image_mb": round(size / 1e6),
+                    "restore_s": round(t_rest, 1), "transfer_s": round(t_xfer, 1),
+                    "where": f"on {SITE}" if self.away else "here", "error": error}
         self.runsc("delete", "-force", old, remote=self.away)
         self.cid, self.away = new, going_out
         where = f"on {SITE}" if going_out else "here"
@@ -322,6 +341,20 @@ class Launcher:
         if self.away:
             self.push_file(final)  # the executor is waiting for it on the site
 
+    CLAIM_S = 120.0  # bound on W restored workers reaching their claims
+
+    @staticmethod
+    def error_manifest(prefix: str, i: int, msg: str) -> None:
+        """The manifest the root reads as the worker's failure; created only if the worker wrote
+        none (it may have exported and exited since the check), never over one."""
+        import pickle
+        try:
+            fd = os.open(f"{prefix}.manifest_{i}", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            return
+        with os.fdopen(fd, "wb") as f:
+            pickle.dump({"error": msg}, f)
+
     def fork(self, n: int, workers: int) -> None:
         """Checkpoint, restore W workers without network, let them claim roles, then the root."""
         assert self.cid is not None
@@ -332,13 +365,23 @@ class Launcher:
         if rc:
             self.say(f"scatter {n}: checkpoint failed (rc {rc})")
         t0 = time.monotonic()
+        up = set(range(workers))
         for i in range(workers):
             rc, _ = self.runsc("restore", "--image-path", img, "-bundle", self.bundle, "-detach",
                                f"sc{n}-w{i}", sandbox_stdio=True, network=False)
             if rc:
                 self.say(f"scatter {n}: restore of worker {i} failed (rc {rc})")
+                self.error_manifest(prefix, i, f"worker {i} could not be restored (rc {rc}); see launcher.log")
+                up.discard(i)
         self.answer(f"scatter-{n}.go", {})
-        while not all(os.path.exists(f"{prefix}.claim_{i}") for i in range(workers)):
+        while not all(os.path.exists(f"{prefix}.claim_{i}") for i in up):
+            if time.monotonic() - t0 > self.CLAIM_S:
+                late = sorted(i for i in up if not os.path.exists(f"{prefix}.claim_{i}"))
+                self.say(f"scatter {n}: workers {late} did not claim within {self.CLAIM_S:.0f}s")
+                for i in late:
+                    self.error_manifest(prefix, i, f"worker {i} did not start within {self.CLAIM_S:.0f}s; see launcher.log")
+                    up.discard(i)
+                break
             time.sleep(0.1)
         t_workers = time.monotonic() - t0
         new = f"sc{n}-root"
@@ -350,8 +393,9 @@ class Launcher:
         self.cid = new
         self.say(f"scatter {n}: checkpoint {t_ckpt:.1f}s, {workers} workers up and claimed in "
                  f"{t_workers:.1f}s, root copy {new} restored in {t_root:.1f}s")
-        # Workers exit after exporting; a worker that dies first gets an error manifest.
-        pending = set(range(workers))
+        # Workers exit after exporting; a worker that dies first gets an error manifest. Only a
+        # state of "stopped" means that: a failed `runsc state` is asked again.
+        pending = set(up)
         while pending:
             for i in sorted(pending):
                 manifest = f"{prefix}.manifest_{i}"
@@ -361,17 +405,8 @@ class Launcher:
                 state = subprocess.run(
                     ["unshare", "-Ur", RUNSC, "--ignore-cgroups", "--root", self.state, "state", f"sc{n}-w{i}"],
                     capture_output=True, text=True)
-                if '"status": "stopped"' in state.stdout or state.returncode:
-                    # the worker may have exported and exited since the first check: the error
-                    # manifest is created only if no manifest exists, never over one
-                    import pickle
-                    try:
-                        fd = os.open(manifest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-                    except FileExistsError:
-                        pending.discard(i)
-                        continue
-                    with os.fdopen(fd, "wb") as f:
-                        pickle.dump({"error": f"worker {i} exited without exporting; see kernel.err"}, f)
+                if state.returncode == 0 and '"status": "stopped"' in state.stdout:
+                    self.error_manifest(prefix, i, f"worker {i} exited without exporting; see kernel.err")
                     pending.discard(i)
             time.sleep(0.2)
         for i in range(workers):

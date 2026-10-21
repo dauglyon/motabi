@@ -240,10 +240,14 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
    authenticate the channel (ZMQ CURVE); install runsc under the user's home and check its
    hash before use; create the run directory with mode 0700.
 
-Noticed on the way (not changed): the launcher's manifest wait (`motabi/launcher.py`, the
-`runsc state` poll) treats a nonzero exit of `runsc state` as the worker having exited and writes
-the "exited without exporting" manifest; it did so once for a worker whose export landed in the
-same second (`kernel.fault` empty). A nonzero exit should be retried.
+Launcher and region robustness (2026-10-21): a leg's checkpoint leaves the kernel running
+until the new sandbox is up, and a failed checkpoint or restore keeps it where it was and
+raises in the cell; a worker whose restore fails, or that has not claimed within 120 s, gets an
+error manifest instead of a wait without end; a failed `runsc state` is asked again rather than
+read as the worker's exit; the fetch from the site appends only to the kernel's stdout and
+copies every other file whole; a scattered cell run again after its scatter (edited, or by
+hand) drops the stale values and raises, naming the header to rerun. The fetch change is
+unverified against a site (no site in this environment); the rest ran in one session.
 
 ## Next
 
