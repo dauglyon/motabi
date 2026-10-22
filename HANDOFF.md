@@ -204,18 +204,22 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
    pool's size class. The ranges are 4 GiB (Python) and 8 GiB (libc) of address space per
    worker, 48 pairs, reserved 1 MiB-aligned, never reused (issue 2). `motabi/npdivert.c` stays **disabled**.
 
-2. **The pool is not yet the design's pool.** DESIGN 2.4 (settled 2026-10-22) has one contiguous
-   reservation of equal 8 GiB slabs, strided ownership per scatter (worker i of W takes slabs
-   b+i, b+i+W, ...), a worker taking its next slab when one is full, the root advancing the base
-   past the highest slab used after each join, slab owner by arithmetic, nesting as the same stride one level down. Built today
-   (2026-10-22): two contiguous pools, 1024 Python ranges of 4 GiB and 1024 libc ranges of 8 GiB
-   (12 TiB reserved, 72 mappings), the range of an address by arithmetic, no table limit; still
-   one pair per worker (the per-worker size cap), two ranges rather than one slab, no stride,
-   and the nesting counter every copy inherits. Memory return is built for small objects (1(e)); the
-   shim's per-page counts for imported libc blocks under 64 KiB are not (`rangemalloc.c`
-   range_free madvises 64 KiB and up). The recycle-by-address attempt and the review behind
-   this design are in `experiments/scatter-libs/checks/recycle-attempt.patch` and
-   `docs/scatter-research.md`.
+2. **The pool is the design's pool (2026-10-22).** One contiguous reservation of 2048 slabs of
+   8 GiB (16 TiB, untouched until used); a scatter of W workers from base b gives worker i the
+   slabs b+i, b+i+W, ..., and the shim takes the worker's next slab when the current one cannot
+   serve a request (extents, a diverted mmap, or a pymalloc arena); the walk, the export check and
+   the free hooks decide "mine" by arithmetic on the slab index; each slab is dumped to its own
+   file and the manifest lists them; the root imports every slab and moves the pool's base past
+   the highest one. One slab serves every allocator of a worker: pymalloc's arenas and diverted
+   mappings from the top, the shim's jemalloc extents from the bottom, the first page the arena
+   bitmap. `checks/grow.py`: a worker holding three 3.5 GiB arrays takes slabs 0, 2, 4 of a stride
+   of 2 and the root reads all three. Found on the way: the switch call's own argument tuple, a
+   pre-fork object, died onto a freelist head as the call returned and became the worker's first
+   tuple of that size; `use_range` and `root_phase` are fast-call functions now, and the per-type
+   freelists are drained by allocation at the switch before they are filled with in-slab
+   objects. Still open: the shim's per-page counts for imported libc blocks under 64 KiB
+   (`rangemalloc.c` range_free madvises 64 KiB and up); the nesting stride is written in DESIGN
+   2.5 and not built (a worker's copies would need their own stride over its row).
 
 3. **No scheduler, no real site.** The guest stands in for a login node: ssh, rsync, and runsc
    invoked directly. A Slurm or Superfacility adapter (submit, status, cancel, walltime

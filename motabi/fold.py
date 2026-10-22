@@ -28,9 +28,8 @@ from typing import Any, Callable
 
 from . import foldalloc
 
-RANGES = 1024   # pairs of ranges per session: 4 TiB + 8 TiB of address space, untouched until used
-PY_RANGE = 4 << 30    # Python's allocators: objects, and NumPy data (PyMem_Raw)
-LIBC_RANGE = 8 << 30  # libc and mmap: address space only; polars' jemalloc reserves GBs of it eagerly
+RANGES = 2048   # slabs per session: 16 TiB of address space, untouched until used (DESIGN 2.4)
+SLAB = 8 << 30  # one slab serves every allocator of a worker; a worker takes its next slab when one is full
 _next_range = 0
 _shim: ctypes.CDLL | None = None
 _held: list[Any] = []  # the worker's cache-draining arrays, alive for its life
@@ -42,8 +41,7 @@ def install() -> None:
     """At kernel start: wrappers on, ranges reserved, the shim told about its ranges."""
     global _shim
     foldalloc.install()
-    py = foldalloc.reserve(RANGES, PY_RANGE)
-    libc = foldalloc.reserve(RANGES, LIBC_RANGE)
+    slabs = foldalloc.reserve(RANGES, SLAB)
     try:
         shim = ctypes.CDLL(None)
         shim.rangemalloc_register_pool.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t, ctypes.c_size_t]
@@ -52,15 +50,23 @@ def install() -> None:
         return  # not preloaded: libc allocations stay outside and the export check refuses them
     shim.rangemalloc_use.argtypes = [ctypes.c_int]
     shim.rangemalloc_use.restype = ctypes.c_int
+    shim.rangemalloc_sequence.argtypes = [ctypes.c_int]
+    shim.rangemalloc_current.restype = ctypes.c_int
     shim.rangemalloc_spans.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t)]
     shim.rangemalloc_divert_failed.restype = ctypes.c_size_t
     shim.rangemalloc_stats.restype = ctypes.c_char_p
     foldalloc.python_ranges(RANGES)
-    # the shim's indices are foldalloc's: the Python pool first, then the libc pool; a Python
-    # range's first page is foldalloc's metadata (pymalloc arena slots) and the shim gets the rest
-    assert shim.rangemalloc_register_pool(py[0], RANGES, PY_RANGE, 4096) == 0
-    assert shim.rangemalloc_register_pool(libc[0], RANGES, LIBC_RANGE, 0) == RANGES
+    # the shim's slab indices are foldalloc's; a slab's first page is foldalloc's metadata
+    # (pymalloc arena slots) and the shim serves the rest
+    assert shim.rangemalloc_register_pool(slabs[0], RANGES, SLAB, 4096) == 0
     _shim = shim
+
+
+def note_slabs(slabs: list[int]) -> None:
+    """After a join: the pool's base moves past the highest slab any worker took."""
+    global _next_range
+    if slabs:
+        _next_range = max(_next_range, max(slabs) + 1)
 
 
 def allot(workers: int) -> int:
@@ -69,7 +75,7 @@ def allot(workers: int) -> int:
     base = _next_range
     _next_range += workers
     if _next_range > RANGES:
-        raise RuntimeError(f"out of ranges: {RANGES} reserved at kernel start")
+        raise RuntimeError(f"out of slabs: {RANGES} of {SLAB >> 30} GiB reserved at kernel start, all taken by this session's scatters")
     return base
 
 
@@ -176,14 +182,15 @@ def snapshot(glbls: Any) -> tuple[int, dict[str, float]]:
                "freeze": round(t4 - t3, 2), "gc_objects": len(seeds)}
 
 
-def worker_begin(rng: int, switched: bool = False) -> list[str]:
+def worker_begin(rng: int, switched: bool = False, stride: int = 1) -> list[str]:
     """The worker's switch; root_phase has already done it (switched) for a claimed copy."""
     if not switched:
-        foldalloc.use_range(rng)
         if _shim is not None:
-            rc = _shim.rangemalloc_use(RANGES + rng)
+            rc = _shim.rangemalloc_use(rng)
             if rc:
-                raise RuntimeError(f"the libc shim could not open range {RANGES + rng} (rc {rc})")
+                raise RuntimeError(f"the shim could not open slab {rng} (rc {rc})")
+            _shim.rangemalloc_sequence(stride)
+        foldalloc.use_range(rng, stride)
     _drain_numpy()
     return []
 
@@ -330,14 +337,14 @@ def _rebuild(obj: Any) -> Any:
 def _outside(obj: Any, tag: str) -> list[str]:
     bufs: list[tuple[str, int]] = []
     _buffers(obj, bufs, tag, set())
-    return [name for name, a in bufs if foldalloc.inrange(a) < 0]
+    return [name for name, a in bufs if not foldalloc.owned(a)]
 
 
 def _check_types(name: str, obj: Any) -> None:
     """A type the worker created outside its range is a C extension first imported inside the
     worker: its code and static types do not exist in the root."""
     for t in type(obj).__mro__:
-        if t is not object and foldalloc.inrange(id(t)) < 0 and not foldalloc.is_prefork(id(t)):
+        if t is not object and not foldalloc.owned(id(t)) and not foldalloc.is_prefork(id(t)):
             raise RuntimeError(f"define {name!r} has type {t.__module__}.{t.__qualname__}, created in the "
                                f"worker outside its range (a C extension first imported here?); import it at home first")
 
@@ -368,7 +375,7 @@ def worker_export(rng: int, glbls: Any, names: set[str], path: str) -> list[str]
             if note:
                 notes.append(note)
     if _shim is not None and _shim.rangemalloc_divert_failed():
-        raise RuntimeError(f"export refused: the libc range ({LIBC_RANGE >> 30} GiB) filled up and an allocator "
+        raise RuntimeError(f"export refused: the worker's slabs ({SLAB >> 30} GiB each) ran out under an allocator's mappings and an allocator "
                            f"fell back to memory outside it ({_shim.rangemalloc_stats().decode()})")
     defs = {k: id(glbls[k]) for k in names if k in glbls}
     # dicts reached from the defines whose key table is a pre-fork block (a freelist handed it out,
@@ -382,7 +389,7 @@ def worker_export(rng: int, glbls: Any, names: set[str], path: str) -> list[str]
         cls: dict[str, int] = {}
         shown = 0
         for o in gc.get_objects():
-            if foldalloc.inrange(id(o)) != rng:
+            if not foldalloc.owned(id(o)):
                 continue
             for r in gc.get_referents(o):
                 ra = id(r)
@@ -402,19 +409,18 @@ def worker_export(rng: int, glbls: Any, names: set[str], path: str) -> list[str]
     # (marimo's completion engine, a library pool) runs in between: an object made or freed then
     # would reach the root miscounted. The worker never untracks: the root drops the list links
     # before tracking (foldalloc.track) and leaves unreached objects untracked (foldalloc.leave).
-    lo, hi = ctypes.c_size_t(), ctypes.c_size_t()
-    if _shim is not None:
-        _shim.rangemalloc_spans(RANGES + rng, ctypes.byref(lo), ctypes.byref(hi))
+    last = _shim.rangemalloc_current() if _shim is not None else rng
     gc.disable()
-    reached, tracked, leftover, deltas, extra, demote, keys, n, libc_bytes = foldalloc.export_tail(
-        rng, RANGES + rng if _shim is not None else -1, lo.value, hi.value, path + ".bin", path + ".libc", list(defs.values()))
+    reached, tracked, leftover, deltas, extra, demote, keys, slabs, n = foldalloc.export_tail(rng, last, path, list(defs.values()))
     if _shim is not None:
-        plo, phi = ctypes.c_size_t(), ctypes.c_size_t()
-        _shim.rangemalloc_spans(rng, ctypes.byref(plo), ctypes.byref(phi))
-        notes.append(f"python range: {plo.value >> 20} MB of extents, {n >> 20} MB touched; "
-                     f"libc range: {lo.value >> 20} MB of extents, {hi.value >> 20} MB of mappings, {libc_bytes >> 20} MB touched")
+        spans = []
+        for k in slabs:
+            lo, hi = ctypes.c_size_t(), ctypes.c_size_t()
+            _shim.rangemalloc_spans(k, ctypes.byref(lo), ctypes.byref(hi))
+            spans.append(f"slab {k}: {lo.value >> 20} MB of extents, {hi.value >> 20} MB from the top")
+        notes.append("; ".join(spans) + f"; {n >> 20} MB touched")
     with open(path + ".tmp", "wb") as f:
-        pickle.dump({"bytes": n, "libc_bytes": libc_bytes, "defs": defs, "reached": reached, "tracked": tracked, "leftover": leftover,
+        pickle.dump({"bytes": n, "slabs": slabs, "defs": defs, "reached": reached, "tracked": tracked, "leftover": leftover,
                      "deltas": deltas, "extra": extra, "demote": demote, "keys": keys, "notes": notes}, f)
     os.rename(path + ".tmp", path)
     return notes
@@ -461,8 +467,7 @@ def root_phase(prefix: str, workers: int, base: int, glbls: Any, req: dict[str, 
     gc.collect()
     gc.disable()
     try:
-        return foldalloc.root_phase(prefix, workers, base, RANGES if _shim is not None else -1, glbls,
-                                    json.dumps(req).encode())
+        return foldalloc.root_phase(prefix, workers, base, glbls, json.dumps(req).encode())
     finally:
         gc.enable()
 
@@ -507,6 +512,7 @@ def audit(m: dict[str, Any], log: Callable[[str], None]) -> None:
 
 def bind(m: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     """After root_phase: the defines as the root's objects, with their stats."""
+    note_slabs(m.get("slabs", []))
     if "error" in m:
         raise RuntimeError(m["error"])
     ns = {k: ctypes.cast(a, ctypes.py_object).value for k, a in m["defs"].items()}
@@ -523,7 +529,7 @@ def bind(m: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         ns[k] = _uncarry(o, shadow)
     applied, skipped = m["applied"]
     extra, extra_skipped = m["extra_applied"]
-    return ns, {"bytes": m["bytes"], "libc_bytes": m["libc_bytes"], "defs": len(ns), "reached": len(m["reached"]),
+    return ns, {"bytes": m["bytes"], "slabs": m["slabs"], "defs": len(ns), "reached": len(m["reached"]),
                 "tracked": len(m["tracked"]), "leftover": len(m["leftover"]),
                 "deltas": len(m["deltas"]), "applied": applied, "skipped": skipped, "dead": foldalloc.dead(),
                 "keys": f"{m['keys_applied']} of {len(m['keys'])}",
@@ -537,9 +543,8 @@ def root_import(rng: int, path: str, log: Callable[[str], None] = lambda s: None
         m = pickle.load(f)
     if "error" in m:
         raise RuntimeError(m["error"])
-    foldalloc.import_spans(rng, path + ".bin")
-    if m["libc_bytes"] or os.path.exists(path + ".libc"):
-        foldalloc.import_spans(RANGES + rng, path + ".libc")
+    for k in m["slabs"]:
+        foldalloc.import_spans(k, f"{path}.slab{k}")
     foldalloc.replay_manifest(m)  # counts, key tables, untabled references, demotions, GC heads
     log("replayed")
     return bind(m)

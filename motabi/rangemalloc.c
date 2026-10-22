@@ -62,6 +62,11 @@ typedef struct {
   size_t mbump;                /* bytes of the range handed to mmap, from the top down */
 } Range;
 static Range *R; static int NR = 0, NRcap = 0; static atomic_int cur = -1;
+/* A worker's slabs are cur, cur+stride, cur+2*stride, ... (foldalloc.c, DESIGN 2.4): when the
+   current one cannot serve a request, the next is opened and becomes current. */
+static int stride = 0;
+static int advance(void);
+int rangemalloc_use(int i);
 /* Ranges come in pools: equal ranges side by side from one base, so the range of an address is
    arithmetic (foldalloc.c reserves the pools; the first page of a Python range is its metadata
    and stays outside the shim's view, hence `meta`). */
@@ -156,7 +161,7 @@ static void range_free(int ri, void *p){
 /* ---------------- the libc surface ---------------- */
 static void *do_malloc(size_t n, size_t align){
   int c = atomic_load(&cur);
-  if (c >= 0) return range_alloc(&R[c], n, align);
+  if (c >= 0) { void *p = range_alloc(&R[c], n, align); if (!p && (c = advance()) >= 0) p = range_alloc(&R[c], n, align); return p; }
   atomic_fetch_add(&n_home, 1); init_home();
   if (align <= 16) return h_malloc(n);
   void *p = NULL; return h_posix_memalign(&p, align, n) ? NULL : p;
@@ -166,7 +171,7 @@ void *calloc(size_t a, size_t b){
   size_t n; if (__builtin_mul_overflow(a, b, &n)) { errno = ENOMEM; return NULL; }
   if (atomic_load(&booting)) return boot_alloc(n);
   int c = atomic_load(&cur);
-  if (c >= 0) { void *p = range_alloc(&R[c], n, 0); if (p) memset(p, 0, n); return p; }
+  if (c >= 0) { void *p = range_alloc(&R[c], n, 0); if (!p && (c = advance()) >= 0) p = range_alloc(&R[c], n, 0); if (p) memset(p, 0, n); return p; }
   atomic_fetch_add(&n_home, 1); init_home(); return h_calloc(a, b);
 }
 size_t malloc_usable_size(void *p){
@@ -186,7 +191,7 @@ void *realloc(void *p, size_t n){
   if (ri < 0 && c < 0) { atomic_fetch_add(&n_home, 1); init_home(); return h_realloc(p, n); }
   /* every other case moves the block: into the range if diverted, else home */
   size_t old = ri >= 0 ? hdr(p)->size : (in_boot(p) ? 0 : (init_home(), h_usable(p)));
-  void *q = c >= 0 ? range_alloc(&R[c], n, 0) : (atomic_fetch_add(&n_home, 1), init_home(), h_malloc(n));
+  void *q = c >= 0 ? do_malloc(n, 0) : (atomic_fetch_add(&n_home, 1), init_home(), h_malloc(n));
   if (!q) return NULL;
   memcpy(q, p, old < n ? old : n);
   if (ri >= 0) range_free(ri, p); else { if (c >= 0) atomic_fetch_add(&n_realloc_home_to_range, 1); if (!in_boot(p)) h_free(p); }
@@ -211,14 +216,18 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off){
   int c = atomic_load(&cur);
   /* an address without MAP_FIXED is only a hint (mimalloc always passes one): it is ignored and the mapping diverted */
   if (c < 0 || fd >= 0 || !(flags & MAP_ANONYMOUS) || !(flags & MAP_PRIVATE) || (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE))) { atomic_fetch_add(&n_mmap_pass, 1); return h_mmap(addr, len, prot, flags, fd, off); }
-  Range *r = &R[c]; size_t align = len >= (2u << 20) ? (2u << 20) : 4096;      /* big requests get THP-friendly alignment */
-  pthread_mutex_lock(&lk);
-  uintptr_t top = (uintptr_t)r->base + r->size - r->mbump;
-  uintptr_t p = (top - len) & ~(uintptr_t)(align - 1);
-  if (p < (uintptr_t)r->base + r->bump + (r->size / 2)) {   /* the mmap half of the range is spent: an allocator falling back to brk would land outside, so this is counted and must fail the export */
-    pthread_mutex_unlock(&lk); atomic_fetch_add(&n_mmap_divert_failed, 1); errno = ENOMEM; return MAP_FAILED; }
-  r->mbump = (uintptr_t)r->base + r->size - p;
-  pthread_mutex_unlock(&lk);
+  size_t align = len >= (2u << 20) ? (2u << 20) : 4096;      /* big requests get THP-friendly alignment */
+  uintptr_t p = 0;
+  for (int tries = 0; tries < 2; tries++) {
+    Range *r = &R[c];
+    pthread_mutex_lock(&lk);
+    uintptr_t top = (uintptr_t)r->base + r->size - r->mbump;
+    p = (top - len) & ~(uintptr_t)(align - 1);
+    if (p >= (uintptr_t)r->base + r->bump + (r->size / 2)) { r->mbump = (uintptr_t)r->base + r->size - p; pthread_mutex_unlock(&lk); break; }
+    pthread_mutex_unlock(&lk); p = 0;
+    if ((c = advance()) < 0) break;   /* the mmap half of the slab is spent and no next slab: counted, and the export must fail */
+  }
+  if (!p) { atomic_fetch_add(&n_mmap_divert_failed, 1); errno = ENOMEM; return MAP_FAILED; }
   /* the range is already mapped PROT_NONE|RW; remap this piece so its flags and the kernel's accounting are what the caller asked for */
   void *got = h_mmap((void *)p, len, prot, (flags & ~MAP_FIXED_NOREPLACE) | MAP_FIXED, -1, 0);
   if (got == MAP_FAILED) return got;
@@ -251,12 +260,18 @@ int rangemalloc_register_pool(void *base, int count, size_t size, size_t meta){
   for (int k = 0; k < count; k++) { memset(&R[NR], 0, sizeof R[NR]); R[NR].base = (char *)base + (size_t)k * size + meta; R[NR].size = size - meta; NR++; }
   pthread_mutex_unlock(&lk); return first;
 }
+static size_t meta_of(int i){ for (int k = 0; k < NP; k++) if (i >= P[k].first && i < P[k].first + P[k].count) return P[k].meta; return 0; }
 int rangemalloc_use(int i){
   if (i < 0 || i >= NR) return -1;
-  if (mprotect(R[i].base, R[i].size, PROT_READ | PROT_WRITE)) return -1;
+  size_t meta = meta_of(i);   /* the whole slab, metadata page included: foldalloc reads and writes it */
+  if (mprotect(R[i].base - meta, R[i].size + meta, PROT_READ | PROT_WRITE)) return -1;
   if (!R[i].ready && backing_open(&R[i])) return -2;
   atomic_store(&cur, i); return 0;
 }
+void rangemalloc_sequence(int s){ stride = s; }
+int rangemalloc_current(void){ return atomic_load(&cur); }
+/* The current slab is full: open the worker's next one. -1 when there is none. */
+static int advance(void){ int c = atomic_load(&cur); if (c < 0 || stride <= 0 || c + stride >= NR) return -1; return rangemalloc_use(c + stride) ? -1 : c + stride; }
 void rangemalloc_off(void){ atomic_store(&cur, -1); }
 int rangemalloc_open(int i){
   if (i < 0 || i >= NR) return -1;
@@ -267,12 +282,17 @@ int rangemalloc_open(int i){
 void *rangemalloc_alloc(int i, size_t n){ return range_alloc(&R[i], n, 0); }
 /* A block from the top of the range, never given back (pymalloc's arenas, foldalloc.c); the
    arena's extents from the bottom stop where these begin, as they do for diverted mmaps. */
-void *rangemalloc_top_alloc(int i, size_t len, size_t align){
-  if (i < 0 || i >= NR) return NULL; Range *r = &R[i];
+static void *top_alloc(Range *r, size_t len, size_t align){
   pthread_mutex_lock(&lk);
   uintptr_t top = (uintptr_t)r->base + r->size - r->mbump, p = (top - len) & ~(uintptr_t)(align - 1);
   if (p < (uintptr_t)r->base + r->bump) { pthread_mutex_unlock(&lk); return NULL; }
   r->mbump = (uintptr_t)r->base + r->size - p; pthread_mutex_unlock(&lk); return (void *)p;
+}
+void *rangemalloc_top_alloc(int i, size_t len, size_t align){
+  if (i < 0 || i >= NR) return NULL;
+  void *p = top_alloc(&R[i], len, align);
+  if (!p && i == atomic_load(&cur) && (i = advance()) >= 0) p = top_alloc(&R[i], len, align);
+  return p;
 }
 void rangemalloc_free(void *p){ int ri = in_range(p); if (ri >= 0) range_free(ri, p); }
 /* Only in a copy that never opened the range's arena (the root): the pages go back to the OS, so

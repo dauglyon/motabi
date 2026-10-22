@@ -5,6 +5,10 @@
 #include "internal/pycore_frame.h"
 #include "internal/pycore_interp.h"
 #include "internal/pycore_obmalloc.h"
+#include "internal/pycore_tuple.h"
+#include "internal/pycore_list.h"
+#include "internal/pycore_dict_state.h"
+#include "internal/pycore_floatobject.h"
 #include "internal/pycore_pystate.h"
 #undef Py_BUILD_CORE
 #include <sys/mman.h>
@@ -45,7 +49,15 @@ static PyMemAllocatorEx orig[3]; static int installed = 0;
    sees an imported block (its radix tree of arenas does not hold the worker's). */
 #define META 4096
 static int npy = -1;   /* ranges [0, npy) are Python ranges, the rest libc */
-static PyObjectArenaAllocator orig_arena; static void *(*shim_top_alloc)(int, size_t, size_t);
+static PyObjectArenaAllocator orig_arena; static void *(*shim_top_alloc)(int, size_t, size_t); static int (*shim_current)(void);
+/* The worker's slabs: first, first+stride, ... up to the shim's current one (DESIGN 2.4). */
+static int first_slab = -1, stride_slabs = 0;
+static int owned(int ri){
+  if (ri < 0 || cur < 0) return 0;
+  int last = shim_current ? shim_current() : cur;
+  if (ri < first_slab || ri > last) return 0;
+  return stride_slabs > 0 ? (ri - first_slab) % stride_slabs == 0 : ri == first_slab;
+}
 static uintptr_t *free_arenas; static size_t n_free_arenas, cap_free_arenas;   /* the worker's emptied arenas, reused */
 static size_t n_dropped_prefork = 0, n_pools_returned = 0, n_arenas = 0;
 static size_t n_divert = 0, n_free_inrange = 0, n_realloc_foreign = 0; static size_t *freed_bytes;
@@ -103,7 +115,7 @@ static void *m_realloc(void *ctx, void *p, size_t n){
   int ri = in_range(p);
   if (ri >= 0) {
     if (ctx) {
-      if (pym_block(ri, p) && ri != cur) {   /* an imported small block: copied out by its pool's size class, its pool count dropped */
+      if (pym_block(ri, p) && !owned(ri)) {   /* an imported small block: copied out by its pool's size class, its pool count dropped */
         size_t old = INDEX2SIZE(POOL_ADDR(p)->szidx); void *q = o->malloc(o->ctx, n);
         if (q) { memcpy(q, p, old < n ? old : n); pool_free(ri, p); } return q;
       }
@@ -130,7 +142,7 @@ static void m_free(void *ctx, void *p){
     /* object and mem domains: an imported small block is freed by its pool header; anything
        else goes back through pymalloc (or the debug layer above it), which frees its own pool
        block or reaches the raw domain below for a large one. Raw: the shim's block. */
-    if (ctx) { if (pym_block(ri, p) && ri != cur) pool_free(ri, p); else o->free(o->ctx, p); }
+    if (ctx) { if (pym_block(ri, p) && !owned(ri)) pool_free(ri, p); else o->free(o->ctx, p); }
     else if (shim_alloc) o->free(o->ctx, p);   /* raw: libc's free, which the shim serves or counts as foreign */
     else rfree(ri, p);
     return;
@@ -142,9 +154,10 @@ static void m_free(void *ctx, void *p){
 /* pymalloc's arenas: 1 MiB slots from the top of the current Python range in a worker, marked in
    the range's first page; an arena pymalloc empties is zeroed and kept for its next one. */
 static void *arena_alloc(void *ctx, size_t n){
-  if (cur >= 0 && shim_top_alloc && is_py_range(cur) && n == ((size_t)1 << 20)) {
-    void *p = n_free_arenas ? (void *)free_arenas[--n_free_arenas] : shim_top_alloc(cur, n, n); if (!p) return NULL;
-    size_t k = (size_t)((char *)p - R[cur].base) >> 20; slab_bits(cur)[k >> 6] |= (uint64_t)1 << (k & 63); n_arenas++; return p;
+  if (cur >= 0 && shim_top_alloc && n == ((size_t)1 << 20)) {
+    int c = shim_current ? shim_current() : cur;
+    void *p = n_free_arenas ? (void *)free_arenas[--n_free_arenas] : shim_top_alloc(c, n, n); if (!p) return NULL;
+    int ri = in_range(p); size_t k = (size_t)((char *)p - R[ri].base) >> 20; slab_bits(ri)[k >> 6] |= (uint64_t)1 << (k & 63); n_arenas++; return p;
   }
   return orig_arena.alloc(orig_arena.ctx, n);
 }
@@ -170,7 +183,7 @@ static PyObject *py_install(PyObject *s, PyObject *a){
   shim_alloc = dlsym(RTLD_DEFAULT, "rangemalloc_alloc"); shim_free = dlsym(RTLD_DEFAULT, "rangemalloc_free"); shim_open = dlsym(RTLD_DEFAULT, "rangemalloc_open");
   shim_spans = dlsym(RTLD_DEFAULT, "rangemalloc_spans"); shim_discard = dlsym(RTLD_DEFAULT, "rangemalloc_discard");
   if (!shim_alloc || !shim_free || !shim_open || !shim_spans || !shim_discard) shim_alloc = NULL;
-  shim_top_alloc = dlsym(RTLD_DEFAULT, "rangemalloc_top_alloc");
+  shim_top_alloc = dlsym(RTLD_DEFAULT, "rangemalloc_top_alloc"); shim_current = dlsym(RTLD_DEFAULT, "rangemalloc_current");
   PyObject_GetArenaAllocator(&orig_arena); PyObjectArenaAllocator aa = { NULL, arena_alloc, arena_free }; PyObject_SetArenaAllocator(&aa);
   for (int d = 0; d < 3; d++) {
     PyMem_GetAllocator((PyMemAllocatorDomain)d, &orig[d]);
@@ -199,15 +212,21 @@ static PyObject *py_reserve(PyObject *s, PyObject *a){
 /* METH_O so no args tuple is created; the full collection drains CPython's
    per-type freelists (float, tuple, list, dict, ...) after the switch, so no
    later allocation can be handed a pre-fork block from a freelist. */
-static void bias_table(void);
-static PyObject *py_use_range(PyObject *s, PyObject *a){
-  int i = (int)PyLong_AsLong(a); if (i < 0 || i >= NR) { PyErr_SetString(PyExc_ValueError, "range"); return NULL; }
+static void bias_table(void); static void settle_freelists(void);
+/* FASTCALL: a call with an argument tuple would leave that pre-fork tuple dying as the call
+   returns, on a freelist head the worker's next tuple of that size would be handed (measured). */
+static PyObject *py_use_range(PyObject *s, PyObject *const *args, Py_ssize_t nargs){
+  int i, stride = 1; if (!_PyArg_ParseStack(args, nargs, "i|i", &i, &stride)) return NULL;
+  if (i < 0 || i >= NR) { PyErr_SetString(PyExc_ValueError, "range"); return NULL; }
   if (mprotect(R[i].base, R[i].size, PROT_READ | PROT_WRITE)) return PyErr_SetFromErrno(PyExc_OSError);
   if (shim_alloc && shim_open(i)) return PyErr_Format(PyExc_RuntimeError, "the shim could not open range %d", i);
-  cur = i; pymalloc_reset(); PyGC_Collect(); bias_table(); Py_RETURN_NONE;
+  /* as the claim path: bias before any collection can free a tabled object, collect, then fill
+     the per-type freelists with in-slab objects so no pre-fork dead block is handed out */
+  first_slab = i; stride_slabs = stride; cur = i; pymalloc_reset(); bias_table(); PyGC_Collect(); settle_freelists(); Py_RETURN_NONE;
 }
 static PyObject *py_divert_off(PyObject *s, PyObject *a){ cur = -1; Py_RETURN_NONE; }
 static PyObject *py_used(PyObject *s, PyObject *a){ int i; if (!PyArg_ParseTuple(a, "i", &i)) return NULL; return PyLong_FromSize_t(R[i].used); }
+static PyObject *py_owned(PyObject *s, PyObject *a){ unsigned long long p; if (!PyArg_ParseTuple(a, "K", &p)) return NULL; return PyBool_FromLong(owned(in_range((void *)(uintptr_t)p))); }
 static PyObject *py_inrange(PyObject *s, PyObject *a){ unsigned long long p; if (!PyArg_ParseTuple(a, "K", &p)) return NULL; return PyLong_FromLong(in_range((void *)(uintptr_t)p)); }
 static PyObject *py_untrack(PyObject *s, PyObject *o){ if (PyObject_IS_GC(o)) PyObject_GC_UnTrack(o); Py_RETURN_NONE; }
 /* Root side: the dumped head still holds the worker's list links (the worker never untracks: an
@@ -419,7 +438,7 @@ static int w_visit(PyObject *r, void *arg){
     return 0;
   }
   int ri = in_range(r);
-  if (ri == W.rng) { if (_Py_IsImmortal(r)) { int a; size_t i = amap_slot(&W.demote, (uintptr_t)r, &a); W.demote.v[i]++; } w_push(r); return 0; }
+  if (owned(ri)) { if (_Py_IsImmortal(r)) { int a; size_t i = amap_slot(&W.demote, (uintptr_t)r, &a); W.demote.v[i]++; } w_push(r); return 0; }
   if (ri < 0 && _Py_IsImmortal(r) && !(PyUnicode_Check(r) && ((PyASCIIObject *)r)->state.interned)) return 0;   /* immortal before the fork */
   if (ri < 0 && holds_range_objects(r)) { W.refuse = "an exported object references a container built in a page the join discards (a pre-fork block from a freelist); rerun the scatter"; return 0; }
   int a; size_t i = amap_slot(&W.extra, (uintptr_t)r, &a); W.extra.v[i]++; W.extra.t[i] = (uintptr_t)Py_TYPE(r);
@@ -430,7 +449,7 @@ static int w_visit(PyObject *r, void *arg){
    or mapped code) and a positive count. */
 static int plausible(const PyObject *c){
   uintptr_t t = (uintptr_t)Py_TYPE(c); if (!t || (t & 7)) return 0;
-  if (hmap_get(t) < 0) { if (in_range((void *)t) == W.rng) { if (t & 15) return 0; } else if (!is_mapped((void *)t)) return 0; }
+  if (hmap_get(t) < 0) { if (owned(in_range((void *)t))) { if (t & 15) return 0; } else if (!is_mapped((void *)t)) return 0; }
   PyObject *mt = (PyObject *)Py_TYPE((PyObject *)t); if (!mt || ((uintptr_t)mt & 7)) return 0;
   if (hmap_get((uintptr_t)mt) < 0 && in_range(mt) < 0 && !is_mapped(mt)) return 0;
   return PyType_Check((PyObject *)t) && ((PyTypeObject *)t)->tp_basicsize > 0 && Py_REFCNT(c) > 0;
@@ -439,7 +458,7 @@ static void w_scan(const char *from, const char *to){
   for (const char *p = from; p + 8 <= to; p += 8) {
     uintptr_t w = *(const uintptr_t *)p; if (!w) continue;
     if (hmap_get(w) >= 0) { w_visit((PyObject *)w, NULL); continue; }
-    if (in_range((void *)w) == W.rng && !(w & 15) && plausible((PyObject *)w)) w_visit((PyObject *)w, NULL);
+    if (owned(in_range((void *)w)) && !(w & 15) && plausible((PyObject *)w)) w_visit((PyObject *)w, NULL);
   }
 }
 static void w_keys(Keys *k){   /* the key strings a unicode key table owns */
@@ -456,7 +475,7 @@ static void w_object(PyObject *o){
   if (PyType_Check(o)) {   /* a type in the range is a heap type; type_traverse skips what type_dealloc drops */
     PyHeapTypeObject *h = (PyHeapTypeObject *)o; PyTypeObject *ht = (PyTypeObject *)o;
     w_visit(h->ht_name, NULL); w_visit(h->ht_slots, NULL); w_visit(h->ht_qualname, NULL); w_visit((PyObject *)ht->tp_subclasses, NULL);
-    if ((ht->tp_flags & Py_TPFLAGS_MANAGED_DICT) && in_range(h->ht_cached_keys) == W.rng) w_keys((Keys *)h->ht_cached_keys);
+    if ((ht->tp_flags & Py_TPFLAGS_MANAGED_DICT) && owned(in_range(h->ht_cached_keys))) w_keys((Keys *)h->ht_cached_keys);
   }
   if (PyCode_Check(o)) {
     PyCodeObject *c = (PyCodeObject *)o;
@@ -790,26 +809,25 @@ static PyObject *py_dump_span(PyObject *s, PyObject *a){
    reached are the objects the walk found in the range, tracked those of them the worker's
    collector tracks, leftover the tracked objects in the range the walk did not reach. */
 static PyObject *py_export_tail(PyObject *s, PyObject *a){
-  int i, li; size_t lo, hi; const char *bin, *libc; PyObject *defs;
-  if (!PyArg_ParseTuple(a, "iinnssO!", &i, &li, &lo, &hi, &bin, &libc, &PyList_Type, &defs)) return NULL;
+  int i, last; const char *prefix; PyObject *defs;
+  if (!PyArg_ParseTuple(a, "iisO!", &i, &last, &prefix, &PyList_Type, &defs)) return NULL;
   if (w_run(i, defs)) { w_done(); return NULL; }
   if (PyList_GET_SIZE(W.foreign)) { w_done(); PyErr_SetString(PyExc_RuntimeError, "export refused: a dict's key table is a pre-fork block after the re-key"); return NULL; }
   PyObject *gcm = PyImport_ImportModule("gc"); if (!gcm) { w_done(); return NULL; }
   PyObject *objs = PyObject_CallMethod(gcm, "get_objects", NULL); Py_DECREF(gcm); if (!objs) { w_done(); return NULL; }
   PyObject *leftover = PyList_New(0);
-  for (Py_ssize_t k = 0; k < PyList_GET_SIZE(objs); k++) { PyObject *o = PyList_GET_ITEM(objs, k); if (in_range(o) != i || amap_get(&W.seen, (uintptr_t)o) >= 0) continue; PyObject *v = PyLong_FromVoidPtr(o); PyList_Append(leftover, v); Py_DECREF(v); }
+  for (Py_ssize_t k = 0; k < PyList_GET_SIZE(objs); k++) { PyObject *o = PyList_GET_ITEM(objs, k); if (!owned(in_range(o)) || amap_get(&W.seen, (uintptr_t)o) >= 0) continue; PyObject *v = PyLong_FromVoidPtr(o); PyList_Append(leftover, v); Py_DECREF(v); }
   Py_DECREF(objs);
   PyObject *reached = w_addrs(0), *tracked = w_addrs(1), *deltas = w_deltas(), *extra = w_amap_list(&W.extra, 1), *demote = w_amap_list(&W.demote, 0), *keys = keys_list();
   w_done();
-  Py_ssize_t n = dump_range_to(i, bin); if (n < 0) return PyErr_SetFromErrno(PyExc_OSError);
-  Py_ssize_t lb = 0;
-  if (li >= 0) {
-    int fd = open(libc, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd < 0) return PyErr_SetFromErrno(PyExc_OSError);
-    Py_ssize_t b1 = dump_span_fd(li, 0, lo, fd), b2 = b1 < 0 ? -1 : dump_span_fd(li, R[li].size - hi, hi, fd); close(fd);
-    if (b2 < 0) return PyErr_SetFromErrno(PyExc_OSError);
-    lb = b1 + b2;
+  /* one sparse file per slab the worker took: first, first+stride, ..., last */
+  PyObject *slabs = PyList_New(0); Py_ssize_t n = 0; int step = stride_slabs > 0 ? stride_slabs : 1;
+  for (int k = i; k <= last; k += step) {
+    char path[4096]; snprintf(path, sizeof path, "%s.slab%d", prefix, k);
+    Py_ssize_t b = dump_range_to(k, path); if (b < 0) return PyErr_SetFromErrno(PyExc_OSError);
+    n += b; PyObject *v = PyLong_FromLong(k); PyList_Append(slabs, v); Py_DECREF(v);
   }
-  return Py_BuildValue("(NNNNNNNnn)", reached, tracked, leftover, deltas, extra, demote, keys, n, lb);
+  return Py_BuildValue("(NNNNNNNNn)", reached, tracked, leftover, deltas, extra, demote, keys, slabs, n);
 }
 static PyObject *py_import_spans(PyObject *s, PyObject *a){
   int i; const char *path; if (!PyArg_ParseTuple(a, "is", &i, &path)) return NULL;
@@ -892,15 +910,33 @@ static void seed_thread_frames(PyObject *seeds){
    caught at export, since it references range objects, which no pre-fork object does. Setting the
    float and tuple counters to their limits instead (which refuses pushes and pops) made the root
    crash on its first allocation after the phase, for a reason not found. */
+/* After the collection at the switch the per-type freelists hold pre-fork blocks (the
+   collection's garbage, and whatever died before). Every entry is popped by allocating it and
+   held for the worker's life (a pre-fork block, harmless to hold), then the lists are filled
+   with in-slab objects, so the worker's next tuple, dict, list or float is in its slab. A
+   pre-fork object that dies later still lands on a list; the export check catches a define
+   built from it. */
+static PyObject *held_prefork = NULL;
 static void settle_freelists(void){
+  PyInterpreterState *ip = PyInterpreterState_Get();
+  if (!held_prefork) held_prefork = PyList_New(0);
+  for (int sz = 1; sz <= PyTuple_NFREELISTS; sz++) {
+    int n = ip->tuple.numfree[sz - 1];
+    for (int k = 0; k < n; k++) { PyObject *t = PyTuple_New(sz); if (!t) break; for (int j = 0; j < sz; j++) PyTuple_SET_ITEM(t, j, Py_NewRef(Py_None)); PyList_Append(held_prefork, t); Py_DECREF(t); }
+  }
+  for (int k = 0, n = ip->list.numfree; k < n; k++) { PyObject *l = PyList_New(0); if (!l) break; PyList_Append(held_prefork, l); Py_DECREF(l); }
+  for (int k = 0, n = ip->dict_state.numfree > ip->dict_state.keys_numfree ? ip->dict_state.numfree : ip->dict_state.keys_numfree; k < n; k++) {
+    PyObject *d = PyDict_New(); if (!d) break; PyDict_SetItemString(d, "k", Py_None); PyList_Append(held_prefork, d); Py_DECREF(d);   /* a dict and its minimal key table */
+  }
+  for (int k = 0, n = ip->float_state.numfree; k < n; k++) { PyObject *f = PyFloat_FromDouble(k); if (!f) break; PyList_Append(held_prefork, f); Py_DECREF(f); }
   PyObject *keep = PyList_New(0);
   for (int k = 0; k < PyDict_MAXFREELIST + PyList_MAXFREELIST; k++) {
-    PyObject *d = PyDict_New(); PyDict_SetItemString(d, "k", Py_None);   /* one unicode key: a minimal key table, which goes to the key-table freelist with the dict */
+    PyObject *d = PyDict_New(); PyDict_SetItemString(d, "k", Py_None);
     PyObject *l = PyList_New(0); PyList_Append(keep, d); PyList_Append(keep, l); Py_DECREF(d); Py_DECREF(l);
   }
   for (int k = 0; k < PyFloat_MAXFREELIST; k++) { PyObject *f = PyFloat_FromDouble(k); PyList_Append(keep, f); Py_DECREF(f); }
   for (int sz = 1; sz <= PyTuple_NFREELISTS; sz++) for (int k = 0; k < 200; k++) { PyObject *t = PyTuple_New(sz); for (int j = 0; j < sz; j++) PyTuple_SET_ITEM(t, j, Py_NewRef(Py_None)); PyList_Append(keep, t); Py_DECREF(t); }
-  Py_DECREF(keep);   /* every object and key table goes onto its freelist, in range */
+  Py_DECREF(keep);   /* every object and key table goes onto its freelist, in the slab */
 }
 /* Is any other thread inside the import machinery? Its half-built module holds objects only its
    C stack and the import locks reach, which the table cannot see; the snapshot waits for it. */
@@ -915,9 +951,9 @@ static int other_thread_importing(void){
   }
   return 0;
 }
-static PyObject *py_root_phase(PyObject *s, PyObject *a){
-  const char *prefix, *req; int workers, base, libc_base, poll_ms = 50; PyObject *glbls; Py_ssize_t reqn;
-  if (!PyArg_ParseTuple(a, "siiiOy#|i", &prefix, &workers, &base, &libc_base, &glbls, &req, &reqn, &poll_ms)) return NULL;
+static PyObject *py_root_phase(PyObject *s, PyObject *const *args, Py_ssize_t nargs){
+  const char *prefix, *req; int workers, base, poll_ms = 50; PyObject *glbls; Py_ssize_t reqn;
+  if (!_PyArg_ParseStack(args, nargs, "siiOy#|i", &prefix, &workers, &base, &glbls, &req, &reqn, &poll_ms)) return NULL;
   char path[1024], tmp[1024];
   /* the table of pre-fork objects, taken here so that no Python code (and no other thread) runs
      between it and the checkpoint: a count changed in between would be misreported by every worker */
@@ -941,16 +977,19 @@ static PyObject *py_root_phase(PyObject *s, PyObject *a){
        its next objects in this copy's pre-fork heap, which the join discards */
     int rng = base + i; if (rng < 0 || rng >= NR) { PyErr_SetString(PyExc_ValueError, "range"); return NULL; }
     if (mprotect(R[rng].base, R[rng].size, PROT_READ | PROT_WRITE)) return PyErr_SetFromErrno(PyExc_OSError);
-    if (shim_alloc && shim_open(rng)) return PyErr_Format(PyExc_RuntimeError, "the shim could not open range %d", rng);
-    cur = rng; pymalloc_reset();
-    if (libc_base >= 0) { int (*use)(int) = dlsym(RTLD_DEFAULT, "rangemalloc_use"); if (!use || use(libc_base + rng)) return PyErr_Format(PyExc_RuntimeError, "the libc shim could not open range %d", libc_base + rng); }
+    if (shim_alloc) {   /* the shim serves the slab and takes the next one of the worker's sequence when it is full */
+      int (*use)(int) = dlsym(RTLD_DEFAULT, "rangemalloc_use"); void (*seq)(int) = dlsym(RTLD_DEFAULT, "rangemalloc_sequence");
+      if (!use || !seq || use(rng)) return PyErr_Format(PyExc_RuntimeError, "the shim could not open slab %d", rng);
+      seq(workers);
+    }
+    first_slab = rng; stride_slabs = workers; cur = rng; pymalloc_reset();
     /* the bias first: the collection may run finalisers, which can let another thread in, and
        no tabled object may die before it is biased. The caller disabled the collector for the
        root's sake; PyGC_Collect is a no-op while it is disabled, and the freelists must be
        drained now, then filled. */
     bias_table();
     PyObject *gcm = PyImport_ImportModule("gc"); if (!gcm) return NULL; PyObject *r = PyObject_CallMethod(gcm, "enable", NULL); Py_XDECREF(r); Py_DECREF(gcm);
-    PyGC_Collect(); settle_freelists(); 
+    PyGC_Collect(); settle_freelists();
     return Py_BuildValue("(NNnn)", tn, PyLong_FromLong(i), n_before, (Py_ssize_t)waited);
   }
   PyObject *pickle = PyImport_ImportModule("pickle"); if (!pickle) return NULL;
@@ -961,17 +1000,18 @@ static PyObject *py_root_phase(PyObject *s, PyObject *a){
     PyObject *m = PyObject_CallMethod(pickle, "loads", "O", raw); Py_DECREF(raw); if (!m) return NULL;
     PyList_Append(out, m); Py_DECREF(m); 
     if (!PyDict_Check(m) || PyDict_GetItemString(m, "error")) continue;
-    int rng = base + i;
-    snprintf(path, sizeof path, "%s.manifest_%d.bin", prefix, i);
-    { PyObject *args = Py_BuildValue("(is)", rng, path), *r = py_import_spans(NULL, args); Py_DECREF(args); if (!r) return NULL; Py_DECREF(r); }
-    snprintf(path, sizeof path, "%s.manifest_%d.libc", prefix, i);
-    if (libc_base >= 0 && file_exists(path)) { PyObject *args = Py_BuildValue("(is)", libc_base + rng, path), *r = py_import_spans(NULL, args); Py_DECREF(args); if (!r) return NULL; Py_DECREF(r); }
+    PyObject *slabs = PyDict_GetItemString(m, "slabs"); if (!slabs || !PyList_Check(slabs)) { PyErr_SetString(PyExc_RuntimeError, "manifest without slabs"); return NULL; }
+    for (Py_ssize_t k = 0; k < PyList_GET_SIZE(slabs); k++) {
+      long sl = PyLong_AsLong(PyList_GET_ITEM(slabs, k));
+      snprintf(path, sizeof path, "%s.manifest_%d.slab%ld", prefix, i, sl);
+      PyObject *args = Py_BuildValue("(ls)", sl, path), *r = py_import_spans(NULL, args); Py_DECREF(args); if (!r) return NULL; Py_DECREF(r);
+    }
     if (replay_manifest(m)) return NULL;
   }
   Py_DECREF(pickle); return Py_BuildValue("(NNnn)", tn, out, n_before, (Py_ssize_t)waited);
 }
 static PyMethodDef M[] = {
-  {"root_phase", py_root_phase, METH_VARARGS, ""}, {"walk_foreign", py_walk_foreign, METH_VARARGS, ""}, {"replay_manifest", py_replay_manifest, METH_O, ""}, {"apply_demote", py_apply_demote, METH_VARARGS, ""}, {"leave", py_leave, METH_O, ""},
+  {"root_phase", (PyCFunction)(void (*)(void))py_root_phase, METH_FASTCALL, ""}, {"walk_foreign", py_walk_foreign, METH_VARARGS, ""}, {"replay_manifest", py_replay_manifest, METH_O, ""}, {"apply_demote", py_apply_demote, METH_VARARGS, ""}, {"leave", py_leave, METH_O, ""},
   {"dict_keys_foreign", py_dict_keys_foreign, METH_O, ""}, {"rekey", py_rekey, METH_O, ""}, {"table_entry", py_table_entry, METH_VARARGS, ""}, {"is_mapped", py_is_mapped, METH_VARARGS, ""}, {"apply_extra", py_apply_extra, METH_O, ""}, {"export_keys", py_export_keys, METH_NOARGS, ""}, {"apply_keys", py_apply_keys, METH_O, ""},
   {"shadow_type", py_shadow_type, METH_O, ""}, {"shadow", py_shadow, METH_VARARGS, ""}, {"shadow_live", py_shadow_live, METH_NOARGS, ""},
   {"dump_span", py_dump_span, METH_VARARGS, ""}, {"export_tail", py_export_tail, METH_VARARGS, ""}, {"import_spans", py_import_spans, METH_VARARGS, ""},
@@ -980,7 +1020,7 @@ static PyMethodDef M[] = {
   {"relink_weakref", py_relink_weakref, METH_O, ""}, {"unintern", py_unintern, METH_O, ""}, {"is_interned", py_is_interned, METH_O, ""},
   {"park", py_park, METH_NOARGS, ""}, {"hold", py_hold, METH_VARARGS, ""}, {"unhold", py_unhold, METH_NOARGS, ""},
   {"install", py_install, METH_NOARGS, ""}, {"reserve", py_reserve, METH_VARARGS, ""}, {"python_ranges", py_python_ranges, METH_O, ""},
-  {"use_range", py_use_range, METH_O, ""}, {"divert_off", py_divert_off, METH_NOARGS, ""},
+  {"use_range", (PyCFunction)(void (*)(void))py_use_range, METH_FASTCALL, ""}, {"owned", py_owned, METH_VARARGS, ""}, {"divert_off", py_divert_off, METH_NOARGS, ""},
   {"used", py_used, METH_VARARGS, ""}, {"inrange", py_inrange, METH_VARARGS, ""},
   {"untrack", py_untrack, METH_O, ""}, {"track", py_track, METH_O, ""},
   {"import_range", py_import_range, METH_VARARGS, ""}, {"immortalize", py_immortalize, METH_O, ""},
