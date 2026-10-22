@@ -217,9 +217,11 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
    pre-fork object, died onto a freelist head as the call returned and became the worker's first
    tuple of that size; `use_range` and `root_phase` are fast-call functions now, and the per-type
    freelists are drained by allocation at the switch before they are filled with in-slab
-   objects. Still open: the shim's per-page counts for imported libc blocks under 64 KiB
-   (`rangemalloc.c` range_free madvises 64 KiB and up); the nesting stride is written in DESIGN
-   2.5 and not built (a worker's copies would need their own stride over its row).
+   objects. The shim keeps a live-block count per 4 KiB page inside each slab (the first 4 MB
+   from the slab's top, so the root inherits it with the import) and the root gives a page back
+   when its last imported block is freed: `checks/rootfree-large.py`, 100k 2 KiB objects dropped,
+   RSS 276 → 31 MB. Still open: the nesting stride is written in DESIGN 2.5 and not built (a
+   worker's copies would need their own stride over its row).
 
 3. **No scheduler, no real site.** The guest stands in for a login node: ssh, rsync, and runsc
    invoked directly. A Slurm or Superfacility adapter (submit, status, cancel, walltime

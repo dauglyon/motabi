@@ -60,6 +60,7 @@ typedef struct {
   unsigned arena; bool ready;
   atomic_size_t foreign_freed_bytes, foreign_freed_blocks;
   size_t mbump;                /* bytes of the range handed to mmap, from the top down */
+  uint16_t *pages;             /* live blocks per 4 KiB page, in the slab's own top (see page_table) */
 } Range;
 static Range *R; static int NR = 0, NRcap = 0; static atomic_int cur = -1;
 /* A worker's slabs are cur, cur+stride, cur+2*stride, ... (foldalloc.c, DESIGN 2.4): when the
@@ -125,12 +126,27 @@ static bool ext_purge(extent_hooks_t *h, void *a, size_t s, size_t o, size_t l, 
 static bool ext_split(extent_hooks_t *h, void *a, size_t s, size_t sa, size_t sb, bool c, unsigned i){ (void)h;(void)a;(void)s;(void)sa;(void)sb;(void)c;(void)i; return false; }
 static bool ext_merge(extent_hooks_t *h, void *a, size_t sa, void *b, size_t sb, bool c, unsigned i){ (void)h;(void)a;(void)sa;(void)b;(void)sb;(void)c;(void)i; return false; }
 static extent_hooks_t hooks = { ext_alloc, ext_dalloc, ext_destroy, ext_commit, ext_decommit, ext_purge, ext_purge, ext_split, ext_merge };
+/* Per-page live-block counts, kept inside the slab so a copy that imports the slab inherits
+   them: the first thing taken from the top when the slab is opened, so its place is the same in
+   every copy. A copy that did not open the slab (the root, for an imported slab) gives a page
+   back the moment its count reaches zero; the copy that owns the arena leaves that to jemalloc. */
+#define PAGE_TABLE_BYTES ((size_t)4 << 20)   /* 8 GiB / 4 KiB pages * 2 bytes */
+static void *top_alloc(Range *r, size_t len, size_t align);
+static uint16_t *page_table(const Range *r){ return (uint16_t *)(r->base + r->size - PAGE_TABLE_BYTES); }
+static void count_pages(const Range *r, const char *lo, const char *hi, int delta, int give_back){
+  uint16_t *t = page_table(r); size_t a = (size_t)(lo - r->base) >> 12, b = (size_t)(hi - 1 - r->base) >> 12;
+  for (size_t k = a; k <= b; k++) {
+    if (delta > 0) __atomic_add_fetch(&t[k], 1, __ATOMIC_RELAXED);
+    else if (__atomic_sub_fetch(&t[k], 1, __ATOMIC_RELAXED) == 0 && give_back) madvise(r->base + (k << 12), 4096, MADV_DONTNEED);
+  }
+}
 static int backing_open(Range *r){
   unsigned ind; size_t sz = sizeof ind; extent_hooks_t *hp = &hooks;
   r->bump = 0; opening = r;
   int err = rj_mallctl("arenas.create", &ind, &sz, &hp, sizeof hp);
   if (!err) {
     r->arena = ind; r->ready = true;
+    r->pages = top_alloc(r, PAGE_TABLE_BYTES, (size_t)1 << 20);   /* zero pages: the reservation's */
     char name[64]; ssize_t ms = 0;   /* purge as soon as an extent is free: nothing waits for it */
     snprintf(name, sizeof name, "arena.%u.dirty_decay_ms", ind); rj_mallctl(name, NULL, NULL, &ms, sizeof ms);
     snprintf(name, sizeof name, "arena.%u.muzzy_decay_ms", ind); rj_mallctl(name, NULL, NULL, &ms, sizeof ms);
@@ -148,14 +164,15 @@ static void *range_alloc(Range *r, size_t n, size_t align){
   char *p = (char *)(((uintptr_t)raw + HDR + align - 1) & ~(uintptr_t)(align - 1));
   Hdr *h = hdr(p); h->size = n; h->off = (uint32_t)(p - raw); h->magic = MAGIC;
   atomic_fetch_add(&n_divert, 1); atomic_fetch_add(&n_divert_bytes, n);
+  count_pages(r, raw, p + n, +1, 0);
   return p;
 }
 static void range_free(int ri, void *p){
-  Hdr *h = hdr(p);
-  if (R[ri].ready) { atomic_fetch_add(&n_free_range_current, 1); backing_free((char *)p - h->off); return; }   /* the arena is in this copy */
-  /* another copy's metadata: count, and give large blocks' pages back */
+  Hdr *h = hdr(p); char *raw = (char *)p - h->off, *end = (char *)p + h->size;
+  if (R[ri].ready) { atomic_fetch_add(&n_free_range_current, 1); count_pages(&R[ri], raw, end, -1, 0); backing_free(raw); return; }   /* the arena is in this copy */
+  /* another copy's arena: counted, and every page whose last block this was goes back */
   atomic_fetch_add(&R[ri].foreign_freed_blocks, 1); atomic_fetch_add(&R[ri].foreign_freed_bytes, h->size);
-  if (h->size >= 65536) { uintptr_t a = ((uintptr_t)p + 4095) & ~(uintptr_t)4095, e = ((uintptr_t)p + h->size) & ~(uintptr_t)4095; if (e > a) madvise((void *)a, e - a, MADV_DONTNEED); }
+  count_pages(&R[ri], raw, end, -1, 1);
 }
 
 /* ---------------- the libc surface ---------------- */
