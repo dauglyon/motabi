@@ -207,10 +207,11 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
 2. **The pool is not yet the design's pool.** DESIGN 2.4 (settled 2026-10-22) has one contiguous
    reservation of equal 8 GiB slabs, strided ownership per scatter (worker i of W takes slabs
    b+i, b+i+W, ...), a worker taking its next slab when one is full, the root advancing the base
-   past the highest slab used after each join, slab owner by arithmetic, nesting as the same stride one level down. Built today:
-   48 fixed pairs of 4 GiB (Python) + 8 GiB (libc) ranges, one pair per worker, `MAXR` 128 in
-   both C files, `in_range` a linear scan on every free, the per-worker size cap, and the
-   nesting counter every copy inherits. Memory return is built for small objects (1(e)); the
+   past the highest slab used after each join, slab owner by arithmetic, nesting as the same stride one level down. Built today
+   (2026-10-22): two contiguous pools, 1024 Python ranges of 4 GiB and 1024 libc ranges of 8 GiB
+   (12 TiB reserved, 72 mappings), the range of an address by arithmetic, no table limit; still
+   one pair per worker (the per-worker size cap), two ranges rather than one slab, no stride,
+   and the nesting counter every copy inherits. Memory return is built for small objects (1(e)); the
    shim's per-page counts for imported libc blocks under 64 KiB are not (`rangemalloc.c`
    range_free madvises 64 KiB and up). The recycle-by-address attempt and the review behind
    this design are in `experiments/scatter-libs/checks/recycle-attempt.patch` and
