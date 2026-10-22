@@ -242,9 +242,9 @@ class Launcher:
         }
         if CPU_FEATURES:
             spec["annotations"] = {ANNOTATION_CPU_FEATURES: CPU_FEATURES}
-        with open(os.path.join(self.bundle, "config.json"), "w") as f:
+        # the spec carries the channel secret in the kernel's environment: owner-only from creation
+        with os.fdopen(os.open(os.path.join(self.bundle, "config.json"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
             json.dump(spec, f, indent=1)
-        os.chmod(f.name, 0o600)  # the spec carries the channel secret in the kernel's environment
 
     def relay(self, path: str, dest: Any) -> None:
         """Tail a sandbox stdio file into one of this process's pipes to the server."""
