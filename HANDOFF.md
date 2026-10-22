@@ -204,23 +204,17 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
    pool's size class. The ranges are 4 GiB (Python) and 8 GiB (libc) of address space per
    worker, 48 pairs, reserved 1 MiB-aligned, never reused (issue 2). `motabi/npdivert.c` stays **disabled**.
 
-2. **Ranges are address space, never reused; memory returns per object.** Each scatter takes one
-   address range per worker from a fixed pool (`RANGES` in `motabi/fold.py`, 48) and the pool is
-   not refilled: an attempt to release a range by counting its live imported objects (2026-10-21,
-   `experiments/scatter-libs/checks/recycle-attempt.patch`, its test `checks/recycle.py`) found
-   permanent kernel objects pointing into every range after all gathers were dropped (appended
-   attribute names in shared key tables, re-keyed dicts, adopted strings), so address reuse would
-   free memory the kernel references. The settled direction: addresses are not scarce (one
-   process inside gVisor reserves 48 TiB; 2048 reservations of 16 GiB cost nothing in images or
-   time), so the pool should be one contiguous reservation sized from the address-space budget,
-   indexed by arithmetic (`MAXR` is 128 and `in_range` is a linear scan on every free, both to
-   go), with the session's bound stated in worker-scatters; what must come back is memory, per
-   object, which 1(e) now does for small objects and the shim's purge does for the worker's
-   freed extents. Still open there: the root returns an imported libc block's pages only for
-   blocks of 64 KiB and up (`rangemalloc.c` range_free); one range per worker sized as a peak
-   working set instead of the 4 + 8 GiB split (NumPy data lands in the Python range); nested
-   scatters, whose allotment counter every worker copy inherits. The adversarial review that
-   produced this list is summarised in `docs/scatter-research.md`.
+2. **The pool is not yet the design's pool.** DESIGN 2.4 (settled 2026-10-22) has one contiguous
+   reservation of equal 8 GiB slabs, strided ownership per scatter (worker i of W takes slabs
+   b+i, b+i+W, ...), a worker taking its next slab when one is full, the root advancing the base
+   past the highest slab used after each join, slab owner by arithmetic, no nesting. Built today:
+   48 fixed pairs of 4 GiB (Python) + 8 GiB (libc) ranges, one pair per worker, `MAXR` 128 in
+   both C files, `in_range` a linear scan on every free, the per-worker size cap, and the
+   nesting counter every copy inherits. Memory return is built for small objects (1(e)); the
+   shim's per-page counts for imported libc blocks under 64 KiB are not (`rangemalloc.c`
+   range_free madvises 64 KiB and up). The recycle-by-address attempt and the review behind
+   this design are in `experiments/scatter-libs/checks/recycle-attempt.patch` and
+   `docs/scatter-research.md`.
 
 3. **No scheduler, no real site.** The guest stands in for a login node: ssh, rsync, and runsc
    invoked directly. A Slurm or Superfacility adapter (submit, status, cancel, walltime

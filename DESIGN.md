@@ -143,13 +143,18 @@ Workers cannot be merged as sandboxes. The join brings each worker's **defines**
 by address, and nothing else: not its mutations of pre-fork objects, not its housekeeping, not
 its process state.
 
-- **Placement.** At session start the kernel reserves a pool of address ranges, far above the
-  heap and untouched. A thawed worker is told its range and from then on every allocation
-  through Python's three allocator domains lands there. CPython's per-type freelists are drained
-  once right after the switch, so no freed pre-fork block is handed to the worker. Its new
-  objects therefore occupy one contiguous range no other worker and not the root will use, and
-  every pointer from them to a pre-fork object is a root address, because restore preserves
-  addresses.
+- **Placement.** At session start the kernel reserves one pool of address space, far above the
+  heap and untouched, as a row of equal slabs (8 GiB each; tens of terabytes in all, which costs
+  nothing until written). A scatter of W workers starting at slab b gives worker i the slabs
+  b+i, b+i+W, b+i+2W, ...: fixed before the fork, so copies that cannot talk take disjoint slabs
+  on any node, and a worker takes its next slab when its current one is full, so no worker has
+  a size cap of its own. From the switch on, every allocation lands in the worker's slabs:
+  CPython's small-object allocator keeps its speed and density by carving its arenas from the
+  slab and forgetting the pre-fork pools at the switch, and every other allocation goes through
+  the preloaded shim into the slab, so a plain loop reuses what it frees. Its new objects
+  therefore occupy slabs no other worker and not the root will use, and every pointer from them
+  to a pre-fork object is a root address, because restore preserves addresses. A slab's owner is
+  found by arithmetic on the address, never by a scan.
 - **Export.** When its cells finish, the worker writes the range to a file in the workspace with
   a manifest: the address of each define; the GC-tracked objects in the range, which it
   untracks; modules it loaded; weak references it created; strings it interned; and, for each
@@ -176,9 +181,15 @@ its process state.
   which is the rule marimo applies to cell dependencies; a hash of the pre-fork objects the
   worker's cells read, before and after, warns when it happened.
 - **Memory.** Nothing is pinned. Pre-fork objects keep ordinary refcounts and die when the root
-  drops them, which it cannot do while workers are out (above). Only code-like objects (types, modules, functions, code) are made permanent at the
-  snapshot. A large block freed inside an imported range returns its pages to the OS at once,
-  and a range is unmapped when everything in it is dead.
+  drops them, which it cannot do while workers are out (above). Only code-like objects (types,
+  modules, functions, code) are made permanent at the snapshot. Imported memory comes back per
+  object, not per slab: the allocator metadata the worker left inside its slab (a pool header
+  per page of small objects, the shim's per-page counts for the rest) lets the root return a
+  page the moment its last block is freed. Slab addresses are never reused: after a join the
+  root advances the pool's base past the highest slab any worker touched, because the join
+  leaves references from permanent root objects (shared key tables, interned strings) into every
+  imported slab. The session's bound is therefore the pool, a bound on memory ever built across
+  all workers, and reaching it is an error naming it.
 
 The worker's pre-fork pages are never diffed; they are discarded. That is what makes the
 interpreter's own writes into pre-fork memory (inline caches in code objects, type method
@@ -257,10 +268,10 @@ worker is not a failure; the worker is resubmitted from its last checkpoint.
 scatter it is the common mistake (appending to a global list). The warning says so and tells the
 user to define the value instead.
 
-**Nesting.** A scatter inside scattered cells forks from the worker's own snapshot and draws
-ranges from the same pool. Depth is bounded by the pool and by what sites accept. Each worker is
-a full copy of the session, so scatter width is bounded by site memory divided by footprint;
-scatter from a lean session.
+**Nesting.** A scatter inside scattered cells is not supported: a worker's slabs are assigned
+before the fork and its copies could not take disjoint ones. Each worker is a full copy of the
+session, so scatter width is bounded by site memory divided by footprint; scatter from a lean
+session.
 
 **Editor.** Each scattered cell keeps its own output, with a selector to view any worker's
 result. A sub-notebook is scattered the same way: a scattered cell calls `app.run(**item)`, which
