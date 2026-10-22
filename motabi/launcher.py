@@ -242,9 +242,14 @@ class Launcher:
         }
         if CPU_FEATURES:
             spec["annotations"] = {ANNOTATION_CPU_FEATURES: CPU_FEATURES}
-        # the spec carries the channel secret in the kernel's environment: owner-only from creation
-        with os.fdopen(os.open(os.path.join(self.bundle, "config.json"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        # the spec carries the channel secret in the kernel's environment: written owner-only to a
+        # fresh file and moved into place, so no reader ever sees it with wider permissions
+        path = os.path.join(self.bundle, "config.json")
+        fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as f:
             json.dump(spec, f, indent=1)
+        os.replace(path + ".tmp", path)
 
     def relay(self, path: str, dest: Any) -> None:
         """Tail a sandbox stdio file into one of this process's pipes to the server."""
@@ -407,6 +412,12 @@ class Launcher:
                     ["unshare", "-Ur", RUNSC, "--ignore-cgroups", "--root", self.state, "state", f"sc{n}-w{i}"],
                     capture_output=True, text=True)
                 if state.returncode == 0 and '"status": "stopped"' in state.stdout:
+                    # the exit and the manifest are two files; give the manifest the time a
+                    # flush can take before the exit is read as a death
+                    for _ in range(25):
+                        if os.path.exists(manifest):
+                            break
+                        time.sleep(0.2)
                     self.error_manifest(prefix, i, f"worker {i} exited without exporting; see kernel.err")
                     pending.discard(i)
             time.sleep(0.2)
