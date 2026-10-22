@@ -18,4 +18,7 @@ pkill -f "motabi.launcher" 2>/dev/null || true
 sleep 1
 pkill -f "^runsc-(sandbox|gofer) .*$PWD/run/state" 2>/dev/null || true
 rm -rf run leg-output.txt __marimo__
+# the server-side half of the channel authentication (motabi/channel.py); the launcher and
+# the sandbox do not see this PYTHONPATH
+export PYTHONPATH="$PWD/server-site${PYTHONPATH:+:$PYTHONPATH}"
 exec .venv/bin/marimo edit --headless --port 2718 nb.py

@@ -243,14 +243,26 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
    run by provisioning rather than by an adapter's `stage(base, lockfile)`. The mapped-file
    check covers the gap for now: a base that differs in a mapped file is refused by name.
 
-8. **The site path is not safe on a shared login node.** Two things the guest hides: the
-   reverse tunnel binds the server's five ports on the site's loopback, where any user of that
-   host can connect, and marimo's kernel channel has no authentication, so a neighbour could
-   speak as the kernel; and runsc is run from `/tmp/gv` on the site, a world-writable parent
-   another user could pre-create or replace. For the slurm-ssh adapter: forward to a Unix
-   socket in a 0700 directory and bridge it to the kernel's loopback inside the payload, or
-   authenticate the channel (ZMQ CURVE); install runsc under the user's home and check its
-   hash before use; create the run directory with mode 0700.
+8. **The site path is not safe on a shared login node.** The kernel channel is now
+   authenticated (2026-10-22, `motabi/channel.py`): the server's five ZeroMQ sockets require a
+   per-session secret through ZeroMQ's PLAIN mechanism, a ZAP handler in the server admits the
+   kernel's credentials and refuses every other peer, and the kernel presents them on every
+   socket before connecting; the secret is made in the server (the sitecustomize on
+   `prototype/server-site`, on the server's PYTHONPATH from `run.sh`) and reaches the kernel in
+   its environment through the sandbox spec, which is now mode 0600. This was found as a stall at
+   home: a port scanner on the workstation (moshi-hook) sent an HTTP line to each fresh kernel
+   port, libzmq attached it as an old-protocol peer, and from then on every other command
+   alternated to it and was lost (`/tmp/stall/REPORT.md` of that day; kernel.log now records
+   every control and completion command as the receiver thread puts it and the reader takes
+   it). Proof: `experiments/scatter-libs/checks/channel-proof.py`, one session with a raw HTTP
+   peer on every port held 8 s and a wrong-secret ZeroMQ peer during a scatter: the scatter
+   joined, the ZAP log shows the kernel admitted and the bad peer refused, raw peers never reach
+   the handshake. Still open on a shared node: the tunnel binds the server's ports on the site's
+   loopback where any user can connect (they are now refused, but can still connect and be
+   counted), and runsc is run from `/tmp/gv` on the site, a world-writable parent another user
+   could pre-create or replace. For the slurm-ssh adapter: forward to a Unix socket in a 0700
+   directory, install runsc under the user's home and check its hash before use, create the run
+   directory with mode 0700.
 
 Launcher and region robustness (2026-10-21): a leg's checkpoint leaves the kernel running
 until the new sandbox is up, and a failed checkpoint or restore keeps it where it was and

@@ -37,7 +37,7 @@ def _child() -> None:
 
     # a crash names its Python frames in the share directory (marimo captures the kernel's own fd 2)
     faulthandler.enable(file=open(os.path.join(os.environ["MOTABI_SHARE"], "kernel.fault"), "a"), all_threads=True)
-    from motabi import fold
+    from motabi import channel, fold
 
     fold.install()  # allocator wrappers and the reserved ranges exist before any object does
     if os.environ.get("MOTABI_NPDIVERT") == "1":
@@ -57,6 +57,7 @@ def _child() -> None:
         s.setsockopt(zmq.HEARTBEAT_IVL, HEARTBEAT_IVL_MS)
         s.setsockopt(zmq.HEARTBEAT_TIMEOUT, HEARTBEAT_TIMEOUT_MS)
         s.setsockopt(zmq.HEARTBEAT_TTL, 2 * HEARTBEAT_TIMEOUT_MS)
+        channel.kernel_options(s)  # the server's sockets admit only these credentials (motabi/channel.py)
         return s
 
     zmq.Context.socket = socket  # type: ignore[method-assign]
@@ -68,9 +69,28 @@ def _child() -> None:
     ON_FINISH_HOOKS.append(on_finish)  # the kernel comes home when the run that sent it out ends
     original_launch = runtime.launch_kernel
 
+    def traced(q: Any, name: str) -> Any:
+        # stall trace: the receiver thread's put and the reader's get, in kernel.log
+        orig_put, orig_get = q.put, q.get
+
+        def put(item: Any, block: bool = True, timeout: float | None = None) -> None:
+            if type(item) is not object:
+                _log(f"{name} queue: received {type(item).__name__} {getattr(item, 'cell_ids', '')}")
+            orig_put(item, block, timeout)
+
+        def get(block: bool = True, timeout: float | None = None) -> Any:
+            item = orig_get(block, timeout)
+            if type(item) is not object:
+                _log(f"{name} queue: taken {type(item).__name__} {getattr(item, 'cell_ids', '')}")
+            return item
+
+        q.put, q.get = put, get
+        return q
+
     def launch_kernel(**kwargs: Any) -> None:
         # the completion engine reads this queue; a scatter parks its thread there (fold.HeldQueue)
-        kwargs["completion_queue"] = fold.hold_queue(kwargs["completion_queue"], _log)
+        kwargs["completion_queue"] = fold.hold_queue(traced(kwargs["completion_queue"], "completion"), _log)
+        kwargs["control_queue"] = traced(kwargs["control_queue"], "control")
         original_launch(**kwargs)
 
     runtime.launch_kernel = launch_kernel  # type: ignore[assignment]
