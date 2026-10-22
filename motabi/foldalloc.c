@@ -227,6 +227,12 @@ static PyObject *py_use_range(PyObject *s, PyObject *const *args, Py_ssize_t nar
 static PyObject *py_divert_off(PyObject *s, PyObject *a){ cur = -1; Py_RETURN_NONE; }
 static PyObject *py_used(PyObject *s, PyObject *a){ int i; if (!PyArg_ParseTuple(a, "i", &i)) return NULL; return PyLong_FromSize_t(R[i].used); }
 static PyObject *py_owned(PyObject *s, PyObject *a){ unsigned long long p; if (!PyArg_ParseTuple(a, "K", &p)) return NULL; return PyBool_FromLong(owned(in_range((void *)(uintptr_t)p))); }
+/* The address of an object's buffer (the buffer protocol), or -1 without one: the export check's
+   fallback for types its per-type list does not name. */
+static PyObject *py_buffer_address(PyObject *s, PyObject *o){
+  Py_buffer view; if (!PyObject_CheckBuffer(o) || PyObject_GetBuffer(o, &view, PyBUF_SIMPLE)) { PyErr_Clear(); return PyLong_FromLong(-1); }
+  PyObject *r = view.len ? PyLong_FromVoidPtr(view.buf) : PyLong_FromLong(-1); PyBuffer_Release(&view); return r;
+}
 static PyObject *py_inrange(PyObject *s, PyObject *a){ unsigned long long p; if (!PyArg_ParseTuple(a, "K", &p)) return NULL; return PyLong_FromLong(in_range((void *)(uintptr_t)p)); }
 static PyObject *py_untrack(PyObject *s, PyObject *o){ if (PyObject_IS_GC(o)) PyObject_GC_UnTrack(o); Py_RETURN_NONE; }
 /* Root side: the dumped head still holds the worker's list links (the worker never untracks: an
@@ -1020,7 +1026,7 @@ static PyMethodDef M[] = {
   {"relink_weakref", py_relink_weakref, METH_O, ""}, {"unintern", py_unintern, METH_O, ""}, {"is_interned", py_is_interned, METH_O, ""},
   {"park", py_park, METH_NOARGS, ""}, {"hold", py_hold, METH_VARARGS, ""}, {"unhold", py_unhold, METH_NOARGS, ""},
   {"install", py_install, METH_NOARGS, ""}, {"reserve", py_reserve, METH_VARARGS, ""}, {"python_ranges", py_python_ranges, METH_O, ""},
-  {"use_range", (PyCFunction)(void (*)(void))py_use_range, METH_FASTCALL, ""}, {"owned", py_owned, METH_VARARGS, ""}, {"divert_off", py_divert_off, METH_NOARGS, ""},
+  {"use_range", (PyCFunction)(void (*)(void))py_use_range, METH_FASTCALL, ""}, {"owned", py_owned, METH_VARARGS, ""}, {"buffer_address", py_buffer_address, METH_O, ""}, {"divert_off", py_divert_off, METH_NOARGS, ""},
   {"used", py_used, METH_VARARGS, ""}, {"inrange", py_inrange, METH_VARARGS, ""},
   {"untrack", py_untrack, METH_O, ""}, {"track", py_track, METH_O, ""},
   {"import_range", py_import_range, METH_VARARGS, ""}, {"immortalize", py_immortalize, METH_O, ""},

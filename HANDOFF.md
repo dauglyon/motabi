@@ -184,8 +184,10 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
    into the range and rewrite pointers) was not built. (b) The join's counts on pre-fork objects come from
    a walk of the exported object graph, not from refcount diffs (2026-10-21, commit 8b58a11; the
    popped-element case and the walkers' cases are `experiments/scatter-libs/checks/refs.py` and
-   `walk.py`, run as the harness below). (c) The per-type buffer list has four entries and an
-   unknown type is carried unchecked. (d) A kernel exit after a scatter still finalises imported
+   `walk.py`, run as the harness below). (c) The export check names NumPy, torch, Arrow and polars and, since 2026-10-22,
+   any type with the buffer protocol (bytes, bytearray, array.array, memoryview, mmap) through
+   `foldalloc.buffer_address`; a pre-fork object exposed by a define is not checked, its buffers
+   are root memory (`checks/buffers.py`). A type with none of these is carried unchecked. (d) A kernel exit after a scatter still finalises imported
    objects. (e) A worker's small objects come from CPython's own pymalloc, whose 1 MiB
    arenas are carved from the top of the worker's Python range and whose pool lists are emptied
    at the switch so no pre-fork pool is reused (2026-10-21; `foldalloc.c` arena_alloc,

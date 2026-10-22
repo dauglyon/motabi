@@ -287,6 +287,8 @@ def _buffers(obj: Any, out: list[tuple[str, int]], tag: str, seen: set[int]) -> 
         for k, v in obj.items():
             _buffers(v, out, f"{tag}[{k!r}]", seen)
         return
+    if not foldalloc.owned(id(obj)):
+        return   # a pre-fork object: its buffers are root memory, valid at home
     np = sys.modules.get("numpy")
     if np is not None and isinstance(obj, np.ndarray):
         if obj.size:
@@ -315,6 +317,11 @@ def _buffers(obj: Any, out: list[tuple[str, int]], tag: str, seen: set[int]) -> 
         return
     if isinstance(obj, Carried):
         _buffers(obj.payload, out, tag, seen)
+    # any other type exposing the buffer protocol (bytes, bytearray, array.array, memoryviews,
+    # mmap): the buffer's address; a type without one is carried unchecked
+    a = foldalloc.buffer_address(obj)
+    if a >= 0:
+        out.append((f"{tag}.buffer", a))
 
 
 def _rebuild(obj: Any) -> Any:

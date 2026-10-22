@@ -446,6 +446,16 @@ class Launcher:
                     body = json.load(f)
                 self.say(f"{kind} {n}: {name.split('.')[1]} {body}")
                 if kind == "leg" and name.endswith(".req"):
+                    # a requirement the destination cannot meet is an error in the cell, never a
+                    # silent fallback; GPUs are the one capability the prototype can check
+                    want = (body.get("requirement") or {}).get("gpus") or 0
+                    has_gpu = self.site_has("/dev/nvidiactl") if SITE is not None else os.path.exists("/dev/nvidiactl")
+                    if want and not has_gpu:
+                        where = SITE or "this machine"
+                        self.say(f"leg {n}: requires {want} GPU(s); {where} has none")
+                        self.answer(f"leg-{n}.go", {"container": self.cid, "checkpoint_s": 0.0, "image_mb": 0, "restore_s": 0.0, "transfer_s": 0.0,
+                                                    "where": "here", "error": f"requires {want} GPU(s); {where} has none"})
+                        continue
                     self.answer(f"leg-{n}.go", self.move(n, "out"))
                 elif kind == "leg":
                     self.answer(f"leg-{n}.home", self.move(n, "home"))
