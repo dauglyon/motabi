@@ -187,8 +187,10 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
    `walk.py`, run as the harness below). (c) The export check names NumPy, torch, Arrow and polars and, since 2026-10-22,
    any type with the buffer protocol (bytes, bytearray, array.array, memoryview, mmap) through
    `foldalloc.buffer_address`; a pre-fork object exposed by a define is not checked, its buffers
-   are root memory (`checks/buffers.py`). A type with none of these is carried unchecked. (d) A kernel exit after a scatter still finalises imported
-   objects. (e) A worker's small objects come from CPython's own pymalloc, whose 1 MiB
+   are root memory (`checks/buffers.py`). A type with none of these is carried unchecked. (d) A kernel exit after a scatter finalises imported
+   objects harmlessly: a shadowed native object's destructor never runs, a plain object's block
+   returns through the pool and page counts; every harness check exits the root normally after an
+   import. (e) A worker's small objects come from CPython's own pymalloc, whose 1 MiB
    arenas are carved from the top of the worker's Python range and whose pool lists are emptied
    at the switch so no pre-fork pool is reused (2026-10-21; `foldalloc.c` arena_alloc,
    pymalloc_reset). Every other allocation passes through the original allocators to the
