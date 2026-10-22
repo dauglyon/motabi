@@ -207,7 +207,7 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
 2. **The pool is not yet the design's pool.** DESIGN 2.4 (settled 2026-10-22) has one contiguous
    reservation of equal 8 GiB slabs, strided ownership per scatter (worker i of W takes slabs
    b+i, b+i+W, ...), a worker taking its next slab when one is full, the root advancing the base
-   past the highest slab used after each join, slab owner by arithmetic, no nesting. Built today:
+   past the highest slab used after each join, slab owner by arithmetic, nesting as the same stride one level down. Built today:
    48 fixed pairs of 4 GiB (Python) + 8 GiB (libc) ranges, one pair per worker, `MAXR` 128 in
    both C files, `in_range` a linear scan on every free, the per-worker size cap, and the
    nesting counter every copy inherits. Memory return is built for small objects (1(e)); the

@@ -268,10 +268,15 @@ worker is not a failure; the worker is resubmitted from its last checkpoint.
 scatter it is the common mistake (appending to a global list). The warning says so and tells the
 user to define the value instead.
 
-**Nesting.** A scatter inside scattered cells is not supported: a worker's slabs are assigned
-before the fork and its copies could not take disjoint ones. Each worker is a full copy of the
-session, so scatter width is bounded by site memory divided by footprint; scatter from a lean
-session.
+**Nesting.** A scatter inside scattered cells forks from the worker's own snapshot and draws
+slabs from the worker's own sequence: a worker's slabs b+i, b+i+W, b+i+2W, ... are a row of their
+own, and an inner scatter of W' workers starting after the worker's current slab gives inner
+worker j every W'-th slab of that row from there, the same stride one level down. Every copy at
+every depth therefore takes slabs disjoint from every other copy's without talking to it. The
+worker is the root for its inner workers: it imports their slabs, which are in its own row, and
+exports them to its root with the rest. Depth is bounded by the pool and by what sites accept.
+Each worker is a full copy of the session, so scatter width is bounded by site memory divided
+by footprint; scatter from a lean session.
 
 **Editor.** Each scattered cell keeps its own output, with a selector to view any worker's
 result. A sub-notebook is scattered the same way: a scattered cell calls `app.run(**item)`, which
