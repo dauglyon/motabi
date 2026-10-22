@@ -28,7 +28,7 @@ from typing import Any, Callable
 
 from . import foldalloc
 
-RANGES = 48
+RANGES = 1024   # pairs of ranges per session: 4 TiB + 8 TiB of address space, untouched until used
 PY_RANGE = 4 << 30    # Python's allocators: objects, and NumPy data (PyMem_Raw)
 LIBC_RANGE = 8 << 30  # libc and mmap: address space only; polars' jemalloc reserves GBs of it eagerly
 _next_range = 0
@@ -46,8 +46,8 @@ def install() -> None:
     libc = foldalloc.reserve(RANGES, LIBC_RANGE)
     try:
         shim = ctypes.CDLL(None)
-        shim.rangemalloc_register.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-        shim.rangemalloc_register.restype = ctypes.c_int
+        shim.rangemalloc_register_pool.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t, ctypes.c_size_t]
+        shim.rangemalloc_register_pool.restype = ctypes.c_int
     except AttributeError:
         return  # not preloaded: libc allocations stay outside and the export check refuses them
     shim.rangemalloc_use.argtypes = [ctypes.c_int]
@@ -56,12 +56,10 @@ def install() -> None:
     shim.rangemalloc_divert_failed.restype = ctypes.c_size_t
     shim.rangemalloc_stats.restype = ctypes.c_char_p
     foldalloc.python_ranges(RANGES)
-    for i, base in enumerate(py + libc):  # the shim's indices are foldalloc's: Python ranges, then libc ranges
-        # a Python range's first page is foldalloc's metadata (pymalloc arena slots); the shim gets the rest
-        if i < RANGES:
-            assert shim.rangemalloc_register(base + 4096, PY_RANGE - 4096) == i
-        else:
-            assert shim.rangemalloc_register(base, LIBC_RANGE) == i
+    # the shim's indices are foldalloc's: the Python pool first, then the libc pool; a Python
+    # range's first page is foldalloc's metadata (pymalloc arena slots) and the shim gets the rest
+    assert shim.rangemalloc_register_pool(py[0], RANGES, PY_RANGE, 4096) == 0
+    assert shim.rangemalloc_register_pool(libc[0], RANGES, LIBC_RANGE, 0) == RANGES
     _shim = shim
 
 

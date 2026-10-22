@@ -51,7 +51,6 @@
 #include <stdarg.h>
 #include <jemalloc/jemalloc.h>
 
-#define MAXR 128
 #define HDR 16
 typedef struct { size_t size; uint32_t off; uint32_t magic; } Hdr;   /* sits HDR bytes before the block */
 #define MAGIC 0x52414e47u                                            /* "RANG" */
@@ -62,12 +61,21 @@ typedef struct {
   atomic_size_t foreign_freed_bytes, foreign_freed_blocks;
   size_t mbump;                /* bytes of the range handed to mmap, from the top down */
 } Range;
-static Range R[MAXR]; static int NR = 0; static atomic_int cur = -1;
+static Range *R; static int NR = 0, NRcap = 0; static atomic_int cur = -1;
+/* Ranges come in pools: equal ranges side by side from one base, so the range of an address is
+   arithmetic (foldalloc.c reserves the pools; the first page of a Python range is its metadata
+   and stays outside the shim's view, hence `meta`). */
+typedef struct { char *base; size_t size, meta; int count, first; } Pool;
+static Pool P[4]; static int NP = 0;
 static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
 static atomic_size_t n_home, n_divert, n_divert_bytes, n_realloc_home_to_range, n_free_range_current;
 static atomic_size_t n_mmap_divert, n_mmap_divert_bytes, n_mmap_pass, n_munmap_range_foreign, n_mremap_refused, n_mmap_divert_failed;
 
-static inline int in_range(const void *p){ const char *c = p; for (int i = 0; i < NR; i++) if (c >= R[i].base && c < R[i].base + R[i].size) return i; return -1; }
+static inline int in_range(const void *p){
+  const char *c = p;
+  for (int k = 0; k < NP; k++) if (c >= P[k].base && c < P[k].base + P[k].size * (size_t)P[k].count) return P[k].first + (int)((size_t)(c - P[k].base) / P[k].size);
+  return -1;
+}
 
 /* ---------------- home allocator: glibc ---------------- */
 static void *(*h_malloc)(size_t); static void (*h_free)(void *); static void *(*h_calloc)(size_t, size_t);
@@ -235,11 +243,13 @@ void *mremap(void *old, size_t old_len, size_t new_len, int flags, ...){
 }
 
 /* ---------------- control ---------------- */
-int rangemalloc_register(void *base, size_t size){
+int rangemalloc_register_pool(void *base, int count, size_t size, size_t meta){
   pthread_mutex_lock(&lk);
-  if (NR == MAXR) { pthread_mutex_unlock(&lk); return -1; }
-  int i = NR++; memset(&R[i], 0, sizeof R[i]); R[i].base = base; R[i].size = size;
-  pthread_mutex_unlock(&lk); return i;
+  if (NP == 4 || count <= 0) { pthread_mutex_unlock(&lk); return -1; }
+  if (NR + count > NRcap) { NRcap = NR + count; R = realloc(R, (size_t)NRcap * sizeof *R); }
+  int first = NR; P[NP++] = (Pool){ base, size, meta, count, first };
+  for (int k = 0; k < count; k++) { memset(&R[NR], 0, sizeof R[NR]); R[NR].base = (char *)base + (size_t)k * size + meta; R[NR].size = size - meta; NR++; }
+  pthread_mutex_unlock(&lk); return first;
 }
 int rangemalloc_use(int i){
   if (i < 0 || i >= NR) return -1;

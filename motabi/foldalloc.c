@@ -24,9 +24,12 @@
    are reused and a plain loop does not exhaust the range; the shim's calls are found with dlsym
    at install. Without the shim the range is a bump cursor (used) that ignores frees. Either way a
    block carries its size in the 16 bytes before it. */
-#define MAXR 128
 typedef struct { char *base; size_t size; size_t used; } Range;
-static Range R[MAXR]; static int NR = 0; static int cur = -1;
+static Range *R; static int NR = 0; static int cur = -1;
+/* Pools: equal ranges side by side from one 1 MiB-aligned base (reserve), so the range of an
+   address is arithmetic. The first pool is the Python ranges, the second the libc ranges. */
+typedef struct { char *base; size_t size; int count, first; } Pool;
+static Pool P[4]; static int NP = 0;
 static void *(*shim_alloc)(int, size_t); static void (*shim_free)(void *); static int (*shim_open)(int); static int (*shim_spans)(int, size_t *, size_t *); static void (*shim_discard)(int);
 static PyObject **stk = NULL; static size_t stk_n = 0, stk_cap = 0; static size_t n_imm = 0;
 
@@ -45,7 +48,7 @@ static int npy = -1;   /* ranges [0, npy) are Python ranges, the rest libc */
 static PyObjectArenaAllocator orig_arena; static void *(*shim_top_alloc)(int, size_t, size_t);
 static uintptr_t *free_arenas; static size_t n_free_arenas, cap_free_arenas;   /* the worker's emptied arenas, reused */
 static size_t n_dropped_prefork = 0, n_pools_returned = 0, n_arenas = 0;
-static size_t n_divert = 0, n_free_inrange = 0, n_realloc_foreign = 0; static size_t freed_bytes[MAXR];
+static size_t n_divert = 0, n_free_inrange = 0, n_realloc_foreign = 0; static size_t *freed_bytes;
 static int is_py_range(int ri){ return npy < 0 || ri < npy; }
 static uint64_t *slab_bits(int ri){ return (uint64_t *)R[ri].base; }
 static int pym_block(int ri, const void *p){ if (!is_py_range(ri)) return 0; size_t k = (size_t)((const char *)p - R[ri].base) >> 20; return (int)((slab_bits(ri)[k >> 6] >> (k & 63)) & 1); }
@@ -53,7 +56,11 @@ static void mark_freed(const char *p);
 static int is_mapped(const void *p);
 #define GC_HEAD (2 * sizeof(uintptr_t))   /* PyGC_Head on 3.12: two words before the object */
 
-static int in_range(const void *p){ const char *c = p; for (int i = 0; i < NR; i++) if (c >= R[i].base && c < R[i].base + R[i].size) return i; return -1; }
+static int in_range(const void *p){
+  const char *c = p;
+  for (int k = 0; k < NP; k++) if (c >= P[k].base && c < P[k].base + P[k].size * (size_t)P[k].count) return P[k].first + (int)((size_t)(c - P[k].base) / P[k].size);
+  return -1;
+}
 /* The raw domain is called without the GIL (file and socket buffers on helper threads), so the
    bump pointer is taken under a lock. */
 static pthread_mutex_t bump_lk = PTHREAD_MUTEX_INITIALIZER;
@@ -173,20 +180,20 @@ static PyObject *py_install(PyObject *s, PyObject *a){
   installed = 1; Py_RETURN_NONE;
 }
 static PyObject *py_reserve(PyObject *s, PyObject *a){
+  /* One pool of n equal ranges, untouched address space, 1 MiB-aligned so an arena slot (1 MiB
+     from a range's base) holds one whole pymalloc arena. */
   int n; size_t size; if (!PyArg_ParseTuple(a, "in", &n, &size)) return NULL;
+  if (NP == 4 || n <= 0 || size & (((size_t)1 << 20) - 1)) { PyErr_SetString(PyExc_ValueError, "pool"); return NULL; }
+  size_t slack = (size_t)1 << 20, total = (size_t)n * size;
+  char *raw = mmap(NULL, total + slack, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  if (raw == MAP_FAILED) return PyErr_SetFromErrno(PyExc_OSError);
+  char *base = (char *)(((uintptr_t)raw + slack - 1) & ~(uintptr_t)(slack - 1));
+  if (base > raw) munmap(raw, (size_t)(base - raw));
+  if (base + total < raw + total + slack) munmap(base + total, (size_t)(raw + total + slack - (base + total)));
+  R = realloc(R, (size_t)(NR + n) * sizeof *R); freed_bytes = realloc(freed_bytes, (size_t)(NR + n) * sizeof *freed_bytes);
+  P[NP++] = (Pool){ base, size, n, NR };
   PyObject *out = PyList_New(0);
-  for (int i = 0; i < n; i++) {
-    /* 1 MiB-aligned, so an arena slot (1 MiB from the base) holds one whole pymalloc arena */
-    if (NR == MAXR) { PyErr_SetString(PyExc_RuntimeError, "range table full"); return NULL; }
-    size_t slack = (size_t)1 << 20;
-    char *raw = mmap(NULL, size + slack, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-    if (raw == MAP_FAILED) return PyErr_SetFromErrno(PyExc_OSError);
-    char *p = (char *)(((uintptr_t)raw + slack - 1) & ~(uintptr_t)(slack - 1));
-    if (p > raw) munmap(raw, (size_t)(p - raw));
-    if (p + size < raw + size + slack) munmap(p + size, (size_t)(raw + size + slack - (p + size)));
-    R[NR].base = p; R[NR].size = size; R[NR].used = 0; NR++;
-    PyList_Append(out, PyLong_FromVoidPtr(p));
-  }
+  for (int i = 0; i < n; i++) { R[NR].base = base + (size_t)i * size; R[NR].size = size; R[NR].used = 0; freed_bytes[NR] = 0; NR++; PyObject *v = PyLong_FromVoidPtr(R[NR - 1].base); PyList_Append(out, v); Py_DECREF(v); }
   return out;
 }
 /* METH_O so no args tuple is created; the full collection drains CPython's
