@@ -229,17 +229,19 @@ All measured on canopy (13th-gen Intel, kernel 6.2) on 2026-10-20.
    set by hand (`MOTABI_CPU_FEATURES` from the host–guest intersection); the design has it
    computed from each site's `capabilities(user)` before the kernel starts.
 
-4. **The original kernel is not frozen while workers run.** A worker's new objects may point at
-   a pre-fork object; if the original kernel drops its last reference to that object while the
-   workers are out, the merged objects point at freed memory. The interpreter-lock hold during
-   the manifest wait keeps the kernel's other threads from doing this, and the merge refuses
-   any increase aimed at an object it saw freed, but nothing yet keeps the pre-fork objects a
-   worker reaches alive. `DESIGN.md` 2.4 leaves this open ("root frozen-or-alive").
+4. **The original kernel cannot drop a pre-fork object while workers are out** (closed
+   2026-10-22 by construction, not by new code): the root copy is restored inside `root_phase`,
+   one C call that holds the interpreter lock from the checkpoint through the wait for every
+   manifest, the import of every slab and the replay of every worker's counts, with the collector
+   disabled; no Python runs in the root until every increment a worker's objects need is applied,
+   and the original kernel is deleted once the root copy is up. A later free in the root is an
+   ordinary refcount drop on a count that is already right.
 
-5. **Marimo's completion engine runs inside the kernel** and its parse trees are tabled with
-   everything else: clicking into a cell after the numpy import added ~400k objects (parso
-   nodes) to the next snapshot, 236k → 651k. Harmless now that the table is linear, but the
-   saved image and the table grow with whatever the kernel's helper threads keep.
+5. **The completion engine's parse trees no longer ride in snapshots** (2026-10-22): once its
+   thread is parked for a scatter, `fold.hold_completion` clears parso's module cache and jedi's
+   time caches, so a scatter after a completion tables 735k objects instead of 1.44M (the same
+   session shape, `kernel.log` "root copy has ... pre-fork objects"). The engine still runs inside
+   the kernel and rebuilds its trees on the next request.
 
 6. **The run-end return is silent in the notebook.** It prints outside any cell, and marimo's
    console redirect drops output with no running cell, so only the trace file records that
@@ -288,11 +290,14 @@ In order:
    capabilities. The guest recipe in `prototype/site/` is the test bed until then. After NERSC,
    Jetstream2 (the NSF cloud) is a likely second adapter target: VM-shaped allocations rather
    than Slurm jobs, GPUs on request.
-   The GPU leg (DESIGN 2.3, settled 2026-10-21) is built on top of the site's scatter: a `gpu`
-   capability in selection, workers restored at the site (today they are restored locally by
-   the launcher), a CUDA-tensor carrier in `fold.worker_export` (copy to host memory, like the
-   polars-to-Arrow carrier), and the Perlmutter check that a worker restored with devices from a
-   driver-less checkpoint initialises CUDA.
+   The GPU leg (DESIGN 2.3, settled 2026-10-21) is built on top of the site's scatter. Built:
+   the CUDA-tensor carrier (`fold._carry`: a device tensor leaves the worker as its host copy)
+   and the shim passing address reservations and oversize mappings through, which the driver
+   needs; `experiments/scatter-libs/checks/gpu-carry.py` (run from a torch+CUDA venv) forks a
+   worker that initialises CUDA, computes on the GPU and exports, and the root, which never
+   initialised CUDA, reads the tensors on CPU. Not built: the `gpu` capability in selection and
+   workers restored at the site (the launcher restores them locally), and the Perlmutter check
+   that a worker restored with devices from a driver-less checkpoint initialises CUDA.
 
 2. **Scatter over real data** (issue 1): done for the four libraries in the prototype; next is
    the reference walk through non-GC objects and recycling the ranges (issue 2).

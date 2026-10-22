@@ -154,6 +154,14 @@ def hold_completion(bound_s: float = HOLD_S) -> str:
     _queue.wake()
     t0 = time.monotonic()
     if foldalloc.hold(int(bound_s * 1000)):
+        # the thread is idle: its parse trees (parso's module cache, jedi's time caches) are not
+        # in use, and dropped now they neither go into the table nor ride in the image
+        try:
+            import jedi.cache
+
+            jedi.cache.clear_time_caches(delete_all=True)
+        except Exception:
+            pass
         return f"parked after {time.monotonic() - t0:.2f}s"
     return f"still busy after {bound_s:.0f}s; snapshotting anyway"
 
@@ -212,8 +220,9 @@ class Carried:
 
 
 def _carry(obj: Any) -> Any:
-    """The object, or a copy of it with every polars value replaced by a carrier; a container with
-    nothing to carry is returned itself, so aliases between defines stay aliases."""
+    """The object, or a copy of it with every polars value replaced by a carrier and every device
+    tensor by its host copy; a container with nothing to carry is returned itself, so aliases
+    between defines stay aliases."""
     if isinstance(obj, (list, tuple)):
         items = [_carry(v) for v in obj]
         if all(a is b for a, b in zip(items, obj)):
@@ -222,6 +231,10 @@ def _carry(obj: Any) -> Any:
     if isinstance(obj, dict):
         items = {k: _carry(v) for k, v in obj.items()}
         return obj if all(a is b for a, b in zip(items.values(), obj.values())) else items
+    torch = _mod(obj, "torch")
+    if torch is not None and isinstance(obj, torch.Tensor) and obj.device.type != "cpu":
+        # a GPU leg's tensor comes home as its bytes: devices do not exist at home (DESIGN 2.3)
+        return obj.cpu()
     pl = _mod(obj, "polars")
     if pl is not None:
         if isinstance(obj, pl.DataFrame):

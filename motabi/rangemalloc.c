@@ -232,7 +232,10 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off){
   init_mm();
   int c = atomic_load(&cur);
   /* an address without MAP_FIXED is only a hint (mimalloc always passes one): it is ignored and the mapping diverted */
-  if (c < 0 || fd >= 0 || !(flags & MAP_ANONYMOUS) || !(flags & MAP_PRIVATE) || (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE))) { atomic_fetch_add(&n_mmap_pass, 1); return h_mmap(addr, len, prot, flags, fd, off); }
+  /* passed through: file and fixed mappings, address reservations (PROT_NONE: a driver or an
+     allocator will place fixed mappings inside), and anything larger than a slab's mmap half;
+     a define that exposes memory there is refused at export as outside */
+  if (c < 0 || fd >= 0 || !(flags & MAP_ANONYMOUS) || !(flags & MAP_PRIVATE) || (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) || prot == PROT_NONE || len > R[c].size / 2) { atomic_fetch_add(&n_mmap_pass, 1); return h_mmap(addr, len, prot, flags, fd, off); }
   size_t align = len >= (2u << 20) ? (2u << 20) : 4096;      /* big requests get THP-friendly alignment */
   uintptr_t p = 0;
   for (int tries = 0; tries < 2; tries++) {

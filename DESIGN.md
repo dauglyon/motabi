@@ -119,6 +119,12 @@ lists in `capabilities(user)` of home and of every site configured for the sessi
 before the kernel starts. A site added mid-session whose features do not cover the pin is
 refused for that session; using it means restarting the kernel with a narrower pin. A pin
 narrower than home's own CPU costs home some speed, which is the price of being able to leave.
+The sandbox platform is fixed with the pin: gVisor's platforms lay out the address space
+differently (systrap's maximum user address is a build constant; KVM's follows the pinned CPU
+features), so a session restores only under the platform it started on. No site runs the kernel
+outside gVisor: a host in strict overcommit refuses the first whole-slab protection change, and
+only the sandbox is immune to the host's overcommit mode and limits. An adapter therefore never
+copies a job's address-space limit into the sandbox spec; the slabs of 2.4 are reserved inside.
 
 ### 2.4 Fork and join
 
