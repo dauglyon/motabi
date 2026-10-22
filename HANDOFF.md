@@ -275,6 +275,11 @@ In order:
    capabilities. The guest recipe in `prototype/site/` is the test bed until then. After NERSC,
    Jetstream2 (the NSF cloud) is a likely second adapter target: VM-shaped allocations rather
    than Slurm jobs, GPUs on request.
+   The GPU leg (DESIGN 2.3, settled 2026-10-21) is built on top of the site's scatter: a `gpu`
+   capability in selection, workers restored at the site (today they are restored locally by
+   the launcher), a CUDA-tensor carrier in `fold.worker_export` (copy to host memory, like the
+   polars-to-Arrow carrier), and the Perlmutter check that a worker restored with devices from a
+   driver-less checkpoint initialises CUDA.
 
 2. **Scatter over real data** (issue 1): done for the four libraries in the prototype; next is
    the reference walk through non-GC objects and recycling the ranges (issue 2).

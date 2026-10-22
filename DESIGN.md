@@ -79,23 +79,21 @@ cells run, and the sandbox is checkpointed and pulled back. The interpreter neve
 boundary, so files, in-place mutations, process state and imports need no carriers; nothing is
 ever taken out of the process.
 
-**A GPU leg carries the kernel's device state inside the process.** The leg's sandbox spec
-lists the GPU devices and gVisor proxies the driver. Before the return checkpoint the kernel
-empties torch's cache, then locks and checkpoints its own CUDA state through the driver's
-process-checkpoint calls (`cuCheckpointProcessLock` and `cuCheckpointProcessCheckpoint` on its
-own pid, libcuda 570 and later): the driver copies every live device allocation into the
-process's memory and closes every device file and mapping, so the sandbox checkpoint holds no
-device reference and restores at home from a spec that lists no devices. Live device memory
-therefore travels in the image at the cost of its size; resident device memory above the
-session's limit at the return checkpoint is an error in the cell naming the size, as any unmet
-requirement is (2.2). Device data the user does not want carried is freed before the leg ends
-or written to the site's scratch like any output that outlives a leg. Measured on one GPU host
-(2026-10-21, `docs/scatter-research.md`, GPU note): three GPU legs and two GPU-less homes in one
-process, device memory back at the same addresses, tensors and cuBLAS state intact. Two
-alternatives were measured and rejected there: closing the driver's files by hand leaves the
-driver's in-process state unusable on every later GPU leg, and gVisor's own
-`--cuda-checkpoint-path` records the device list before the driver checkpoint runs, so its
-image restores only on a host with a GPU.
+**A GPU leg is a scatter of one worker, not a move of the kernel.** The kernel's own process
+never initialises CUDA: once it has, the driver owns the process, and the measurements of
+2026-10-21 (`docs/scatter-research.md`, GPU note) leave no way out that fits a session: the
+driver's own checkpoint of the process's CUDA state restores only onto the same chip type and
+cannot be dropped (unlocking without restoring is refused, every later CUDA call blocks), and
+closing the driver's files by hand ends CUDA in that process for good. So the cells whose
+selection lands on a GPU site run in a worker copy (2.4) restored there: it initialises CUDA
+fresh on whatever GPU the node has, runs the leg's cells in order with GPU state persisting
+across them, exports their defines with every CUDA tensor copied to host memory (a carrier, as
+polars is carried as Arrow), and dies; its death is the release. The kernel at home, which did
+not move, imports and continues. What this costs is the scatter's cost: an in-place change to
+an object that existed before the leg is not carried and is named by the hash check; process
+state the leg created does not come home; device state does not outlive the leg. Files the leg
+wrote come home as a moved kernel's do. A GPU is therefore a site capability (2.2), never a
+pinned parameter of the session, and nothing about the driver appears at home.
 
 **Home** is a Linux kernel with user namespaces, native or in a VM, on the same ISA as every
 site the session may visit: a lab workstation, a login or workflow node, a dedicated box, or a
@@ -302,13 +300,6 @@ Changing the notebook's dependencies mid-session is a kernel restart, as the CPU
 GPU driver libraries are the stated exception to path identity: gVisor's nvproxy supplies them
 from the host at restore, so they may differ between sites.
 
-**CUDA at home.** On a host without a GPU the kernel's CUDA state is checkpointed in the
-driver's sense (2.3), and a CUDA call made in that state blocks until the next restore; some
-blocked calls (a device count, a synchronize) crash the process when the device returns. motabi
-guards CUDA off on such a host: a cell that calls into CUDA there gets an error naming the
-requirement, and marking the cell for a GPU site (2.2) is the fix. On the next GPU leg the
-kernel restores and unlocks its CUDA state before the first cell runs.
-
 The alternative, an image built from a user-maintained recipe and copied to every site, was
 the prototype's first form and was dropped: it moves the environment definition out of the
 notebook, where marimo users keep it, for no gain in reproducibility.
@@ -462,18 +453,18 @@ restore of a Python process, both copies continuing at the same object address; 
 across restores, with a restored root copy importing two workers' ranges; the marimo executor
 entry point in script mode.
 
-Verified on one GPU workstation, 2026-10-21 (2.3): a kernel that used the GPU through torch
-checkpoints its CUDA state in the driver, restores on a sandbox with no devices, and takes the
-GPU back on a later restore with devices, repeatedly, in one process.
+Measured on one GPU workstation, 2026-10-21 (2.3): a process that used the GPU through torch
+can checkpoint its CUDA state in the driver and restore GPU-less, but that state restores only
+onto the same chip type and cannot be dropped, which is why a GPU leg is a worker (2.3) and the
+checks below do not mention the driver.
 
-Three checks to run on Perlmutter before anything else, each unverified today:
+Two checks to run on Perlmutter before anything else, each unverified today:
 
-1. A CUDA state checkpointed on one node restores on another node of the same GPU model. NVIDIA
-   documents the driver checkpoint as restorable on a matching chip type; a different model is
-   expected to refuse, which the selection (2.2) must then treat as a capability.
-2. The site's driver exposes the process-checkpoint calls (libcuda 570 or later) and gVisor's
-   nvproxy has an ABI table for that driver version.
-3. That a rootless sandbox on a compute node (host networking) reaches the server on the user's
+1. A worker restored from the kernel's checkpoint on a GPU node, in a sandbox given the node's
+   devices, initialises CUDA and runs a torch cell; the kernel's checkpoint was taken on a host
+   with no driver, so gVisor must create the device files on restore from the restore spec alone
+   (google/gvisor#14525 suggests it does).
+2. 3. That a rootless sandbox on a compute node (host networking) reaches the server on the user's
    machine through the adapter's tunnel, and that the connection comes back after restore.
 
 ## 7. Out of scope and rejected alternatives

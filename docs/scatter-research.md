@@ -666,8 +666,17 @@ devices creates no device nodes at all; hook mode needs nvidia-container-cli on 
 than `/`. A helper process that owns the GPU and dies on the leg works but changes what the
 user writes (no `device="cuda"` in the kernel) and is the fallback, not the design.
 
-Untested: restore on a different GPU model (NVIDIA documents a matching chip type), several
-GPUs, NCCL, a long time checkpointed, Triton and torch.compile caches.
+Measured after that, natively (2026-10-21): after the driver's checkpoint, unlocking without
+restoring returns CUDA_ERROR_ILLEGAL_STATE and leaves the state checkpointed, and every later CUDA
+call blocks; NVIDIA's reference says the restore target "needs to have enough memory and be of the
+same chip type as the old GPU", the UUID-pair array "must contain every checkpointed GPU" (no
+partial restore), and restore "requires persistence mode". Forwarding the CUDA APIs to a helper
+process (rCUDA, cricket, scuda) would keep the driver out of the kernel, at the price of about 420
+entry points torch imports across the runtime, cuSPARSE, cuDNN, cuBLAS, NCCL and cuFFT plus kernel
+registration and host callbacks. The design that followed (DESIGN 2.3): a GPU leg is a scatter of
+one worker restored at the GPU site; the kernel never initialises CUDA; CUDA tensors are carried
+to host memory at export. Untested: a worker restored with devices from a checkpoint taken without
+a driver (DESIGN 6, check 1).
 
 ## Allocator note: pymalloc in the range (2026-10-21)
 
